@@ -1,0 +1,176 @@
+// ============================================================================
+// File: src/webgpu/shaders/lines_render.wgsl
+// Target: WebGPU Lines Render Pipeline (Indexed Delaunay Mesh & Isoline Contours)
+// Description: Zero-copy indexed line segment rasterization with hypsometric/bathymetric tinting
+// ============================================================================
+
+struct SimUniforms {
+    u_unfurl: f32,
+    u_mode: u32,
+    u_layerMode: u32,
+    u_time: f32,
+    u_cursorActive: f32,
+    u_numParticles: u32,
+    u_theme: u32,            // 0 = Dark Obsidian, 1 = Light Monochrome (swisstopo)
+    u_cursorHitPos: vec4<f32>,
+    u_cursorVel: vec4<f32>,
+    u_viewMatrix: mat4x4<f32>,
+    u_projectionMatrix: mat4x4<f32>,
+    u_cameraPos: vec4<f32>,
+};
+
+@group(0) @binding(0) var<uniform> sim: SimUniforms;
+
+struct VertexInput {
+    @location(0) position: vec4<f32>,     // xyz: Position, w: pointType / normalized elevation
+    @location(1) velocity: vec4<f32>,     // xyz: Velocity, w: metric
+};
+
+struct VertexOutput {
+    @builtin(position) clipPos: vec4<f32>,
+    @location(0) vPointType: f32,
+    @location(1) vFacing: f32,
+    @location(2) vElevation: f32,
+    @location(3) worldPos: vec3<f32>,
+    @location(4) spherePos: vec3<f32>,
+};
+
+// ----------------------------------------------------------------------------
+// Horizon Limb Falloff Specification (§1)
+// ----------------------------------------------------------------------------
+fn horizonFalloff(facing: f32, tau: f32, killEdge0: f32, killEdge1: f32) -> f32 {
+    let maxPath: f32 = 12.5; // ≈ sqrt(π·X/2) for engine atmosphere
+    let path = min(1.0 / max(facing, 1.0 / maxPath), maxPath);
+    let transmission = exp(-tau * path);
+    let killTerm = smoothstep(killEdge0, killEdge1, facing);
+    return transmission * killTerm;
+}
+
+@vertex
+fn vs_main(in: VertexInput) -> VertexOutput {
+    var out: VertexOutput;
+    let pos = in.position.xyz;
+    let pointType = in.position.w;
+
+    var dynamicNormal = select(vec3<f32>(0.0, 0.0, 1.0), normalize(pos), length(pos) > 0.001);
+    dynamicNormal = normalize(mix(dynamicNormal, vec3<f32>(0.0, 0.0, 1.0), sim.u_unfurl));
+
+    let p3D = in.velocity.xyz;
+    let rSphere = length(p3D);
+    if (rSphere > 0.1 && sim.u_mode == 0u) {
+        let lonRad = atan2(p3D.x, p3D.z);
+        let latRad = asin(clamp(p3D.y / rSphere, -1.0, 1.0));
+        let s = max(0.0, 1.0 - sim.u_unfurl);
+        let u = s * lonRad;
+        let sLat = s * latRad;
+        let unrollNorm = vec3<f32>(cos(sLat) * sin(u), sin(sLat), cos(sLat) * cos(u));
+        if (length(unrollNorm) > 0.001) {
+            dynamicNormal = normalize(unrollNorm);
+        }
+    }
+
+    let elevDisp = (pointType - 0.552498) * 0.08;
+    let displacedPos = pos + dynamicNormal * elevDisp;
+    let worldPos = vec4<f32>(displacedPos, 1.0);
+    let viewPos = sim.u_viewMatrix * worldPos;
+    out.clipPos = sim.u_projectionMatrix * viewPos;
+
+    let viewDir = normalize(sim.u_cameraPos.xyz - displacedPos);
+    out.vFacing = dot(dynamicNormal, viewDir);
+    out.vPointType = pointType;
+    out.vElevation = pointType * 19772.0 - 10924.0; // Map [0, 1] to [-10924m .. +8848m]
+    out.worldPos = displacedPos;
+    out.spherePos = in.velocity.xyz;
+
+    return out;
+}
+
+@fragment
+fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
+    // ------------------------------------------------------------------------
+    // UNIFORM CONTROL FLOW EVALUATION
+    // All finite difference derivatives (dpdx, dpdy) MUST be evaluated
+    // unconditionally at the top of fs_main before ANY conditional branches or discard.
+    // ------------------------------------------------------------------------
+    let dpdxWorld = dpdx(in.worldPos);
+    let dpdyWorld = dpdy(in.worldPos);
+    let dpdxSphere = dpdx(in.spherePos);
+    let dpdySphere = dpdy(in.spherePos);
+    let dWorld = length(dpdxWorld) + length(dpdyWorld);
+    let dSphere = length(dpdxSphere) + length(dpdySphere) + 1e-7;
+
+    if (sim.u_layerMode == 1u) {
+        discard;
+    }
+
+    // Antimeridian seam split & topological stretch severance
+    if (sim.u_unfurl > 0.02 && (dWorld / dSphere > 8.0 * (1.0 + sim.u_unfurl))) {
+        discard;
+    }
+
+    if (in.vFacing <= 0.02) {
+        discard;
+    }
+
+    let densityFactor = sqrt(100000.0 / max(f32(sim.u_numParticles), 1.0));
+    let sphereFactor = 1.0 - smoothstep(0.0, 0.35, sim.u_unfurl);
+    let falloff = smoothstep(0.02, 0.20, in.vFacing);
+    let backfaceDimming = mix(falloff, 1.0, smoothstep(0.80, 1.0, sim.u_unfurl));
+
+    var wireColor = vec3<f32>(0.35, 0.42, 0.52);
+    var alpha = 0.35;
+
+    if (sim.u_theme == 1u) {
+        // Light Monochrome (swisstopo / Cream Rag): Subtle graphite isobaths
+        let h = in.vElevation;
+        if (h < 0.0) {
+            wireColor = vec3<f32>(0.45, 0.58, 0.70); // Bathymetric blue-gray
+            alpha = 0.28;
+        } else if (h < 1000.0) {
+            wireColor = vec3<f32>(0.55, 0.52, 0.48); // Lowland sepia-graphite
+            alpha = 0.32;
+        } else {
+            wireColor = vec3<f32>(0.35, 0.33, 0.30); // Alpine dark charcoal
+            alpha = 0.45;
+        }
+    } else if (sim.u_theme == 2u) {
+        // Theme 2: Prussian Cyanotype (Blueprint architectural lines)
+        // STRICTLY MONOCHROMATIC
+        let h = in.vElevation;
+        if (h < 0.0) {
+            // Bathymetric & marine grid: drafting cerulean (#4F79A3)
+            wireColor = vec3<f32>(0.31, 0.475, 0.64);
+            alpha = 0.28;
+        } else if (h < 1500.0) {
+            // Lowlands/plateaus: soft cerulean tint (#7AA2C8)
+            wireColor = vec3<f32>(0.478, 0.635, 0.784);
+            alpha = 0.30;
+        } else {
+            // Ridges & summits: chalk ruling pen white (#E8EDF2)
+            wireColor = vec3<f32>(0.91, 0.93, 0.95);
+            alpha = 0.35;
+        }
+    } else {
+        // Theme 0: Dark Obsidian (Marie Tharp) with Hypsometric Depth Tint
+        let h = in.vElevation;
+        if (h < -3000.0) {
+            wireColor = vec3<f32>(0.10, 0.25, 0.55); // Abyssal navy
+            alpha = 0.40;
+        } else if (h < 0.0) {
+            wireColor = vec3<f32>(0.15, 0.65, 0.75); // Continental shelf cyan
+            alpha = 0.45;
+        } else if (h < 1500.0) {
+            wireColor = vec3<f32>(0.85, 0.65, 0.25); // Highland amber/ochre
+            alpha = 0.50;
+        } else {
+            wireColor = vec3<f32>(0.92, 0.95, 0.98); // Alpine platinum/snow
+            alpha = 0.65;
+        }
+    }
+
+    let camDist = length(sim.u_cameraPos.xyz);
+    let distAtten = select(1.0, 1.0 - smoothstep(18.0, 45.0, camDist) * 0.70, sim.u_layerMode == 0u);
+
+    let finalAlpha = alpha * densityFactor * backfaceDimming * distAtten;
+    return vec4<f32>(wireColor, clamp(finalAlpha, 0.01, 1.0));
+}

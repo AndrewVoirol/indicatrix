@@ -1,0 +1,740 @@
+@import "tailwindcss";
+
+@custom-variant dark (&:where([data-theme="tharp"], [data-theme="cyanotype"], [data-theme="tharp"] *, [data-theme="cyanotype"] *));
+
+@theme {
+  --font-sans: 'Inter', system-ui, -apple-system, sans-serif;
+  --font-mono: "IBM Plex Mono", SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  --font-cartouche: 'Cinzel', 'Times New Roman', serif;
+  --font-serif-body: "Cormorant Garamond", Georgia, serif;
+  --font-serif-book: 'Newsreader', Georgia, serif;
+
+  --text-pico: 7px;
+  --text-pico--line-height: 9px;
+  --text-pico--letter-spacing: 0.00em;
+
+  --text-nano: 8px;
+  --text-nano--line-height: 10px;
+  --text-nano--letter-spacing: 0.04em;
+
+  --text-micro: 9px;
+  --text-micro--line-height: 12px;
+  --text-micro--letter-spacing: 0.03em;
+
+  --text-body: 10px;
+  --text-body--line-height: 13px;
+  --text-body--letter-spacing: 0.02em;
+
+  --text-title: 11px;
+  --text-title--line-height: 14px;
+  --text-title--letter-spacing: 0.05em;
+
+  --color-theme-text-primary: var(--theme-text-primary);
+  --color-theme-text-secondary: var(--theme-text-secondary);
+  --color-theme-text-muted: var(--theme-text-muted);
+  --color-theme-text-accent: var(--theme-text-accent);
+  --color-theme-text-inverse: var(--theme-text-inverse);
+
+  --color-theme-panel-bg: var(--theme-panel-bg);
+  --color-theme-panel-border: var(--theme-panel-border);
+  --color-theme-card-bg: var(--theme-card-bg);
+  --color-theme-card-border: var(--theme-card-border);
+  --color-theme-card-border-hover: var(--theme-card-border-hover);
+  --color-theme-neatline-border: var(--theme-neatline-border);
+  --color-theme-neatline-accent: var(--theme-neatline-accent);
+
+  --color-theme-control-bg: var(--theme-control-bg);
+  --color-theme-control-border: var(--theme-control-border);
+  --color-theme-control-text: var(--theme-control-text);
+  --color-theme-control-hover-bg: var(--theme-control-hover-bg);
+  --color-theme-control-hover-border: var(--theme-control-hover-border);
+  --color-theme-control-hover-text: var(--theme-control-hover-text);
+  --color-theme-control-active-bg: var(--theme-control-active-bg);
+  --color-theme-control-active-border: var(--theme-control-active-border);
+  --color-theme-control-active-text: var(--theme-control-active-text);
+
+  --color-theme-switch-track-bg: var(--theme-switch-track-bg);
+  --color-theme-switch-track-active-bg: var(--theme-switch-track-active-bg);
+  --color-theme-switch-thumb-bg: var(--theme-switch-thumb-bg);
+  --color-theme-switch-thumb-active-bg: var(--theme-switch-thumb-active-bg);
+
+  --color-theme-slider-track-bg: var(--theme-slider-track-bg);
+  --color-theme-slider-track-fill: var(--theme-slider-track-fill);
+  --color-theme-slider-thumb-bg: var(--theme-slider-thumb-bg);
+
+  --color-theme-status-sage: var(--theme-status-sage);
+  --color-theme-status-slate: var(--theme-status-slate);
+  --color-theme-status-amber: var(--theme-status-amber);
+  --color-theme-focus-ring: var(--theme-focus-ring);
+
+  --animate-spin-slow: spin 20s linear infinite;
+}
+
+/* -------------------------------------------------------------------------- */
+/* Master Archival Design Tokens & Dynamic Theme Custom Properties            */
+/* -------------------------------------------------------------------------- */
+:root,
+[data-theme="tharp"] {
+  --theme-text-primary: #F0EDE6;
+  --theme-text-secondary: #A2998A;
+  --theme-text-muted: #908980;
+  --theme-text-tertiary: #968F85;
+  --theme-text-accent: #C5A059;
+  --theme-text-inverse: #0C1219;
+
+  --theme-panel-bg: rgba(15, 22, 31, 0.90);
+  --theme-panel-border: #333E4D;
+  --theme-panel-header-border: rgba(255, 255, 255, 0.10);
+  --theme-card-bg: rgba(16, 23, 33, 0.70);
+  --theme-card-border: rgba(51, 62, 77, 0.80);
+  --theme-card-border-hover: #415164;
+  --theme-neatline-border: rgba(122, 111, 94, 0.80);
+  --theme-neatline-accent: #C5A059;
+
+  --theme-control-bg: rgba(27, 43, 58, 0.60);
+  --theme-control-border: #333E4D;
+  --theme-control-text: #A2998A;
+  --theme-control-hover-bg: #22384A;
+  --theme-control-hover-text: #F0EDE6;
+  --theme-control-hover-border: #3B788A;
+  --theme-control-active-bg: #22384A;
+  --theme-control-active-border: #3B788A;
+  --theme-control-active-text: #F0EDE6;
+  --theme-control-active-ring: rgba(197, 160, 89, 0.40);
+  --theme-focus-ring: rgba(255, 255, 255, 0.20);
+
+  --theme-status-sage: #34D399;
+  --theme-status-slate: #4FD1C5;
+  --theme-status-amber: #F59E0B;
+
+  /* OKLCH color-mix opacity blends — Tailwind v3 /N modifiers fail on hex CSS vars */
+  --theme-status-sage-10: color-mix(in oklch, var(--theme-status-sage) 10%, transparent);
+  --theme-status-sage-15: color-mix(in oklch, var(--theme-status-sage) 15%, transparent);
+  --theme-status-sage-20: color-mix(in oklch, var(--theme-status-sage) 20%, transparent);
+  --theme-status-sage-40: color-mix(in oklch, var(--theme-status-sage) 40%, transparent);
+  --theme-status-sage-50: color-mix(in oklch, var(--theme-status-sage) 50%, transparent);
+  --theme-status-amber-10: color-mix(in oklch, var(--theme-status-amber) 10%, transparent);
+  --theme-status-amber-15: color-mix(in oklch, var(--theme-status-amber) 15%, transparent);
+  --theme-status-amber-20: color-mix(in oklch, var(--theme-status-amber) 20%, transparent);
+  --theme-status-amber-25: color-mix(in oklch, var(--theme-status-amber) 25%, transparent);
+  --theme-status-amber-30: color-mix(in oklch, var(--theme-status-amber) 30%, transparent);
+  --theme-status-amber-40: color-mix(in oklch, var(--theme-status-amber) 40%, transparent);
+  --theme-status-amber-50: color-mix(in oklch, var(--theme-status-amber) 50%, transparent);
+  --theme-status-slate-5: color-mix(in oklch, var(--theme-status-slate) 5%, transparent);
+  --theme-status-slate-20: color-mix(in oklch, var(--theme-status-slate) 20%, transparent);
+  --theme-status-slate-40: color-mix(in oklch, var(--theme-status-slate) 40%, transparent);
+  --theme-text-accent-10: color-mix(in oklch, var(--theme-text-accent) 10%, transparent);
+  --theme-text-accent-20: color-mix(in oklch, var(--theme-text-accent) 20%, transparent);
+  --theme-text-accent-40: color-mix(in oklch, var(--theme-text-accent) 40%, transparent);
+  --theme-text-accent-50: color-mix(in oklch, var(--theme-text-accent) 50%, transparent);
+  --theme-card-border-15: color-mix(in oklch, var(--theme-card-border) 15%, transparent);
+  --theme-card-border-50: color-mix(in oklch, var(--theme-card-border) 50%, transparent);
+  --theme-card-border-60: color-mix(in oklch, var(--theme-card-border) 60%, transparent);
+  --theme-card-bg-40: color-mix(in oklch, var(--theme-card-bg) 40%, transparent);
+  --theme-card-bg-50: color-mix(in oklch, var(--theme-card-bg) 50%, transparent);
+  --theme-control-bg-40: color-mix(in oklch, var(--theme-control-bg) 40%, transparent);
+  --theme-control-bg-60: color-mix(in oklch, var(--theme-control-bg) 60%, transparent);
+  --theme-control-border-30: color-mix(in oklch, var(--theme-control-border) 30%, transparent);
+  --theme-control-border-50: color-mix(in oklch, var(--theme-control-border) 50%, transparent);
+  --theme-control-border-60: color-mix(in oklch, var(--theme-control-border) 60%, transparent);
+  --theme-panel-border-50: color-mix(in oklch, var(--theme-panel-border) 50%, transparent);
+  --theme-text-secondary-35: color-mix(in oklch, var(--theme-text-secondary) 35%, transparent);
+
+  --theme-spring-switch: 350ms cubic-bezier(0.25, 1, 0.5, 1);
+  --theme-switch-thumb-shadow: 0 0 8px rgba(79, 209, 197, 0.5);
+  --theme-shadow-ambient: 0 12px 32px -4px rgba(0, 0, 0, 0.75);
+  --theme-cathode-glow: inset 0 1px 0 rgba(79, 209, 197, 0.2);
+
+  --theme-switch-track-bg: rgba(10, 17, 26, 0.80);
+  --theme-switch-track-border: rgba(255, 255, 255, 0.15);
+  --theme-switch-track-active-bg: #1A3848;
+  --theme-switch-track-active-border: #3B788A;
+  --theme-switch-thumb-bg: #4A5568;
+  --theme-switch-thumb-border: #2D3748;
+  --theme-switch-thumb-text: #A0AEC0;
+  --theme-switch-thumb-active-bg: #C5A059;
+  --theme-switch-thumb-active-border: #E2C37E;
+  --theme-switch-thumb-active-text: #0C1219;
+  --theme-knurl-ridge: currentColor;
+
+  --theme-slider-track-bg: rgba(140, 150, 165, 0.25);
+  --theme-slider-track-fill: #C5A059;
+  --theme-slider-thumb-bg: #C5A059;
+  --theme-slider-thumb-border: #7C6230;
+  --theme-slider-tick: rgba(240, 237, 230, 0.25);
+  --theme-stepper-btn-bg: rgba(255, 255, 255, 0.05);
+  --theme-stepper-btn-border: rgba(255, 255, 255, 0.15);
+  --theme-stepper-btn-text: #C5A059;
+  --theme-stepper-btn-hover-bg: rgba(255, 255, 255, 0.12);
+
+  --theme-direction-a-bg: #1B2B3A;
+  --theme-direction-a-border: #3B788A;
+  --theme-direction-a-text: #F0EDE6;
+  --theme-direction-a-ring: rgba(59, 120, 138, 0.5);
+
+  --theme-direction-b-bg: #102A38;
+  --theme-direction-b-border: #3B8B9B;
+  --theme-direction-b-text: #8CE2F2;
+  --theme-direction-b-ring: rgba(59, 139, 155, 0.5);
+
+  --theme-direction-c-bg: #122538;
+  --theme-direction-c-border: #3B6B9B;
+  --theme-direction-c-text: #8CB8F2;
+  --theme-direction-c-ring: rgba(59, 107, 155, 0.5);
+
+  --theme-reticle-pip-active: #C5A059;
+  --theme-reticle-ring-active: #3B788A;
+  --theme-pulse-indicator: #C5A059;
+
+  /* Instrument SVG Ink Tokens — Cartographic Vector Graphics Inside Instruments */
+  --theme-instrument-ink: #00e5ff;            /* Primary instrument SVG stroke/fill — oceanographic cyan */
+  --theme-instrument-ink-secondary: #34d399;  /* Secondary/accent SVG ink — bathymetric emerald */
+  --theme-instrument-viewport-bg: #0c1219;    /* SVG viewport background — ocean floor dark */
+  --theme-instrument-viewport-bg-center: #1a2633; /* SVG viewport radial center */
+  --theme-instrument-viewport-border: rgba(58, 77, 97, 0.60); /* SVG viewport subtle delineator */
+  --theme-instrument-caliper: #00e5ff;        /* Caliper/reticle cursor color */
+  --theme-instrument-caliper-badge-bg: #0a111a; /* Caliper readout badge background */
+  --theme-instrument-caliper-badge-text: #00e5ff; /* Caliper readout badge text */
+  --theme-instrument-strata-high: #ffa026;    /* Atmospheric strata indicator — high */
+  --theme-instrument-strata-mid: #1fd9f5;     /* Atmospheric strata indicator — mid */
+  --theme-instrument-strata-low: #f547e0;     /* Atmospheric strata indicator — low */
+
+  --theme-font-cartouche: 'Cinzel', 'Times New Roman', serif;
+  --theme-font-telemetry: 'IBM Plex Mono', 'Courier New', monospace;
+  --theme-font-body: 'Inter', system-ui, sans-serif;
+  --theme-tracking-cartouche: 0.12em;
+  --theme-transform-cartouche: uppercase;
+}
+
+[data-theme="cream"] {
+  --theme-text-primary: #2B241A;
+  --theme-text-secondary: #736750;
+  --theme-text-muted: #7A6E5A;
+  --theme-text-tertiary: #746849;
+  --theme-text-accent: #8C4820;
+  --theme-text-inverse: #FDFCF9;
+
+  --theme-panel-bg: rgba(248, 243, 232, 0.92);
+  --theme-panel-border: #CFC4AF;
+  --theme-panel-header-border: rgba(184, 173, 152, 0.60);
+  --theme-card-bg: rgba(252, 249, 242, 0.94);
+  --theme-card-border: #D8CFBC;
+  --theme-card-border-hover: #B8AD98;
+  --theme-neatline-border: #B8AD98;
+  --theme-neatline-accent: #8C4820;
+
+  --theme-control-bg: rgba(244, 238, 225, 0.70);
+  --theme-control-border: #D8CFBC;
+  --theme-control-text: #5A4F3E;
+  --theme-control-hover-bg: #EDE3D4;
+  --theme-control-hover-text: #2B241A;
+  --theme-control-hover-border: #B8AD98;
+  --theme-control-active-bg: #3D2F1D;
+  --theme-control-active-border: #8C4820;
+  --theme-control-active-text: #FDFCF9;
+  --theme-control-active-ring: rgba(140, 72, 32, 0.40);
+  --theme-focus-ring: rgba(148, 163, 184, 0.35);
+
+  --theme-status-sage: #1B432B;
+  --theme-status-slate: #1A4457;
+  --theme-status-amber: #7D4700;
+
+  --theme-spring-switch: 280ms cubic-bezier(0.22, 1, 0.36, 1);
+  --theme-switch-thumb-shadow: 0 1px 3px rgba(140, 72, 32, 0.35);
+  --theme-shadow-ambient: 0 8px 24px -2px rgba(140, 114, 82, 0.22);
+  --theme-cathode-glow: none;
+
+  --theme-switch-track-bg: #E2D7C3;
+  --theme-switch-track-border: #C8B9A6;
+  --theme-switch-track-active-bg: #C8B9A6;
+  --theme-switch-track-active-border: #8C4820;
+  --theme-switch-thumb-bg: #FDFCF9;
+  --theme-switch-thumb-border: #C8B9A6;
+  --theme-switch-thumb-text: #7D715D;
+  --theme-switch-thumb-active-bg: #8C4820;
+  --theme-switch-thumb-active-border: #5A2C10;
+  --theme-switch-thumb-active-text: #FDFCF9;
+  --theme-knurl-ridge: currentColor;
+
+  --theme-slider-track-bg: rgba(184, 173, 152, 0.40);
+  --theme-slider-track-fill: #8C4820;
+  --theme-slider-thumb-bg: #8C4820;
+  --theme-slider-thumb-border: #5A2C10;
+  --theme-slider-tick: rgba(43, 36, 26, 0.25);
+  --theme-stepper-btn-bg: #F4EEE1;
+  --theme-stepper-btn-border: #D8CFBC;
+  --theme-stepper-btn-text: #8C4820;
+  --theme-stepper-btn-hover-bg: #EDE3D4;
+
+  --theme-direction-a-bg: #2B241A;
+  --theme-direction-a-border: #2B241A;
+  --theme-direction-a-text: #FDFCF9;
+  --theme-direction-a-ring: rgba(43, 36, 26, 0.4);
+
+  --theme-direction-b-bg: #77998B;
+  --theme-direction-b-border: #587A6C;
+  --theme-direction-b-text: #FDFCF9;
+  --theme-direction-b-ring: rgba(119, 153, 139, 0.4);
+
+  --theme-direction-c-bg: #9E6D50;
+  --theme-direction-c-border: #7D4F35;
+  --theme-direction-c-text: #FDFCF9;
+  --theme-direction-c-ring: rgba(158, 109, 80, 0.4);
+
+  --theme-reticle-pip-active: #8C4820;
+  --theme-reticle-ring-active: #8C4820;
+  --theme-pulse-indicator: #8C4820;
+
+  /* Instrument SVG Ink Tokens — Sepia Copperplate Engraving */
+  --theme-instrument-ink: #8c4820;            /* Primary instrument SVG stroke/fill — sepia copperplate */
+  --theme-instrument-ink-secondary: #8c4820;  /* Secondary SVG ink — same sepia family */
+  --theme-instrument-viewport-bg: #f4ede0;    /* SVG viewport background — paper tooth substrate */
+  --theme-instrument-viewport-bg-center: #fdfcf9; /* SVG viewport radial center — ivory */
+  --theme-instrument-viewport-border: rgba(184, 173, 152, 0.60); /* SVG viewport delineator */
+  --theme-instrument-caliper: #8c4820;        /* Caliper/reticle cursor color — burnt sienna */
+  --theme-instrument-caliper-badge-bg: #fdfcf9; /* Caliper readout badge background */
+  --theme-instrument-caliper-badge-text: #8c4820; /* Caliper readout badge text */
+  --theme-instrument-strata-high: #9e6d50;    /* Atmospheric strata indicator — high (warm sienna) */
+  --theme-instrument-strata-mid: #77998b;     /* Atmospheric strata indicator — mid (sage) */
+  --theme-instrument-strata-low: #b8ad98;     /* Atmospheric strata indicator — low (parchment) */
+
+  --theme-font-cartouche: 'Cinzel', 'Cormorant Garamond', 'Times New Roman', serif;
+  --theme-font-telemetry: 'IBM Plex Mono', 'Courier New', monospace;
+  --theme-font-body: 'Inter', system-ui, sans-serif;
+  --theme-tracking-cartouche: 0.10em;
+  --theme-transform-cartouche: uppercase;
+}
+
+[data-theme="cyanotype"] {
+  --theme-text-primary: #E8EDF2;
+  --theme-text-secondary: #8EA4BD;
+  --theme-text-muted: #6B94BD;
+  --theme-text-tertiary: #7B9FBF;
+  --theme-text-accent: #A5D5FF;
+  --theme-text-inverse: #0C1520;
+
+  --theme-panel-bg: rgba(18, 32, 48, 0.92);
+  --theme-panel-border: #263C54;
+  --theme-panel-header-border: rgba(79, 121, 163, 0.40);
+  --theme-card-bg: rgba(15, 28, 43, 0.85);
+  --theme-card-border: #263C54;
+  --theme-card-border-hover: #3B597A;
+  --theme-neatline-border: rgba(59, 89, 122, 0.70);
+  --theme-neatline-accent: #A5D5FF;
+
+  --theme-control-bg: rgba(16, 28, 43, 0.65);
+  --theme-control-border: #263C54;
+  --theme-control-text: #8EA4BD;
+  --theme-control-hover-bg: #152A40;
+  --theme-control-hover-text: #E8EDF2;
+  --theme-control-hover-border: #4F79A3;
+  --theme-control-active-bg: #203A57;
+  --theme-control-active-border: #4F79A3;
+  --theme-control-active-text: #E8EDF2;
+  --theme-control-active-ring: rgba(165, 213, 255, 0.40);
+  --theme-focus-ring: rgba(79, 121, 163, 0.40);
+
+  --theme-status-sage: #4FA3E3;
+  --theme-status-slate: #6B94BD;
+  --theme-status-amber: #7BA8C4;
+
+  --theme-spring-switch: 180ms cubic-bezier(0.16, 1, 0.3, 1);
+  --theme-switch-thumb-shadow: 0 1px 4px rgba(79, 163, 227, 0.4);
+  --theme-shadow-ambient: 0 12px 28px -4px rgba(5, 15, 26, 0.8);
+  --theme-cathode-glow: inset 0 1px 0 rgba(79, 163, 227, 0.25);
+
+  --theme-switch-track-bg: #0D1724;
+  --theme-switch-track-border: #263C54;
+  --theme-switch-track-active-bg: #203A57;
+  --theme-switch-track-active-border: #4F79A3;
+  --theme-switch-thumb-bg: #1A2F47;
+  --theme-switch-thumb-border: #263C54;
+  --theme-switch-thumb-text: #8EA4BD;
+  --theme-switch-thumb-active-bg: #E8EDF2;
+  --theme-switch-thumb-active-border: #4F79A3;
+  --theme-switch-thumb-active-text: #0C1520;
+  --theme-knurl-ridge: currentColor;
+
+  --theme-slider-track-bg: rgba(79, 121, 163, 0.30);
+  --theme-slider-track-fill: #4F79A3;
+  --theme-slider-thumb-bg: #E8EDF2;
+  --theme-slider-thumb-border: #4F79A3;
+  --theme-slider-tick: rgba(232, 237, 242, 0.25);
+  --theme-stepper-btn-bg: #101C2B;
+  --theme-stepper-btn-border: #263C54;
+  --theme-stepper-btn-text: #A5D5FF;
+  --theme-stepper-btn-hover-bg: #162B42;
+
+  --theme-direction-a-bg: #203A57;
+  --theme-direction-a-border: #4F79A3;
+  --theme-direction-a-text: #E8EDF2;
+  --theme-direction-a-ring: rgba(79, 121, 163, 0.5);
+
+  --theme-direction-b-bg: #162B42;
+  --theme-direction-b-border: #386B99;
+  --theme-direction-b-text: #A5D5FF;
+  --theme-direction-b-ring: rgba(56, 107, 153, 0.5);
+
+  --theme-direction-c-bg: #102236;
+  --theme-direction-c-border: #294C6F;
+  --theme-direction-c-text: #8EC5FC;
+  --theme-direction-c-ring: rgba(41, 76, 111, 0.5);
+
+  --theme-reticle-pip-active: #A5D5FF;
+  --theme-reticle-ring-active: #4F79A3;
+  --theme-pulse-indicator: #4F79A3;
+
+  /* Instrument SVG Ink Tokens — Prussian Cyanotype Blueprint */
+  --theme-instrument-ink: #4fa3e3;            /* Primary instrument SVG stroke/fill — cyanotype blue */
+  --theme-instrument-ink-secondary: #a5d5ff;  /* Secondary SVG ink — bright cerulean highlight */
+  --theme-instrument-viewport-bg: #0d1724;    /* SVG viewport background — deep indigo */
+  --theme-instrument-viewport-bg-center: #18293d; /* SVG viewport radial center */
+  --theme-instrument-viewport-border: rgba(59, 89, 122, 0.60); /* SVG viewport delineator */
+  --theme-instrument-caliper: #70b7ff;        /* Caliper/reticle cursor color — actinic blue */
+  --theme-instrument-caliper-badge-bg: #0e1824; /* Caliper readout badge background */
+  --theme-instrument-caliper-badge-text: #a5d5ff; /* Caliper readout badge text */
+  --theme-instrument-strata-high: #4f79a3;    /* Atmospheric strata indicator — high (slate blue) */
+  --theme-instrument-strata-mid: #6b94bd;     /* Atmospheric strata indicator — mid (pale cerulean) */
+  --theme-instrument-strata-low: #3b597a;     /* Atmospheric strata indicator — low (deep slate) */
+
+  --theme-font-cartouche: 'Cinzel', 'IBM Plex Mono', monospace;
+  --theme-font-telemetry: 'IBM Plex Mono', 'Courier New', monospace;
+  --theme-font-body: 'Inter', system-ui, sans-serif;
+  --theme-tracking-cartouche: 0.16em;
+  --theme-transform-cartouche: uppercase;
+}
+
+*, *::before, *::after {
+  box-sizing: border-box;
+}
+
+html, body, #root {
+  width: 100%;
+  height: 100%;
+  margin: 0;
+  padding: 0;
+  overflow: hidden;
+  background-color: #090B10;
+  font-family: 'Inter', system-ui, -apple-system, sans-serif;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+/* Cartographic Archival Font Utilities */
+.font-serif-title { font-family: 'Cinzel', 'Times New Roman', serif; }
+.font-serif-body { font-family: 'Cormorant Garamond', Georgia, serif; }
+.font-serif-book { font-family: 'Newsreader', Georgia, serif; }
+.font-mono-draft { font-family: 'IBM Plex Mono', 'Courier New', monospace; }
+
+/* 5-Tier Semantic Typography Scale */
+.text-archival-title { font-size: 11px; line-height: 14px; letter-spacing: 0.05em; font-weight: 600; }
+.text-archival-body  { font-size: 10px; line-height: 13px; letter-spacing: 0.02em; font-weight: 500; }
+.text-archival-micro { font-size: 9px;  line-height: 12px; letter-spacing: 0.03em; font-weight: 400; }
+.text-archival-nano  { font-size: 8px;  line-height: 10px; letter-spacing: 0.04em; font-weight: 500; }
+.text-archival-pico  { font-size: 7px;  line-height: 9px;  letter-spacing: 0.00em; font-weight: 400; }
+
+/* Theme-Responsive Cartographic Classes */
+.cartouche-title {
+  font-family: var(--theme-font-cartouche, 'Cinzel', serif);
+  letter-spacing: var(--theme-tracking-cartouche, 0.12em);
+  text-transform: var(--theme-transform-cartouche, uppercase);
+  font-weight: 600;
+}
+
+.cartouche-subtitle {
+  font-family: var(--theme-font-body, 'Inter', sans-serif);
+  letter-spacing: 0.02em;
+}
+[data-theme="cream"] .cartouche-subtitle {
+  font-family: 'Cormorant Garamond', Georgia, serif;
+  font-style: italic;
+}
+
+.telemetry-mono {
+  font-family: var(--theme-font-telemetry, 'IBM Plex Mono', monospace);
+  font-feature-settings: 'tnum' on, 'zero' on;
+}
+
+.font-telemetry {
+  font-family: var(--theme-font-telemetry, 'IBM Plex Mono', monospace);
+}
+
+/* Restrained Atmospheric Backgrounds (Macro Space) */
+.paper-cyanotype {
+  background-color: #101c2b;
+  background-image: 
+    /* Ultra-subtle 20px tracing cloth fiber tooth (0.025 opacity) */
+    linear-gradient(rgba(255, 255, 255, 0.025) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(255, 255, 255, 0.025) 1px, transparent 1px),
+    /* Soft organic ferroprussiate chemical wash pool */
+    radial-gradient(ellipse at 50% 30%, #15273c 0%, #0c1520 100%);
+  background-size: 20px 20px, 20px 20px, 100% 100%;
+}
+
+.paper-cream {
+  background-color: #f3ece0;
+  background-image: 
+    /* Soft organic watercolor wash pool */
+    radial-gradient(ellipse at 45% 35%, rgba(205, 190, 165, 0.22) 0%, transparent 70%),
+    /* Archival paper tone gradient */
+    linear-gradient(to bottom, #f7f1e6, #ebe1cf);
+  background-size: 100% 100%, 100% 100%;
+}
+
+.paper-cream-panel {
+  background-color: rgba(252, 249, 242, 0.94);
+  background-image:
+    linear-gradient(to bottom, rgba(255, 253, 248, 0.60), rgba(248, 243, 234, 0.60));
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+  box-shadow: 0 12px 30px -4px rgba(70, 55, 35, 0.14), 0 2px 6px -1px rgba(70, 55, 35, 0.08);
+}
+
+.paper-tharp {
+  background-color: #0f161f;
+  background-image: 
+    /* Calm deep abyssal ground */
+    radial-gradient(rgba(200, 180, 140, 0.025) 1px, transparent 1px),
+    linear-gradient(to bottom, #0c1219, #131c26);
+  background-size: 18px 18px, 100% 100%;
+}
+
+/* Vintage Vernier Slider Styling */
+input[type=range].slider-archival {
+  -webkit-appearance: none;
+  appearance: none;
+  background: transparent;
+  width: 100%;
+}
+input[type=range].slider-archival::-webkit-slider-runnable-track {
+  width: 100%;
+  height: 3px;
+  background: var(--theme-slider-track-bg, rgba(140, 150, 165, 0.25));
+  border-radius: 2px;
+}
+input[type=range].slider-archival::-moz-range-track {
+  width: 100%;
+  height: 3px;
+  background: var(--theme-slider-track-bg, rgba(140, 150, 165, 0.25));
+  border-radius: 2px;
+}
+input[type=range].slider-archival::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  height: 14px;
+  width: 9px;
+  border-radius: 1px;
+  background: var(--theme-slider-thumb-bg, #c5a059); /* Brushed antique brass or copper */
+  cursor: pointer;
+  border: 1px solid var(--theme-slider-thumb-border, #7c6230);
+  box-shadow: 0 1px 3px rgba(0,0,0,0.35);
+  margin-top: -5.5px;
+}
+input[type=range].slider-archival::-moz-range-thumb {
+  height: 14px;
+  width: 9px;
+  border-radius: 1px;
+  background: var(--theme-slider-thumb-bg, #c5a059);
+  cursor: pointer;
+  border: 1px solid var(--theme-slider-thumb-border, #7c6230);
+  box-shadow: 0 1px 3px rgba(0,0,0,0.35);
+}
+
+/* Rolled Blueprint Scroll Unfurl & Roll-up Spring Mechanics */
+@keyframes scrollUnfurl {
+  0% {
+    max-height: 0px;
+    opacity: 0;
+    transform: scaleY(0.90);
+  }
+  65% {
+    max-height: calc(100vh - 6.5rem);
+    opacity: 0.95;
+    transform: scaleY(1.025);
+  }
+  85% {
+    transform: scaleY(0.995);
+  }
+  100% {
+    max-height: calc(100vh - 6.5rem);
+    opacity: 1.0;
+    transform: scaleY(1.0);
+  }
+}
+
+@keyframes scrollRollUp {
+  0% {
+    max-height: calc(100vh - 6.5rem);
+    opacity: 1.0;
+    transform: scaleY(1.0);
+  }
+  25% {
+    /* Preparatory tension spring stretch down */
+    transform: scaleY(1.02);
+  }
+  75% {
+    max-height: 35px;
+    opacity: 0.6;
+    transform: scaleY(0.85);
+  }
+  90% {
+    /* Recoil bounce */
+    max-height: 12px;
+    opacity: 0.25;
+    transform: scaleY(0.96);
+  }
+  100% {
+    max-height: 0px;
+    opacity: 0;
+    transform: scaleY(0.90);
+  }
+}
+
+.scroll-unfurl-anim {
+  animation: scrollUnfurl 0.42s cubic-bezier(0.34, 1.4, 0.64, 1) forwards;
+  transform-origin: top;
+}
+
+.scroll-rollup-anim {
+  animation: scrollRollUp 0.38s cubic-bezier(0.34, 1.35, 0.64, 1) forwards;
+  transform-origin: top;
+}
+
+.sidebar-spring-transition {
+  transition: max-height 0.45s cubic-bezier(0.34, 1.35, 0.64, 1),
+              opacity 0.3s ease,
+              transform 0.45s cubic-bezier(0.34, 1.35, 0.64, 1);
+  transform-origin: top;
+}
+
+.scroll-curl-lip {
+  box-shadow: 0 8px 20px -4px rgba(0, 0, 0, 0.7), 0 3px 8px -2px rgba(0, 0, 0, 0.45);
+}
+
+[data-theme="cream"] .scroll-curl-lip,
+.paper-cream.scroll-curl-lip,
+.paper-cream .scroll-curl-lip,
+.paper-cream-panel.scroll-curl-lip,
+.paper-cream-panel .scroll-curl-lip {
+  box-shadow: 0 10px 25px -4px rgba(70, 55, 35, 0.16), 0 2px 6px -1px rgba(70, 55, 35, 0.10);
+}
+
+[data-theme="cyanotype"] .scroll-curl-lip,
+.paper-cyanotype.scroll-curl-lip,
+.paper-cyanotype .scroll-curl-lip {
+  box-shadow: 0 8px 20px -4px rgba(5, 15, 26, 0.8), 0 3px 8px -2px rgba(5, 15, 26, 0.5);
+}
+
+/* Machined Knurled Slide Switch & Tumbler */
+.knurl-switch {
+  transition: background-color 0.2s ease, border-color 0.2s ease, box-shadow 0.2s ease;
+}
+
+.knurl-thumb {
+  transition: transform var(--theme-spring-switch, 0.2s cubic-bezier(0.16, 1, 0.3, 1)),
+              background-color 0.2s ease,
+              border-color 0.2s ease,
+              box-shadow 0.2s ease;
+  box-shadow: var(--theme-switch-thumb-shadow, 0 1px 2px rgba(0, 0, 0, 0.25));
+}
+
+.knurl-ridge {
+  height: 1px;
+  width: 100%;
+  background: currentColor;
+  opacity: 0.45;
+}
+
+/* Calibrated Vernier Ticks */
+.vernier-ticks {
+  display: flex;
+  justify-content: space-between;
+  padding: 0 2px;
+  font-family: monospace;
+  font-size: 6px;
+  line-height: 1;
+  user-select: none;
+  opacity: 0.4;
+}
+
+/* Optical Reticle Pip */
+.reticle-pip {
+  transition: transform 0.18s cubic-bezier(0.34, 1.56, 0.64, 1), opacity 0.15s ease;
+}
+
+/* Interactive Control Ergonomics & Global Pointer Cursor Contract */
+button,
+input[type="range"],
+.tactile-btn,
+[role="button"],
+.pigment-pan,
+.folio-strip,
+.domain-chip {
+  cursor: pointer;
+}
+
+/* Tactile Active Press Feedback */
+.tactile-btn:active,
+.tactile-press:active,
+button:active:not(:disabled) {
+  transform: translateY(1px);
+  box-shadow: inset 0 2px 4px rgba(0, 0, 0, 0.45) !important;
+}
+
+[data-theme="cream"] .tactile-btn:active,
+[data-theme="cream"] .tactile-press:active,
+[data-theme="cream"] button:active:not(:disabled),
+.paper-cream.tactile-btn:active,
+.paper-cream .tactile-btn:active,
+.paper-cream .tactile-press:active,
+.paper-cream button:active:not(:disabled),
+.paper-cream-panel.tactile-btn:active,
+.paper-cream-panel .tactile-btn:active,
+.paper-cream-panel .tactile-press:active,
+.paper-cream-panel button:active:not(:disabled) {
+  box-shadow: inset 0 1px 3px rgba(61, 47, 29, 0.40) !important;
+}
+
+/* Cartographic Glassmorphic Focus Rings */
+:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 2px var(--theme-focus-ring, rgba(255, 255, 255, 0.20)) !important;
+}
+
+/* Folio Strip Hover Lift & Archival Shadow */
+.folio-strip {
+  transition: transform 0.18s cubic-bezier(0.25, 1, 0.5, 1), box-shadow 0.18s ease, background-color 0.15s ease, border-color 0.15s ease;
+}
+.folio-strip:hover {
+  transform: translateY(-1px);
+  box-shadow: 0 4px 12px -2px rgba(0, 0, 0, 0.45);
+}
+[data-theme="cream"] .folio-strip:hover,
+.paper-cream .folio-strip:hover {
+  box-shadow: 0 3px 10px -2px rgba(140, 114, 82, 0.30);
+}
+
+/* Watercolor Pigment Pan Scale Hover */
+.pigment-pan {
+  transition: transform 0.15s cubic-bezier(0.34, 1.35, 0.64, 1), box-shadow 0.15s ease, border-color 0.15s ease;
+}
+.pigment-pan:hover {
+  transform: scale(1.05);
+}
+
+/* Smooth Scroll Container Edge Mask & Breathing Room */
+.scroll-fade-mask {
+  mask-image: linear-gradient(
+    to bottom,
+    transparent 0px,
+    black 14px,
+    black calc(100% - 14px),
+    transparent 100%
+  );
+  -webkit-mask-image: linear-gradient(
+    to bottom,
+    transparent 0px,
+    black 14px,
+    black calc(100% - 14px),
+    transparent 100%
+  );
+}

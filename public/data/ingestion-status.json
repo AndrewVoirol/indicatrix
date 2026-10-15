@@ -1,0 +1,37 @@
+{
+  "updatedAtUTC": "2026-10-15T16:06:10.908Z",
+  "scheduler": "canonical-planetary-orchestrator",
+  "weatherNextGateHours": 24,
+  "freeFeedGateHours": 3,
+  "feeds": {
+    "weathernext3": {
+      "lastPulledUTC": "2026-10-15T10:11:12.399702+00:00",
+      "lastAttemptUTC": "2026-10-15T16:06:10.908Z",
+      "modelCycle": "20261015_03hr_01_preds",
+      "forecastInitUTC": "2026-10-15T03:00:00Z",
+      "totalHours": 12,
+      "ageHours": 5.92,
+      "status": "ok"
+    },
+    "gfs": {
+      "lastPulledUTC": "2026-10-15T16:06:03.723553+00:00",
+      "lastAttemptUTC": "2026-10-15T16:06:10.908Z",
+      "ageHours": 0,
+      "status": "ok"
+    },
+    "radar": {
+      "lastPulledUTC": "2026-10-15T16:06:08.149Z",
+      "lastAttemptUTC": "2026-10-15T16:06:10.908Z",
+      "frameCount": 12,
+      "ageHours": 0,
+      "status": "ok"
+    },
+    "starlink": {
+      "lastPulledUTC": "2026-10-15T16:06:10.909Z",
+      "lastAttemptUTC": "2026-10-15T16:06:10.908Z",
+      "satelliteCount": 110,
+      "ageHours": 0,
+      "status": "ok"
+    }
+  }
+}

@@ -1,0 +1,236 @@
+import React, { useState, useEffect, useRef } from 'react';
+import { DATA_LAYER_CATALOG } from '../../../core/data/DataLayerCatalog';
+import type { DataLayerItem } from '../UnifiedRightSidebar';
+
+export interface CatalogSheetProps {
+  isCatalogOpen: boolean;
+  setIsCatalogOpen: (open: boolean | ((prev: boolean) => boolean)) => void;
+  theme: 0 | 1 | 2;
+  dataLayers: DataLayerItem[];
+  onAddDataLayer?: (layer: DataLayerItem) => void;
+  onShowCloudsChange?: (v: boolean) => void;
+}
+
+export const CatalogSheet: React.FC<CatalogSheetProps> = ({
+  isCatalogOpen,
+  setIsCatalogOpen,
+  theme,
+  dataLayers = [],
+  onAddDataLayer,
+  onShowCloudsChange,
+}) => {
+  const [catalogFilter, setCatalogFilter] = useState<'all' | 'topo' | 'vectors' | 'satellite'>('all');
+  const catalogSheetRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Escape' && isCatalogOpen) setIsCatalogOpen(false);
+    };
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [isCatalogOpen, setIsCatalogOpen]);
+
+  if (!isCatalogOpen) return null;
+
+  return (
+    <>
+      {/* Modal Backdrop below xl breakpoint (stacks over sidebar z-30) */}
+      <div
+        className="fixed inset-0 bg-black/20 z-35 z-[35] xl:hidden pointer-events-auto backdrop-blur-[1px] transition-opacity duration-300"
+        onClick={() => setIsCatalogOpen(false)}
+        aria-hidden="true"
+      />
+      <div
+        ref={catalogSheetRef}
+        className="fixed top-5 right-5 xl:right-[26.5rem] z-40 pointer-events-auto w-96 max-w-[calc(100vw-2.5rem)] xl:max-w-[calc(100vw-28rem)] max-h-[calc(100vh-2.5rem)] xl:max-h-[calc(100vh-8.5rem)] 2xl:max-h-[calc(100vh-8.5rem)] flex flex-col font-mono select-none rounded-[3px] border backdrop-blur-2xl shadow-2xl p-4 text-micro transition-all duration-300 ease-out animate-in fade-in slide-in-from-right-4 border-[var(--theme-panel-border)] bg-[var(--theme-panel-bg)] text-[var(--theme-text-primary)]"
+      >
+        <div className="flex items-center justify-between pb-3 border-b border-[var(--theme-panel-border)]">
+          <div>
+            <h3 className="text-micro font-semibold uppercase tracking-wider text-[var(--theme-text-primary)]">Catalog</h3>
+            <span className="text-nano text-[var(--theme-text-tertiary)]">
+              {DATA_LAYER_CATALOG.length} datasets
+            </span>
+          </div>
+
+          <button
+            type="button"
+            aria-label="Close catalog"
+            onClick={() => setIsCatalogOpen(false)}
+            title="Close Catalog Sheet (Esc)"
+            className="p-1.5 rounded-[2px] border transition-all cursor-pointer border-[var(--theme-control-border)] bg-[var(--theme-control-bg)] text-[var(--theme-text-secondary)] hover:text-[var(--theme-text-primary)] hover:border-[var(--theme-card-border-hover)]"
+          >
+            <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2.5" d="M6 18L18 6M6 6l12 12" />
+            </svg>
+          </button>
+        </div>
+
+        {/* Filter Chips */}
+        <div className="flex items-center gap-1.5 pt-2 pb-2 border-b border-[var(--theme-panel-border)]">
+          {(['all', 'topo', 'vectors', 'satellite'] as const).map((cat) => {
+            const isSelected = catalogFilter === cat;
+            const labels = {
+              all: 'ALL',
+              topo: 'TOPO',
+              vectors: 'VECTORS',
+              satellite: 'SATELLITE',
+            };
+            return (
+              <button
+                key={cat}
+                onClick={() => setCatalogFilter(cat)}
+                className={`domain-chip cursor-pointer px-2 py-0.5 rounded-[2px] text-nano font-mono font-bold tracking-wider uppercase border transition-all ${
+                  isSelected
+                    ? 'bg-[var(--theme-control-active-bg)] text-[var(--theme-control-active-text)] border-[var(--theme-control-active-border)] shadow-sm ring-1 ring-[var(--theme-control-active-ring)]'
+                    : 'border-[var(--theme-control-border)] bg-[var(--theme-control-bg)] text-[var(--theme-control-text)] hover:bg-[var(--theme-control-hover-bg)] hover:text-[var(--theme-control-hover-text)] hover:border-[var(--theme-card-border-hover)]'
+                }`}
+              >
+                [{labels[cat]}]
+              </button>
+            );
+          })}
+        </div>
+
+        {/* Catalog List */}
+        <div className="overflow-y-auto space-y-2.5 pr-1 mt-3 flex-1 min-h-0 pb-4 scroll-fade-mask pt-1">
+          {DATA_LAYER_CATALOG.filter((preset) => {
+            if (catalogFilter === 'all') return true;
+            if (catalogFilter === 'topo') {
+              return preset.category === 'topo' || preset.category === 'ocean' || preset.category === 'point';
+            }
+            if (catalogFilter === 'vectors') {
+              return preset.category === 'vectors' || preset.category === 'field' || preset.category === 'trajectory' || preset.category === 'point';
+            }
+            if (catalogFilter === 'satellite') {
+              return preset.category === 'satellite' || preset.category === 'night' || preset.category === 'trajectory' || preset.id === 'starlink-iss-orbits';
+            }
+            return true;
+          }).map((preset) => {
+            const isAlreadyAdded = dataLayers.some((l) => l.id === preset.id);
+
+            return (
+              <div
+                key={preset.id}
+                className="p-2.5 rounded-[2px] border transition-all border-[var(--theme-card-border)] bg-[var(--theme-card-bg)] hover:border-[var(--theme-card-border-hover)]"
+              >
+                <div className="flex items-start justify-between gap-2">
+                  <div className="flex-1 min-w-0">
+                    <div className="flex items-center gap-1.5">
+                      <span
+                        className={`w-1.5 h-1.5 rounded-full ${
+                          preset.category === 'topo'
+                            ? 'bg-[var(--theme-text-accent)]'
+                            : preset.category === 'satellite'
+                            ? 'bg-[var(--theme-status-sage)]'
+                            : preset.category === 'vectors'
+                            ? 'bg-[var(--theme-status-amber)]'
+                            : 'bg-[var(--theme-status-slate)]'
+                        }`}
+                      />
+                      <span className="font-semibold text-nano tracking-tight text-[var(--theme-text-primary)] truncate block">
+                        {preset.name}
+                      </span>
+                    </div>
+                    <span className="text-nano text-[var(--theme-text-tertiary)] block mt-0.5 truncate">
+                      {preset.type}
+                    </span>
+                  </div>
+
+                  <span
+                    className={`text-nano px-1.5 py-0.5 rounded-[2px] border font-bold uppercase shrink-0 ${
+                      preset.category === 'topo'
+                        ? 'bg-[var(--theme-text-accent-20)] text-[var(--theme-text-accent)] border-[var(--theme-text-accent-40)]'
+                        : preset.category === 'satellite'
+                        ? 'bg-[var(--theme-status-sage-20)] text-[var(--theme-status-sage)] border-[var(--theme-status-sage-40)]'
+                        : preset.category === 'vectors'
+                        ? 'bg-[var(--theme-status-amber-20)] text-[var(--theme-status-amber)] border-[var(--theme-status-amber-40)]'
+                        : 'bg-[var(--theme-status-slate-20)] text-[var(--theme-status-slate)] border-[var(--theme-status-slate-40)]'
+                    }`}
+                  >
+                    {preset.category}
+                  </span>
+                </div>
+
+                <p className="text-nano text-[var(--theme-text-tertiary)] mt-1.5 leading-relaxed line-clamp-2">
+                  {preset.details}
+                </p>
+
+                <div className="mt-2.5 pt-2 border-t flex items-center justify-between gap-2 border-[var(--theme-card-border)]">
+                  <div className="flex flex-col min-w-0 flex-1">
+                    <span className="text-nano font-mono text-[var(--theme-text-secondary)] truncate" title={preset.attribution}>
+                      Source: {preset.id === 'google-weathernext3'
+                        ? 'Google DeepMind WeatherNext 3 (0.1°)'
+                        : preset.id.includes('gfs')
+                        ? 'NOAA GFS (0.25°)'
+                        : preset.id === 'live-doppler-radar'
+                        ? 'RainViewer (Doppler Radar)'
+                        : preset.attribution}
+                    </span>
+                    <span className="text-pico text-[var(--theme-text-muted)]">
+                      {preset.elevationEncoding ? `Format: ${preset.elevationEncoding.toUpperCase()}` : 'Format: Float32'}
+                    </span>
+                  </div>
+
+                  <button
+                    type="button"
+                    disabled={isAlreadyAdded || preset.unsupported}
+                    onClick={() => {
+                      if (isAlreadyAdded || preset.unsupported) return;
+                      if (onAddDataLayer) {
+                        onAddDataLayer({
+                          id: preset.id,
+                          name: preset.name,
+                          category: preset.category,
+                          type: preset.type,
+                          details: preset.details,
+                          visible: true,
+                          opacity: preset.defaultOpacity,
+                          blendMode: preset.defaultBlendMode,
+                          displacementScale: preset.defaultDisplacementScale,
+                          elevationEncoding: preset.elevationEncoding,
+                          sunAzimuth: 315,
+                          sunAltitude: 45,
+                          hillshadeIntensity: 0.65,
+                          url: preset.url,
+                          renderStyle: preset.renderStyle,
+                        });
+                      }
+                      if (preset.id === 'noaa-gfs-clouds') {
+                        onShowCloudsChange?.(true);
+                      }
+                    }}
+                    className={`px-3 py-1.5 rounded-[2px] text-nano font-bold border transition-all flex items-center gap-1.5 ${
+                      preset.unsupported
+                        ? 'opacity-40 cursor-not-allowed bg-[var(--theme-instrument-viewport-bg)] text-[var(--theme-text-muted)] border-[var(--theme-instrument-viewport-border)]'
+                        : isAlreadyAdded
+                        ? 'bg-[var(--theme-status-sage)]/20 text-[var(--theme-status-sage)] border-[var(--theme-status-sage)]/40 cursor-default ring-1 ring-[var(--theme-status-sage)]/30 font-semibold'
+                        : 'cursor-pointer bg-[var(--theme-control-active-bg)] text-[var(--theme-control-active-text)] border-[var(--theme-control-active-border)] hover:border-[var(--theme-card-border-hover)] shadow-sm font-semibold'
+                    }`}
+                  >
+                    {preset.unsupported ? (
+                      <span>Unsupported</span>
+                    ) : isAlreadyAdded ? (
+                      <>
+                        <svg className="w-3.5 h-3.5 text-[var(--theme-status-sage)]" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2.5" d="M5 13l4 4L19 7" />
+                        </svg>
+                        <span>✓ Added to Stack</span>
+                      </>
+                    ) : (
+                      <>
+                        <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2.5" d="M12 4v16m8-8H4" />
+                        </svg>
+                        <span>+ Add Layer to Stack</span>
+                      </>
+                    )}
+                  </button>
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      </div>
+    </>
+  );
+};

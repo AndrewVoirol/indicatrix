@@ -1,0 +1,394 @@
+// ============================================================================
+// File: src/components/hud/instruments/CurvatureUnfurlSextant.tsx
+// Gaussian Curvature Unfurl Sextant
+// Interactive 180° topological curvature arc measuring surface flattening (K > 0 to K = 0)
+// ============================================================================
+
+import React, { useState, useEffect, useRef, useCallback } from 'react';
+import { SimulationMode } from '../../../types';
+
+export interface CurvatureUnfurlSextantProps {
+  alpha: number; // 0.000 (Sphere) to 1.000 (Map)
+  onAlphaChange: (val: number) => void;
+  onGlideToAlpha?: (target: number) => void;
+  onCancelGlide?: () => void;
+  mode?: SimulationMode;
+  theme?: 0 | 1 | 2;
+  isLight?: boolean;
+}
+
+interface MilestoneStage {
+  t: number;
+  label: string;
+  desc: string;
+  sub: string;
+}
+
+const MILESTONES_BY_MODE: Record<number, MilestoneStage[]> = {
+  0: [
+    { t: 0.0, label: 'SPHERE (K > 0)', desc: 'Closed Riemannian sphere', sub: 'Closed Riemannian sphere' },
+    { t: 0.3, label: 'LINEAR DILATION', desc: 'Spheroidal metric interpolation', sub: 'Spheroidal metric interpolation' },
+    { t: 0.7, label: 'PLANAR TRANSITION', desc: 'Coordinate transformation', sub: 'Coordinate transformation' },
+    { t: 1.0, label: 'PLANAR MAP (K = 0)', desc: 'Equirectangular planar projection', sub: 'Equirectangular planar projection' },
+  ],
+  1: [
+    { t: 0.0, label: 'SPHERE (K > 0)', desc: 'Closed spherical cylinder', sub: 'Closed spherical cylinder' },
+    { t: 0.3, label: 'SEAM DECOUPLING', desc: 'Antimeridian longitudinal cut', sub: 'Antimeridian longitudinal cut' },
+    { t: 0.7, label: 'CYLINDER UNROLL', desc: 'Circumferential unrolling', sub: 'Circumferential unrolling' },
+    { t: 1.0, label: 'PLANAR MAP (K = 0)', desc: 'Unrolled Mercator cylinder', sub: 'Unrolled Mercator cylinder' },
+  ],
+  2: [
+    { t: 0.0, label: 'SPHERE (K > 0)', desc: 'Hoop stress accumulating along seam', sub: 'Hoop stress accumulating along seam' },
+    { t: 0.3, label: 'ANTIMERIDIAN RUPTURE', desc: 'Griffith LEFM crack opens at equator', sub: 'Griffith LEFM crack opens at equator' },
+    { t: 0.7, label: 'FLAP PEELING', desc: 'Elastic stress dissipation', sub: 'Elastic stress dissipation' },
+    { t: 1.0, label: 'PLANAR MAP (K = 0)', desc: 'Unrolled planar fracture manifold', sub: 'Unrolled planar fracture manifold' },
+  ],
+  3: [
+    { t: 0.0, label: 'SPHERE (K > 0)', desc: 'Viscous quiescence', sub: 'Viscous quiescence' },
+    { t: 0.3, label: 'LIQUEFACTION', desc: 'Hydrodynamic viscosity collapse', sub: 'Hydrodynamic viscosity collapse' },
+    { t: 0.7, label: 'VORTEX ADVECTION', desc: 'Turbulent Lamb-Oseen flow', sub: 'Turbulent Lamb-Oseen flow' },
+    { t: 1.0, label: 'PLANAR MAP (K = 0)', desc: 'Conformal planar equilibrium', sub: 'Conformal planar equilibrium' },
+  ],
+};
+
+const MILESTONE_DETENTS = [0.000, 0.300, 0.700, 1.000];
+const VELOCITY_BREAKAWAY = 0.0004;
+
+export const CurvatureUnfurlSextant: React.FC<CurvatureUnfurlSextantProps> = ({
+  alpha = 0,
+  onAlphaChange,
+  onGlideToAlpha,
+  onCancelGlide,
+  mode = 0,
+  isLight = false,
+  theme = isLight ? 1 : 0,
+}) => {
+  const boxRef = useRef<HTMLDivElement>(null);
+  const isDraggingRef = useRef(false);
+  const [isHovered, setIsHovered] = useState(false);
+  const lastClientXRef = useRef(0);
+  const lastTimeRef = useRef(0);
+  const velocityRef = useRef(0);
+  const momentumRafRef = useRef<number | null>(null);
+  const stationaryTimeoutRef = useRef<NodeJS.Timeout | null>(null);
+  const lastInteractedAlphaRef = useRef<number>(alpha);
+
+  useEffect(() => {
+    lastInteractedAlphaRef.current = alpha;
+  }, [alpha]);
+
+  useEffect(() => {
+    return () => {
+      if (momentumRafRef.current) cancelAnimationFrame(momentumRafRef.current);
+      if (stationaryTimeoutRef.current) clearTimeout(stationaryTimeoutRef.current);
+    };
+  }, []);
+
+
+
+  const [dragAlpha, setDragAlpha] = useState<number | null>(null);
+
+  const updateFromPointer = useCallback(
+    (clientX: number) => {
+      if (!boxRef.current) return;
+      const rect = boxRef.current.getBoundingClientRect();
+      if (rect.width <= 0) return;
+      // Active arc span: calibrated pointer clientX relative to SVG arc path [15, 225] inside 240 viewBox.
+      // Because the SVG uses xMidYMid meet, it is letterboxed inside the container. We must calculate the 
+      // actual rendered dimensions and centering padding to project the screen coordinate to the arc correctly.
+      const svgScale = rect.height / 36;
+      const renderedSvgWidth = 240 * svgScale;
+      const svgLeftPadding = (rect.width - renderedSvgWidth) / 2;
+      
+      const arcStartX_px = svgLeftPadding + (15 * svgScale);
+      const arcWidth_px = 210 * svgScale;
+      
+      const rawFrac = (clientX - (rect.left + arcStartX_px)) / arcWidth_px;
+      let normX = Math.max(0.0, Math.min(1.0, rawFrac));
+
+      const nextAlpha = parseFloat(normX.toFixed(4));
+
+      // Render reticle thumb using local drag coordinates, bypassing 30Hz React throttle
+      lastInteractedAlphaRef.current = nextAlpha;
+      setDragAlpha(nextAlpha);
+      onAlphaChange(nextAlpha);
+    },
+    [onAlphaChange]
+  );
+
+  const handlePointerDown = (e: React.PointerEvent) => {
+    if (e.button !== 0) return;
+    onCancelGlide?.();
+    isDraggingRef.current = true;
+    if (stationaryTimeoutRef.current) {
+      clearTimeout(stationaryTimeoutRef.current);
+      stationaryTimeoutRef.current = null;
+    }
+    if (momentumRafRef.current) {
+      cancelAnimationFrame(momentumRafRef.current);
+      momentumRafRef.current = null;
+    }
+    lastClientXRef.current = e.clientX;
+    lastTimeRef.current = performance.now();
+    velocityRef.current = 0;
+    try {
+      boxRef.current?.setPointerCapture?.(e.pointerId);
+    } catch {
+      // Ignore
+    }
+    updateFromPointer(e.clientX);
+  };
+
+  const handlePointerMove = (e: React.PointerEvent) => {
+    if (!isDraggingRef.current) return;
+    if (stationaryTimeoutRef.current) {
+      clearTimeout(stationaryTimeoutRef.current);
+      stationaryTimeoutRef.current = null;
+    }
+    const now = performance.now();
+    const dt = now - lastTimeRef.current;
+    if (dt > 4 && boxRef.current) {
+      const rect = boxRef.current.getBoundingClientRect();
+      if (rect.width > 0) {
+        const svgScale = rect.height / 36;
+        const arcWidth_px = 210 * svgScale;
+        const dx = (e.clientX - lastClientXRef.current) / arcWidth_px;
+        velocityRef.current = dx / dt; // normalized fraction per ms
+        lastClientXRef.current = e.clientX;
+        lastTimeRef.current = now;
+      }
+    }
+    updateFromPointer(e.clientX);
+
+    // If pointer stops moving within a milestone detent radius while still dragging,
+    // decay velocity and snap activeAlpha directly to milestone after brief pause (40ms)
+    stationaryTimeoutRef.current = setTimeout(() => {
+      if (!isDraggingRef.current) return;
+      velocityRef.current = 0;
+      updateFromPointer(lastClientXRef.current);
+    }, 40);
+  };
+
+  const handlePointerUp = (e: React.PointerEvent) => {
+    if (!isDraggingRef.current) return;
+    isDraggingRef.current = false;
+    if (stationaryTimeoutRef.current) {
+      clearTimeout(stationaryTimeoutRef.current);
+      stationaryTimeoutRef.current = null;
+    }
+    try {
+      if (!boxRef.current?.hasPointerCapture || boxRef.current.hasPointerCapture(e.pointerId)) {
+        boxRef.current?.releasePointerCapture?.(e.pointerId);
+      }
+    } catch {
+      // Ignore
+    }
+
+    // If stationary before releasing, cancel coasting
+    const now = performance.now();
+    if (now - lastTimeRef.current > 50) {
+      velocityRef.current = 0;
+    }
+
+    const finalAlpha = dragAlpha !== null ? dragAlpha : alpha;
+    let currentAlpha = finalAlpha;
+    if (lastInteractedAlphaRef.current !== null && lastInteractedAlphaRef.current !== undefined) {
+      currentAlpha = lastInteractedAlphaRef.current;
+    }
+
+    // Micro-momentum coasting (20-50ms inertia decay, strictly clamped to 2-5 alpha units)
+    let vel = velocityRef.current;
+    // Clamp velocity to enforce 2-5 alpha units (0.02 - 0.05) maximum overshoot
+    vel = Math.max(-0.0015, Math.min(0.0015, vel));
+    if (Math.abs(vel) > 0.0002) {
+      const step = () => {
+        vel *= 0.60; // rapid friction damping over 20-50ms (2-3 frames)
+        currentAlpha = Math.max(0.0, Math.min(1.0, currentAlpha + vel * 16));
+        const clampedAlpha = parseFloat(currentAlpha.toFixed(4));
+        setDragAlpha(clampedAlpha);
+        onAlphaChange(clampedAlpha);
+        if (Math.abs(vel) < 0.00008) {
+          momentumRafRef.current = null;
+          setDragAlpha(null);
+          return;
+        }
+        momentumRafRef.current = requestAnimationFrame(step);
+      };
+      momentumRafRef.current = requestAnimationFrame(step);
+    } else {
+      lastInteractedAlphaRef.current = currentAlpha;
+      setDragAlpha(null);
+      onAlphaChange(currentAlpha);
+    }
+  };
+
+  // Local drag alpha takes precedence during interactions to bypass 30Hz React throttle
+  const activeAlpha = dragAlpha !== null ? dragAlpha : alpha;
+
+  // SVG dimensions: 240 x 36
+  const peakY = 6 + activeAlpha * 20;
+  const pathD = `M 15 26 Q 120 ${peakY} 225 26`;
+
+  // Quadratic Bezier formula: B(t) = (1-t)^2 * P0 + 2*(1-t)*t * P1 + t^2 * P2
+  const getBezierY = (tVal: number) =>
+    (1 - tVal) * (1 - tVal) * 26 + 2 * (1 - tVal) * tVal * peakY + tVal * tVal * 26;
+
+  const t = Math.max(0, Math.min(1, activeAlpha));
+  const thumbX = 15 + t * 210;
+  const thumbY = getBezierY(t);
+
+  // Dynamic intermediate tick marker y-coordinates so ticks sit flush on the track line at alpha = 1.0 (no floating dots)
+  const tick2Y = getBezierY(0.3);
+  const tickCenterY = getBezierY(0.5);
+  const tick3Y = getBezierY(0.7);
+
+  const milestones = MILESTONES_BY_MODE[mode] || MILESTONES_BY_MODE[0];
+  let currentMilestone = milestones[0];
+  // Milestone 4 threshold adjusted to alpha >= 0.98
+  if (activeAlpha >= 0.98) currentMilestone = milestones[3];
+  else if (activeAlpha >= 0.5) currentMilestone = milestones[2];
+  else if (activeAlpha >= 0.15) currentMilestone = milestones[1];
+
+  return (
+    <div
+      data-instrument="curvature-unfurl-sextant"
+      className="relative flex flex-col items-center w-72 sm:w-80 md:w-[350px] select-none"
+    >
+      {/* Interactive Sextant Arc Scrubber */}
+      <div
+        ref={boxRef}
+        tabIndex={0}
+        role="slider"
+        aria-label="Topological Curvature Unfurl Sextant"
+        aria-valuemin={0}
+        aria-valuemax={1}
+        aria-valuenow={parseFloat(activeAlpha.toFixed(4))}
+        aria-valuetext={`${(activeAlpha * 100).toFixed(0)}% — ${currentMilestone.label}: ${currentMilestone.sub}`}
+        onKeyDown={(e) => {
+          onCancelGlide?.();
+          if (momentumRafRef.current) {
+            cancelAnimationFrame(momentumRafRef.current);
+            momentumRafRef.current = null;
+          }
+          velocityRef.current = 0;
+          if (dragAlpha !== null) setDragAlpha(null);
+          const step = e.shiftKey ? 0.05 : 0.01;
+          if (e.key === 'ArrowLeft' || e.key === 'ArrowDown') {
+            e.preventDefault();
+            e.stopPropagation();
+            onAlphaChange(parseFloat(Math.max(0.0, activeAlpha - step).toFixed(4)));
+          } else if (e.key === 'ArrowRight' || e.key === 'ArrowUp') {
+            e.preventDefault();
+            e.stopPropagation();
+            onAlphaChange(parseFloat(Math.min(1.0, activeAlpha + step).toFixed(4)));
+          } else if (e.key === 'Home') {
+            e.preventDefault();
+            e.stopPropagation();
+            onAlphaChange(0.0);
+          } else if (e.key === 'End') {
+            e.preventDefault();
+            e.stopPropagation();
+            onAlphaChange(1.0);
+          } else if (!e.metaKey && !e.ctrlKey && !e.altKey && e.key === 'PageUp') {
+            e.preventDefault();
+            e.stopPropagation();
+            const next = MILESTONE_DETENTS.find((m) => m > activeAlpha + 0.001) ?? 1.0;
+            onAlphaChange(parseFloat(next.toFixed(4)));
+          } else if (!e.metaKey && !e.ctrlKey && !e.altKey && e.key === 'PageDown') {
+            e.preventDefault();
+            e.stopPropagation();
+            const prev = [...MILESTONE_DETENTS].reverse().find((m) => m < activeAlpha - 0.001) ?? 0.0;
+            onAlphaChange(parseFloat(prev.toFixed(4)));
+          } else if (!e.metaKey && !e.ctrlKey && !e.altKey && e.key === '1') {
+            e.preventDefault();
+            e.stopPropagation();
+            onAlphaChange(0.0);
+          } else if (!e.metaKey && !e.ctrlKey && !e.altKey && e.key === '2') {
+            e.preventDefault();
+            e.stopPropagation();
+            onAlphaChange(0.3);
+          } else if (!e.metaKey && !e.ctrlKey && !e.altKey && e.key === '3') {
+            e.preventDefault();
+            e.stopPropagation();
+            onAlphaChange(0.7);
+          } else if (!e.metaKey && !e.ctrlKey && !e.altKey && e.key === '4') {
+            e.preventDefault();
+            e.stopPropagation();
+            onAlphaChange(1.0);
+          }
+        }}
+        onPointerDown={handlePointerDown}
+        onPointerMove={handlePointerMove}
+        onPointerUp={handlePointerUp}
+        onPointerCancel={handlePointerUp}
+        onLostPointerCapture={handlePointerUp}
+        onPointerEnter={() => setIsHovered(true)}
+        onPointerLeave={() => setIsHovered(false)}
+        onDoubleClick={() => {
+          if (momentumRafRef.current) {
+            cancelAnimationFrame(momentumRafRef.current);
+            momentumRafRef.current = null;
+          }
+          velocityRef.current = 0;
+          setDragAlpha(null);
+          const refAlpha = dragAlpha !== null ? dragAlpha : lastInteractedAlphaRef.current;
+          onGlideToAlpha?.(refAlpha < 0.5 ? 1.0 : 0.0);
+        }}
+        title="Drag vernier reticle along curvature arc (Double-click to toggle Globe/Map, Arrow keys to nudge)"
+        className={`relative w-full h-9 rounded-[2px] flex items-center justify-center cursor-pointer select-none touch-none shadow-inner bg-[var(--theme-instrument-viewport-bg)] transition-all duration-200 focus-visible:ring-2 focus-visible:ring-[var(--theme-focus-ring)] focus-visible:outline-none ${
+          isHovered ? 'shadow-[0_0_12px_var(--theme-focus-ring)]' : ''
+        }`}
+        style={{ touchAction: 'none' }}
+      >
+        <svg className="w-full h-full pointer-events-none" viewBox="0 0 240 36" preserveAspectRatio="xMidYMid meet">
+          {/* Radial reference rays - dynamically calibrated to fiducial milestone detents */}
+          <line x1="120" y1="34" x2="15" y2="26" stroke="var(--theme-instrument-viewport-border)" strokeDasharray="2 2" />
+          <line x1="120" y1="34" x2="78" y2={tick2Y} stroke="var(--theme-instrument-viewport-border)" strokeDasharray="2 2" />
+          <line x1="120" y1="34" x2="120" y2={tickCenterY} stroke="var(--theme-instrument-viewport-border)" strokeDasharray="2 2" />
+          <line x1="120" y1="34" x2="162" y2={tick3Y} stroke="var(--theme-instrument-viewport-border)" strokeDasharray="2 2" />
+          <line x1="120" y1="34" x2="225" y2="26" stroke="var(--theme-instrument-viewport-border)" strokeDasharray="2 2" />
+
+          {/* Curvature Unfurling Arc */}
+          <path
+            d={pathD}
+            fill="none"
+            stroke="var(--theme-instrument-ink)"
+            strokeWidth="2.5"
+            strokeLinecap="round"
+          />
+
+          {/* Magnetic tick markers - rendered on top of arc track for optical legibility */}
+          <circle cx="15" cy="26" r="2.5" fill={activeAlpha < 0.15 ? 'var(--theme-instrument-ink-secondary)' : 'var(--theme-instrument-viewport-border)'} stroke="var(--theme-instrument-ink)" strokeWidth="0.75" />
+          <circle cx="78" cy={tick2Y} r="2.5" fill={activeAlpha >= 0.15 && activeAlpha < 0.5 ? 'var(--theme-instrument-ink-secondary)' : 'var(--theme-instrument-viewport-border)'} stroke="var(--theme-instrument-ink)" strokeWidth="0.75" />
+          <circle cx="162" cy={tick3Y} r="2.5" fill={activeAlpha >= 0.5 && activeAlpha < 0.98 ? 'var(--theme-instrument-ink-secondary)' : 'var(--theme-instrument-viewport-border)'} stroke="var(--theme-instrument-ink)" strokeWidth="0.75" />
+          <circle cx="225" cy="26" r="2.5" fill={activeAlpha >= 0.98 ? 'var(--theme-instrument-ink-secondary)' : 'var(--theme-instrument-viewport-border)'} stroke="var(--theme-instrument-ink)" strokeWidth="0.75" />
+
+          {/* Reticle Thumb */}
+          <circle
+            cx={thumbX}
+            cy={thumbY}
+            r={isHovered || dragAlpha !== null ? 5.5 : 4.5}
+            fill="var(--theme-slider-thumb-bg)"
+            stroke="var(--theme-slider-thumb-border)"
+            strokeWidth="2"
+            className="shadow-sm"
+          />
+        </svg>
+
+        {/* Milestone Tick Labels */}
+        <div className="absolute top-1 left-2 text-nano font-mono font-bold pointer-events-none text-[var(--theme-text-accent)]">
+          K &gt; 0
+        </div>
+        <div className="absolute top-1 right-2 text-nano font-mono font-bold pointer-events-none text-[var(--theme-text-accent)]">
+          K = 0
+        </div>
+      </div>
+
+      {/* Stage Telemetry Tag */}
+      <div className="absolute top-full mt-1 w-full h-3.5 leading-tight text-center truncate text-micro font-mono tracking-wider uppercase pointer-events-none">
+        <span className="font-bold text-[var(--theme-text-accent)]">{currentMilestone.label}</span>
+        <span className="opacity-70 text-[var(--theme-text-secondary)]"> · {currentMilestone.desc}</span>
+      </div>
+    </div>
+  );
+};

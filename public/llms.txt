@@ -1,0 +1,9 @@
+# Indicatrix Engine — Riemannian Cartographic Manifold & WebGPU Earth Observatory
+
+> Interactive WebGPU archival cartographic manifold engine transforming a 3D terrestrial globe into continuous 2D map projections (Linear Equirectangular, Mercator Scroll, Griffith LEFM Fracture, and Fluid Continuum) across three physical drafting mediums (1977 Marie Tharp Physiographic Panorama, 19th-Century Cream Cotton Rag Intaglio, and 1842 Herschel Prussian Cyanotype).
+
+## Documentation & Entry Points
+- [Interactive Cartographic Observatory](/): Main WebGPU 3D globe-to-map Riemannian manifold application.
+- [WeatherNext 2 Prognostic Metadata](/data/weathernext/meta.json): DeepMind WeatherNext 2 and NOAA GFS multi-stratum forecast metadata.
+- [Atmospheric & Bathymetric Ingestion Status](/data/ingestion-status.json): Live synoptic telemetry and DEM dataset provenance manifest.
+- [Natural Earth Vector Topology](/geo-vectors.bin): Multi-tier 1:110M, 1:10M, and 1:1M coastline and Leopold-Maddock river hierarchy binary dataset.

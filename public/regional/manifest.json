@@ -1,0 +1,102 @@
+{
+  "version": "1.0",
+  "description": "High-Resolution Regional Elevation Overlays (1/3 arc-second ~10m & 1 arc-second ~30m)",
+  "elevationEncoding": {
+    "zMin": -10924.0,
+    "zMax": 8848.0,
+    "zSpan": 19772.0,
+    "channels": {
+      "R": "land_elevation_normalized_to_8848m",
+      "G": "ocean_depth_normalized_to_10924m",
+      "B": "shoreline_land_mask",
+      "A": "full_range_signed_elevation_normalized"
+    }
+  },
+  "regions": [
+    {
+      "id": "hawaii",
+      "name": "Hawaii",
+      "bounds": {
+        "minLon": -161.0,
+        "maxLon": -154.0,
+        "minLat": 18.0,
+        "maxLat": 23.0
+      },
+      "width": 5400,
+      "height": 3600,
+      "binUrl": "/regional/hawaii-dem-u16.bin",
+      "webpUrl": "/regional/hawaii-dem.webp",
+      "cogUrl": "/regional/hawaii.cog.tif",
+      "minElevationMeters": -5800.205078125,
+      "maxElevationMeters": 4011.4248046875
+    },
+    {
+      "id": "capecod",
+      "name": "Cape Cod",
+      "bounds": {
+        "minLon": -71.0,
+        "maxLon": -69.0,
+        "minLat": 41.0,
+        "maxLat": 43.0
+      },
+      "width": 2400,
+      "height": 2400,
+      "binUrl": "/regional/capecod-dem-u16.bin",
+      "webpUrl": "/regional/capecod-dem.webp",
+      "cogUrl": "/regional/capecod.cog.tif",
+      "minElevationMeters": -286.0087890625,
+      "maxElevationMeters": 97.7548828125
+    },
+    {
+      "id": "grand-canyon",
+      "name": "Grand Canyon",
+      "bounds": {
+        "minLon": -112.5,
+        "maxLon": -111.5,
+        "minLat": 35.9,
+        "maxLat": 36.5
+      },
+      "width": 900,
+      "height": 540,
+      "binUrl": "/regional/dem-grand-canyon-30m.bin",
+      "webpUrl": "/regional/dem-grand-canyon-30m.webp",
+      "cogUrl": "/regional/grand-canyon.cog.tif",
+      "minElevationMeters": 605.517578125,
+      "maxElevationMeters": 2805.8271484375
+    },
+    {
+      "id": "fuji",
+      "name": "Mount Fuji",
+      "bounds": {
+        "minLon": 138.5,
+        "maxLon": 139.0,
+        "minLat": 35.2,
+        "maxLat": 35.5
+      },
+      "width": 900,
+      "height": 540,
+      "binUrl": "/regional/dem-fuji-30m.bin",
+      "webpUrl": "/regional/dem-fuji-30m.webp",
+      "cogUrl": "/regional/dem-fuji-30m.cog.tif",
+      "minElevationMeters": 51.896484375,
+      "maxElevationMeters": 3756.4873046875
+    },
+    {
+      "id": "matterhorn",
+      "name": "Matterhorn (Swiss Alps)",
+      "bounds": {
+        "minLon": 7.2,
+        "maxLon": 8.2,
+        "minLat": 45.6,
+        "maxLat": 46.4
+      },
+      "width": 900,
+      "height": 540,
+      "binUrl": "/regional/dem-matterhorn-30m.bin",
+      "webpUrl": "/regional/dem-matterhorn-30m.webp",
+      "cogUrl": "/regional/dem-matterhorn-30m.cog.tif",
+      "minElevationMeters": 280.41973876953125,
+      "maxElevationMeters": 4504.11376953125
+    }
+  ]
+}

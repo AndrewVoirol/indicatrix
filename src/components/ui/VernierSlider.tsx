@@ -1,0 +1,182 @@
+// ============================================================================
+// File: src/components/ui/VernierSlider.tsx
+// Primitive: Calibrated Vernier Millimeter Range Slider with Steppers
+// Theme-adaptive, accessible slider with fine-increment buttons & tabular readout
+// ============================================================================
+
+import React from 'react';
+
+export interface VernierSliderProps {
+  id: string;
+  label: string;
+  sublabel?: string;
+  tooltip?: string;
+  value: number;
+  defaultValue?: number;
+  min: number;
+  max: number;
+  step: number;
+  unit?: string;
+  readout?: string;
+  onChange?: (val: number) => void;
+  onDoubleClick?: (e: React.MouseEvent) => void;
+  disabled?: boolean;
+  showSteppers?: boolean;
+  showTicks?: boolean;
+  className?: string;
+}
+
+export const VernierSlider: React.FC<VernierSliderProps> = ({
+  id,
+  label,
+  sublabel,
+  tooltip,
+  value,
+  defaultValue,
+  min,
+  max,
+  step,
+  unit = '',
+  readout,
+  onChange,
+  onDoubleClick,
+  disabled = false,
+  showSteppers = true,
+  showTicks = true,
+  className = '',
+}) => {
+  const [localVal, setLocalVal] = React.useState(value);
+
+  React.useEffect(() => {
+    setLocalVal(value);
+  }, [value]);
+
+  const handleStep = (dir: -1 | 1) => {
+    if (disabled || !onChange) return;
+    const base = value !== undefined ? value : localVal;
+    const next = Math.max(min, Math.min(max, parseFloat((base + dir * step).toFixed(3))));
+    setLocalVal(next);
+    onChange(next);
+  };
+
+  const handleReset = (e: React.MouseEvent) => {
+    if (disabled) return;
+    if (onDoubleClick) {
+      onDoubleClick(e);
+    }
+    if (defaultValue !== undefined && onChange) {
+      setLocalVal(defaultValue);
+      onChange(defaultValue);
+    }
+  };
+
+  const formattedReadout = readout !== undefined ? readout : `${localVal}${unit}`;
+  const effectiveTooltip = tooltip 
+    ? (defaultValue !== undefined ? `${tooltip} (Double-click to reset: ${defaultValue}${unit})` : tooltip)
+    : (defaultValue !== undefined ? `${label} (Double-click to reset: ${defaultValue}${unit})` : sublabel);
+
+  return (
+    <div
+      onDoubleClick={handleReset}
+      className={`p-2 rounded-[2px] border space-y-1.5 transition-colors bg-[var(--theme-card-bg)] border-[var(--theme-card-border)] ${
+        disabled ? 'opacity-50 pointer-events-none' : ''
+      } ${className}`}
+    >
+      {/* Header: Label, Sublabel & Readout/Steppers */}
+      <div className="flex items-center justify-between text-micro">
+        <div className="flex flex-col min-w-0 pr-1" title={effectiveTooltip}>
+          <label
+            htmlFor={id}
+            title={effectiveTooltip}
+            onDoubleClick={handleReset}
+            className="font-bold uppercase tracking-wider text-[var(--theme-text-primary)] cursor-pointer truncate text-body"
+          >
+            {label}
+          </label>
+          {sublabel && (
+            <span className="text-nano font-mono text-[var(--theme-text-tertiary)] truncate">
+              {sublabel}
+            </span>
+          )}
+        </div>
+
+        <div className="flex items-center gap-1.5 shrink-0">
+          {showSteppers && (
+            <button
+              type="button"
+              onClick={() => handleStep(-1)}
+              disabled={disabled || value <= min}
+              title={`Decrease ${label}`}
+              className="tactile-press w-5 h-5 rounded-[1px] border border-[var(--theme-control-border)] bg-[var(--theme-control-bg)] hover:bg-[var(--theme-control-hover-bg)] text-[var(--theme-text-accent)] disabled:opacity-35 flex items-center justify-center font-bold text-body leading-none select-none transition-colors"
+            >
+              -
+            </button>
+          )}
+
+          <span
+            onDoubleClick={handleReset}
+            title={defaultValue !== undefined ? `Double-click to reset (${defaultValue}${unit})` : undefined}
+            className={`font-mono font-bold tabular-nums text-body min-w-[36px] text-right text-[var(--theme-text-primary)] ${
+              defaultValue !== undefined ? 'cursor-pointer hover:underline' : ''
+            }`}
+          >
+            {formattedReadout}
+          </span>
+
+          {showSteppers && (
+            <button
+              type="button"
+              onClick={() => handleStep(1)}
+              disabled={disabled || value >= max}
+              title={`Increase ${label}`}
+              className="tactile-press w-5 h-5 rounded-[1px] border border-[var(--theme-control-border)] bg-[var(--theme-control-bg)] hover:bg-[var(--theme-control-hover-bg)] text-[var(--theme-text-accent)] disabled:opacity-35 flex items-center justify-center font-bold text-body leading-none select-none transition-colors"
+            >
+              +
+            </button>
+          )}
+        </div>
+      </div>
+
+      {/* Slider Track & Millimeter Vernier Calibration */}
+      <div className="relative pt-0.5">
+        <input
+          id={id}
+          type="range"
+          min={min}
+          max={max}
+          step={step}
+          value={localVal}
+          disabled={disabled}
+          aria-label={label}
+          aria-valuemin={min}
+          aria-valuemax={max}
+          aria-valuenow={localVal}
+          onDoubleClick={handleReset}
+          onInput={(e) => {
+            const next = parseFloat((e.target as HTMLInputElement).value);
+            if (!Number.isNaN(next)) {
+              setLocalVal(next);
+              onChange?.(next);
+            }
+          }}
+          onChange={(e) => {
+            const next = parseFloat(e.target.value);
+            if (!Number.isNaN(next)) {
+              setLocalVal(next);
+              onChange?.(next);
+            }
+          }}
+          className="w-full slider-archival h-1 cursor-pointer block transition-opacity touch-none select-none"
+        />
+
+        {showTicks && (
+          <div className="vernier-ticks pt-0.5" aria-hidden="true">
+            <span>|</span><span>·</span><span>·</span><span>·</span><span>|</span>
+            <span>·</span><span>·</span><span>·</span><span>|</span><span>·</span>
+            <span>·</span><span>·</span><span>|</span>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+};

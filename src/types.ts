@@ -1,0 +1,40 @@
+export type SimulationMode = 0 | 1 | 2 | 3; // 0 = Linear, 1 = Scroll, 2 = Griffith, 3 = Fluid
+export type LayerMode = 0 | 1 | 2; // 0 = Both, 1 = Points Only, 2 = Wireframe Only
+export type GeodesicOverlayMode = 'off' | 'antipodes' | 'conveyor' | 'migration';
+export type ResolutionTier = '100k' | '1M' | '3M' | '4M' | '8M' | '16M';
+export type ExtendedResolutionTier = ResolutionTier;
+
+export interface LoadedDataInfo {
+  pointCount: number;
+  lineCount: number;
+  format: string;
+  loadTimeMs: number;
+  vramMb: number;
+}
+
+export type BlendModeType = 0 | 1 | 2 | 3; // 0 = Normal, 1 = Additive, 2 = Multiply, 3 = Screen
+
+export interface DataLayerItem {
+  id: string;
+  name: string;
+  category?: string;
+  type: string;
+  details: string;
+  visible: boolean;
+  opacity?: number;
+  blendMode?: BlendModeType;
+  displacementScale?: number;
+  elevationEncoding?: 'luminance' | 'mapbox' | 'terrarium';
+  sunAzimuth?: number;
+  sunAltitude?: number;
+  hillshadeIntensity?: number;
+  url?: string;
+  renderStyle?: 'architectural' | 'hybrid' | 'photoreal';
+  seaLevelOffset?: number;
+  waterClarity?: number;
+  peakExponent?: number;
+  ambientOcclusion?: number;
+  paperTooth?: number;
+  unsupported?: boolean;
+  unsupportedReason?: string;
+}

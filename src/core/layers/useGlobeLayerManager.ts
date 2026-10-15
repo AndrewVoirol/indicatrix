@@ -1,0 +1,364 @@
+// ============================================================================
+// File: src/core/layers/useGlobeLayerManager.ts
+// Architecture: React State & GlobeLayerManager Synchronization Hook
+// Description: Unifies UI layer state mutations, z-index ordering, and toast feedback
+// ============================================================================
+
+import { useState, useRef, useCallback, useEffect } from 'react';
+import { GlobeLayerManager } from './GlobeLayerManager';
+import { DataLayerItem } from '../../components/hud/UnifiedRightSidebar';
+import { ToastMessage } from '../../components/hud/DataLayerToastNotification';
+import { BlendModeType, getPresetById, DataLayerRenderStyle } from '../data/DataLayerCatalog';
+
+export function useGlobeLayerManager(initialLayers?: DataLayerItem[]) {
+  const managerRef = useRef<GlobeLayerManager>(new GlobeLayerManager());
+
+  const [toasts, setToasts] = useState<ToastMessage[]>([]);
+  const [dataLayers, setDataLayers] = useState<DataLayerItem[]>(
+    initialLayers || [
+      {
+        id: 'architectural-topo-relief',
+        name: 'Architectural Topographic Relief',
+        category: 'topo',
+        type: 'Monochrome Relief & Isolines',
+        details: 'Cartographic Eduard Imhof relief shading, analytical elevation isocontours & bathymetric isobaths matching Theme 0/1',
+        visible: true,
+        url: '/earth-etopo2022-dem-u16.bin',
+        opacity: 0.95,
+        blendMode: 0,
+        displacementScale: 0.10,
+        renderStyle: 'architectural',
+        ambientOcclusion: 0.65,
+        seaLevelOffset: 0,
+        waterClarity: 0.75,
+        peakExponent: 1.4,
+        paperTooth: 0.40,
+        sunAzimuth: 315.0,
+        sunAltitude: 45.0,
+        hillshadeIntensity: 0.65,
+      },
+      {
+        id: 'google-weathernext3',
+        name: 'Google DeepMind WeatherNext 3 (0.1° AI)',
+        category: 'field',
+        type: '0.1° (10km) AI',
+        details: 'Global 0.1° (10km) AI prognostic weather model with 48-hour continuous time horizon across 6 prognostic fields',
+        visible: true,
+        url: '/data/weathernext/meta.json',
+        opacity: 0.85,
+        blendMode: 0,
+      },
+    ]
+  );
+
+  const addToast = useCallback((toast: Omit<ToastMessage, 'id'>) => {
+    const id = `toast-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`;
+    setToasts((prev) => [...prev.slice(-4), { ...toast, id }]);
+  }, []);
+
+  const dismissToast = useCallback((id: string) => {
+    setToasts((prev) => prev.filter((t) => t.id !== id));
+  }, []);
+
+  // Layers managed dynamically via state
+  const handleAddDataLayer = useCallback(
+    (layer: DataLayerItem) => {
+      const preset = getPresetById(layer.id);
+      if (preset?.unsupported || (layer as any).unsupported) {
+        addToast({
+          type: 'warning',
+          title: 'Unsupported Dataset',
+          message: `${layer.name} requires XYZ Tile Pyramid Pipeline (unsupported)`,
+        });
+        return;
+      }
+      setDataLayers((prev) => {
+        if (prev.some((l) => l.id === layer.id)) return prev;
+        return [...prev, layer];
+      });
+      const presetForAttribution = getPresetById(layer.id);
+      const source = layer.id === 'google-weathernext3'
+        ? 'Google DeepMind WeatherNext 3 (0.1°)'
+        : layer.id.includes('gfs')
+        ? 'NOAA GFS (0.25°)'
+        : layer.id === 'live-doppler-radar'
+        ? 'RainViewer (Doppler Radar)'
+        : presetForAttribution?.attribution;
+      addToast({
+        type: 'success',
+        title: 'Dataset Layer Added',
+        message: source ? `${layer.name} • ${source}` : `Activated ${layer.name} (${layer.type})`,
+      });
+    },
+    [addToast]
+  );
+
+  const handleToggleDataLayer = useCallback(
+    (id: string) => {
+      managerRef.current.toggleLayerVisibility(id);
+      setDataLayers((prev) => {
+        const next = prev.map((l) => (l.id === id ? { ...l, visible: !l.visible } : l));
+        const target = next.find((l) => l.id === id);
+        if (target) {
+          const preset = getPresetById(target.id);
+          const source = target.id === 'google-weathernext3'
+            ? 'Google DeepMind WeatherNext 3 (0.1°)'
+            : target.id.includes('gfs')
+            ? 'NOAA GFS (0.25°)'
+            : target.id === 'live-doppler-radar'
+            ? 'RainViewer (Doppler Radar)'
+            : preset?.attribution;
+          addToast({
+            type: 'info',
+            title: `Layer ${target.visible ? 'Visible' : 'Hidden'}`,
+            message: source ? `${target.name} [${source}]` : target.name,
+          });
+        }
+        return next;
+      });
+    },
+    [addToast]
+  );
+
+  const handleRemoveDataLayer = useCallback(
+    (id: string) => {
+      managerRef.current.removeLayer(id);
+      setDataLayers((prev) => {
+        const target = prev.find((l) => l.id === id);
+        if (target) {
+          addToast({
+            type: 'warning',
+            title: 'Layer Removed',
+            message: `Removed ${target.name} from active stack`,
+          });
+        }
+        return prev.filter((l) => l.id !== id);
+      });
+    },
+    [addToast]
+  );
+
+  const handleOpacityChangeDataLayer = useCallback((id: string, opacity: number) => {
+    managerRef.current.setLayerOpacity(id, opacity);
+    setDataLayers((prev) =>
+      prev.map((l) => (l.id === id ? { ...l, opacity } : l))
+    );
+  }, []);
+
+  const handleBlendModeChangeDataLayer = useCallback((id: string, blendMode: BlendModeType) => {
+    const modeMap: Record<BlendModeType, 'opaque' | 'additive' | 'multiply' | 'screen'> = {
+      0: 'opaque',
+      1: 'additive',
+      2: 'multiply',
+      3: 'screen',
+    };
+    managerRef.current.setLayerBlendMode(id, modeMap[blendMode] || 'opaque');
+    setDataLayers((prev) =>
+      prev.map((l) => (l.id === id ? { ...l, blendMode } : l))
+    );
+  }, []);
+
+  const handleReorderDataLayer = useCallback(
+    (id: string, direction: 'up' | 'down') => {
+      setDataLayers((prev) => {
+        const index = prev.findIndex((l) => l.id === id);
+        if (index === -1) return prev;
+        const targetIndex = direction === 'up' ? index - 1 : index + 1;
+        if (targetIndex < 0 || targetIndex >= prev.length) return prev;
+
+        const updated = [...prev];
+        const [moved] = updated.splice(index, 1);
+        updated.splice(targetIndex, 0, moved);
+
+        // Update z-index order in GlobeLayerManager
+        updated.forEach((layer, idx) => {
+          const zOrder = (updated.length - idx) * 10;
+          managerRef.current.setLayerOrder(layer.id, zOrder);
+        });
+        managerRef.current.reorder();
+
+        addToast({
+          type: 'info',
+          title: 'Z-Order Updated',
+          message: `Moved ${moved.name} ${direction === 'up' ? 'closer to top' : 'down stack'}`,
+        });
+
+        return updated;
+      });
+    },
+    [addToast]
+  );
+
+  // Decoupled uniform queue for high-frequency continuous slider updates
+  const pendingUpdatesRef = useRef<Map<string, Partial<DataLayerItem>>>(new Map());
+  const commitTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  const flushUpdates = useCallback(() => {
+    if (pendingUpdatesRef.current.size === 0) return;
+    const updates = new Map(pendingUpdatesRef.current);
+    pendingUpdatesRef.current.clear();
+    commitTimeoutRef.current = null;
+
+    if (typeof window !== 'undefined' && (window as any).__INDICATRIX_LIVE_UNIFORMS__) {
+      const live = (window as any).__INDICATRIX_LIVE_UNIFORMS__;
+      for (const patch of updates.values()) {
+        for (const k of Object.keys(patch)) {
+          delete live[k];
+          if (k === 'paperTooth') delete live.roughness;
+        }
+      }
+    }
+
+    setDataLayers((prev) =>
+      prev.map((l) => {
+        const patch = updates.get(l.id);
+        return patch ? { ...l, ...patch } : l;
+      })
+    );
+  }, []);
+
+  const queueUpdate = useCallback(
+    (id: string, patch: Partial<DataLayerItem>) => {
+      const existing = pendingUpdatesRef.current.get(id) || {};
+      pendingUpdatesRef.current.set(id, { ...existing, ...patch });
+
+      // Immediately publish directly to fast global uniform bus / WebGPU uniform buffer
+      if (typeof window !== 'undefined') {
+        if (!(window as any).__INDICATRIX_LIVE_UNIFORMS__) {
+          (window as any).__INDICATRIX_LIVE_UNIFORMS__ = {};
+        }
+        Object.assign((window as any).__INDICATRIX_LIVE_UNIFORMS__, patch);
+
+        const engine = (window as any).__INDICATRIX_WEBGPU_ENGINE__ || (window as any).__ENGINE;
+        if (engine && typeof engine.updateUniforms === 'function') {
+          engine.updateUniforms(patch);
+        }
+      }
+
+      // Debounce React state re-render so slider dragging does not trigger App.tsx & UnifiedRightSidebar re-renders
+      if (commitTimeoutRef.current) {
+        clearTimeout(commitTimeoutRef.current);
+      }
+      commitTimeoutRef.current = setTimeout(flushUpdates, 200);
+    },
+    [flushUpdates]
+  );
+
+  useEffect(() => {
+    return () => {
+      if (commitTimeoutRef.current) {
+        clearTimeout(commitTimeoutRef.current);
+      }
+    };
+  }, []);
+
+  const handleDisplacementScaleChangeDataLayer = useCallback((id: string, displacementScale: number) => {
+    queueUpdate(id, { displacementScale });
+  }, [queueUpdate]);
+
+  const handleHillshadeChangeDataLayer = useCallback((id: string, sunAzimuth: number, hillshadeIntensity: number, sunAltitude?: number) => {
+    queueUpdate(id, {
+      sunAzimuth,
+      hillshadeIntensity,
+      ...(sunAltitude !== undefined ? { sunAltitude } : {}),
+    });
+  }, [queueUpdate]);
+
+  const handleSeaLevelOffsetChangeDataLayer = useCallback((id: string, seaLevelOffset: number) => {
+    queueUpdate(id, { seaLevelOffset });
+  }, [queueUpdate]);
+
+  const handleWaterClarityChangeDataLayer = useCallback((id: string, waterClarity: number) => {
+    queueUpdate(id, { waterClarity });
+  }, [queueUpdate]);
+
+  const handlePeakExponentChangeDataLayer = useCallback((id: string, peakExponent: number) => {
+    queueUpdate(id, { peakExponent });
+  }, [queueUpdate]);
+
+  const handleAmbientOcclusionChangeDataLayer = useCallback((id: string, ambientOcclusion: number) => {
+    queueUpdate(id, { ambientOcclusion });
+  }, [queueUpdate]);
+
+  const handlePaperToothChangeDataLayer = useCallback((id: string, paperTooth: number) => {
+    queueUpdate(id, { paperTooth });
+  }, [queueUpdate]);
+
+  const handleSelectRenderStyle = useCallback(
+    (style: DataLayerRenderStyle) => {
+      const presetId =
+        style === 'architectural'
+          ? 'architectural-topo-relief'
+          : style === 'hybrid'
+          ? 'hybrid-crust-hydrosphere'
+          : 'nasa-blue-marble';
+
+      const preset = getPresetById(presetId);
+      if (!preset) return;
+
+      setDataLayers((prev) => {
+        // Keep non-cartographic auxiliary layers if any, replacing cartographic base layers
+        const filtered = prev.filter(
+          (l) =>
+            l.renderStyle !== 'architectural' &&
+            l.renderStyle !== 'hybrid' &&
+            l.renderStyle !== 'photoreal' &&
+            l.id !== presetId
+        );
+
+        const newLayer: DataLayerItem = {
+          id: preset.id,
+          name: preset.name,
+          category: preset.category,
+          type: preset.type,
+          details: preset.details,
+          visible: true,
+          opacity: preset.defaultOpacity,
+          blendMode: preset.defaultBlendMode,
+          displacementScale: preset.defaultDisplacementScale,
+          elevationEncoding: preset.elevationEncoding,
+          sunAzimuth: 315,
+          sunAltitude: 45,
+          hillshadeIntensity: 0.65,
+          seaLevelOffset: preset.seaLevelOffset ?? 0,
+          waterClarity: preset.waterClarity ?? 0.75,
+          peakExponent: preset.peakExponent ?? (style === 'hybrid' ? 1.4 : 1.0),
+          ambientOcclusion: preset.ambientOcclusion ?? 0.65,
+          url: preset.url,
+          renderStyle: preset.renderStyle,
+        };
+
+        return [newLayer, ...filtered];
+      });
+
+      addToast({
+        type: 'info',
+        title: `Direction ${style === 'architectural' ? 'A' : style === 'hybrid' ? 'B' : 'C'} Activated`,
+        message: `${preset.name}`,
+      });
+    },
+    [addToast]
+  );
+
+  return {
+    layerManager: managerRef.current,
+    dataLayers,
+    toasts,
+    addToast,
+    dismissToast,
+    handleAddDataLayer,
+    handleToggleDataLayer,
+    handleRemoveDataLayer,
+    handleOpacityChangeDataLayer,
+    handleBlendModeChangeDataLayer,
+    handleDisplacementScaleChangeDataLayer,
+    handleHillshadeChangeDataLayer,
+    handleSeaLevelOffsetChangeDataLayer,
+    handleWaterClarityChangeDataLayer,
+    handlePeakExponentChangeDataLayer,
+    handleAmbientOcclusionChangeDataLayer,
+    handlePaperToothChangeDataLayer,
+    handleReorderDataLayer,
+    handleSelectRenderStyle,
+  };
+}

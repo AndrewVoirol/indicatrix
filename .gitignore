@@ -1,0 +1,29 @@
+# Dependencies & Build
+node_modules
+dist
+dist-ssr
+*.local
+
+# Logs & OS
+logs
+*.log
+.DS_Store
+.vscode/*
+!.vscode/extensions.json
+.idea
+__pycache__/
+*.pyc
+.cache/
+
+# Self-serve / generated high-resolution planetary & meteorological binary payloads
+# Fetch or generate locally via:
+#   npm run refresh:planetary
+#   npm run weather:fetch (or npm run weather:mock)
+#   npm run precompute -- --density 1m
+public/data/*.bin
+public/data/weathernext/*.bin
+public/*-u16.bin
+public/*.cog.tif
+public/geo-mesh-1m.bin
+public/regional/*.bin
+public/regional/*.cog.tif
