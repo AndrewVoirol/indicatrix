@@ -53,7 +53,7 @@
     "@vitejs/plugin-react": "^6.1.2",
     "@webgpu/types": "^0.1.72",
     "canvas": "^3.2.3",
-    "happy-dom": "^20.13.2",
+    "happy-dom": "^21.0.4",
     "tailwindcss": "^4.3.3",
     "three": "^0.185.1",
     "tsx": "^4.23.15",
