@@ -26,16 +26,16 @@ export function useGlobeLayerManager(initialLayers?: DataLayerItem[]) {
         url: '/earth-etopo2022-dem-u16.bin',
         opacity: 0.95,
         blendMode: 0,
-        displacementScale: 0.10,
+        displacementScale: 0.14,
         renderStyle: 'architectural',
         ambientOcclusion: 0.65,
         seaLevelOffset: 0,
-        waterClarity: 0.75,
-        peakExponent: 1.4,
+        waterClarity: 0.70,
+        peakExponent: 1.6,
         paperTooth: 0.40,
         sunAzimuth: 315.0,
         sunAltitude: 45.0,
-        hillshadeIntensity: 0.65,
+        hillshadeIntensity: 0.70,
       },
       {
         id: 'google-weathernext3',
@@ -81,8 +81,6 @@ export function useGlobeLayerManager(initialLayers?: DataLayerItem[]) {
         ? 'Google DeepMind WeatherNext 3 (0.1°)'
         : layer.id.includes('gfs')
         ? 'NOAA GFS (0.25°)'
-        : layer.id === 'live-doppler-radar'
-        ? 'RainViewer (Doppler Radar)'
         : presetForAttribution?.attribution;
       addToast({
         type: 'success',
@@ -105,8 +103,6 @@ export function useGlobeLayerManager(initialLayers?: DataLayerItem[]) {
             ? 'Google DeepMind WeatherNext 3 (0.1°)'
             : target.id.includes('gfs')
             ? 'NOAA GFS (0.25°)'
-            : target.id === 'live-doppler-radar'
-            ? 'RainViewer (Doppler Radar)'
             : preset?.attribution;
           addToast({
             type: 'info',
@@ -222,17 +218,12 @@ export function useGlobeLayerManager(initialLayers?: DataLayerItem[]) {
       const existing = pendingUpdatesRef.current.get(id) || {};
       pendingUpdatesRef.current.set(id, { ...existing, ...patch });
 
-      // Immediately publish directly to fast global uniform bus / WebGPU uniform buffer
+      // Immediately publish directly to fast global uniform bus read by WebGPUCanvas.tsx RAF loop
       if (typeof window !== 'undefined') {
         if (!(window as any).__INDICATRIX_LIVE_UNIFORMS__) {
           (window as any).__INDICATRIX_LIVE_UNIFORMS__ = {};
         }
         Object.assign((window as any).__INDICATRIX_LIVE_UNIFORMS__, patch);
-
-        const engine = (window as any).__INDICATRIX_WEBGPU_ENGINE__ || (window as any).__ENGINE;
-        if (engine && typeof engine.updateUniforms === 'function') {
-          engine.updateUniforms(patch);
-        }
       }
 
       // Debounce React state re-render so slider dragging does not trigger App.tsx & UnifiedRightSidebar re-renders
@@ -289,9 +280,7 @@ export function useGlobeLayerManager(initialLayers?: DataLayerItem[]) {
       const presetId =
         style === 'architectural'
           ? 'architectural-topo-relief'
-          : style === 'hybrid'
-          ? 'hybrid-crust-hydrosphere'
-          : 'nasa-blue-marble';
+          : 'hybrid-crust-hydrosphere';
 
       const preset = getPresetById(presetId);
       if (!preset) return;
@@ -302,7 +291,6 @@ export function useGlobeLayerManager(initialLayers?: DataLayerItem[]) {
           (l) =>
             l.renderStyle !== 'architectural' &&
             l.renderStyle !== 'hybrid' &&
-            l.renderStyle !== 'photoreal' &&
             l.id !== presetId
         );
 
@@ -361,4 +349,59 @@ export function useGlobeLayerManager(initialLayers?: DataLayerItem[]) {
     handleReorderDataLayer,
     handleSelectRenderStyle,
   };
+}
+
+export interface MediumCalibrationPreset {
+  sunAzimuth: number;
+  hillshadeIntensity: number;
+  sunAltitude: number;
+  displacementScale: number;
+  peakExponent: number;
+  ambientOcclusion: number;
+  waterClarity: number;
+  seaLevelOffset: number;
+  paperTooth: number;
+}
+
+export const MEDIUM_CALIBRATION_PRESETS: Record<0 | 1 | 2, MediumCalibrationPreset> = {
+  // Theme 0: Marie Tharp (1977 Hand-Painted Physiographic Ocean Floor)
+  0: {
+    sunAzimuth: 300,
+    hillshadeIntensity: 0.60,
+    sunAltitude: 40,
+    displacementScale: 0.12,
+    peakExponent: 1.3,
+    ambientOcclusion: 0.60,
+    waterClarity: 0.85,
+    seaLevelOffset: 0,
+    paperTooth: 0.25,
+  },
+  // Theme 1: Cream Rag (310 GSM Cotton Rag Archival Sheet — Boot Default)
+  1: {
+    sunAzimuth: 315,
+    hillshadeIntensity: 0.70,
+    sunAltitude: 45,
+    displacementScale: 0.14,
+    peakExponent: 1.6,
+    ambientOcclusion: 0.65,
+    waterClarity: 0.70,
+    seaLevelOffset: 0,
+    paperTooth: 0.40,
+  },
+  // Theme 2: Prussian Cyanotype (1842 Photochemical Blueprint)
+  2: {
+    sunAzimuth: 315,
+    hillshadeIntensity: 0.65,
+    sunAltitude: 50,
+    displacementScale: 0.11,
+    peakExponent: 1.4,
+    ambientOcclusion: 0.75,
+    waterClarity: 0.60,
+    seaLevelOffset: 0,
+    paperTooth: 0.15,
+  },
+};
+
+export function getMediumCalibrationPreset(targetMode: 0 | 1 | 2): MediumCalibrationPreset {
+  return MEDIUM_CALIBRATION_PRESETS[targetMode] ?? MEDIUM_CALIBRATION_PRESETS[1];
 }

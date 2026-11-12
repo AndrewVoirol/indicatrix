@@ -165,11 +165,27 @@ fn getRegionalBlendWeight(uv: vec2<f32>) -> f32 {
     return max(bestTileWeight, weightU * weightV);
 }
 
+fn unpackGlobalDemRG(s: vec4<f32>) -> vec4<f32> {
+    let bNorm = s.r;
+    let aNorm = s.g;
+    let elevM = aNorm * 19772.0 - 10924.0;
+    return vec4<f32>(clamp(elevM / 8848.0, 0.0, 1.0), clamp(-elevM / 10924.0, 0.0, 1.0), bNorm, aNorm);
+}
+
+fn unpackDemRG(s: vec4<f32>) -> vec4<f32> {
+    let bNorm = s.r;
+    let elevM = s.g;
+    let aNorm = clamp((elevM + 10924.0) / 19772.0, 0.0, 1.0);
+    return vec4<f32>(clamp(elevM / 8848.0, 0.0, 1.0), clamp(-elevM / 10924.0, 0.0, 1.0), bNorm, aNorm);
+}
+
 fn sampleRegionalComposite(uv: vec2<f32>, globalSample: vec4<f32>, lod: f32) -> vec4<f32> {
     let lon = uv.x * 360.0 - 180.0;
     let lat = 90.0 - uv.y * 180.0;
     var compositeSample = globalSample;
 
+    var activeRegWeight: f32 = 0.0;
+    var activeRegTsY: f32 = 1.0;
     if (u_regionalOverlay.u_regionalActive == 1u) {
         let bounds = u_regionalOverlay.u_regionalBounds;
         let minLon = bounds.x;
@@ -183,9 +199,10 @@ fn sampleRegionalComposite(uv: vec2<f32>, globalSample: vec4<f32>, lod: f32) -> 
             let marginU = clamp(blendDeg / (maxLon - minLon), 0.001, 0.49);
             let marginV = clamp(blendDeg / (maxLat - minLat), 0.001, 0.49);
             let regW = smoothstep(0.0, marginU, min(regU, 1.0 - regU)) * smoothstep(0.0, marginV, min(regV, 1.0 - regV));
-            let regSample = textureSampleLevel(u_regionalDEMTexture, u_demSampler, vec2<f32>(regU, regV), lod);
+            let regSample = unpackDemRG(textureSampleLevel(u_regionalDEMTexture, u_demSampler, vec2<f32>(regU, regV), lod));
+            activeRegWeight = regW;
+            activeRegTsY = (maxLat - minLat) / (180.0 * max(f32(textureDimensions(u_regionalDEMTexture).y), 1.0));
             compositeSample = mix(compositeSample, regSample, regW);
-            return compositeSample;
         }
     }
 
@@ -216,13 +233,18 @@ fn sampleRegionalComposite(uv: vec2<f32>, globalSample: vec4<f32>, lod: f32) -> 
             let wSouth = select(smoothstep(0.0, marginV, 1.0 - tileV), 1.0, (edgeMask & 2u) != 0u);
             let slotWeight = min(wWest, wEast) * min(wNorth, wSouth);
 
+            let isRegionalCogTile = (u32(slot.tileMeta.x) & 63u) == 14u;
             let effCols = max(1.0, slot.tileMeta.z * 256.0);
             let effRows = max(1.0, slot.tileMeta.w * 256.0);
-            let sampU = (0.5 + tileU * (effCols - 1.0)) / 256.0;
-            let sampV = (0.5 + tileV * (effRows - 1.0)) / 256.0;
-            let tileSample = textureSampleLevel(u_tileCacheArray, u_demSampler, vec2<f32>(sampU, sampV), i32(slot.tileMeta.y), 0.0);
-            let tileLandGate = smoothstep(0.35, 0.65, globalSample.b);
-            compositeSample = mix(compositeSample, tileSample, slotWeight * tileLandGate);
+            let sampU = select((0.5 + tileU * (effCols - 1.0)) / 256.0, clamp(tileU * effCols, 0.5, effCols - 0.5) / 256.0, isRegionalCogTile);
+            let sampV = select((0.5 + tileV * (effRows - 1.0)) / 256.0, clamp(tileV * effRows, 0.5, effRows - 0.5) / 256.0, isRegionalCogTile);
+            let tileSample = unpackDemRG(textureSampleLevel(u_tileCacheArray, u_demSampler, vec2<f32>(sampU, sampV), i32(slot.tileMeta.y), 0.0));
+            let tileAddLand = clamp((tileSample.b - 0.504) * 2.0, 0.0, 1.0);
+            let isOffshoreOcean = (globalSample.a * 19772.0 - 10924.0) < -15.0 && tileSample.b <= 0.504;
+            let tileLandGate = select(max(smoothstep(0.35, 0.65, globalSample.b), tileAddLand), 0.0, isOffshoreOcean);
+            let tileTsY = max(0.0001, b.w - b.y) / (180.0 * effRows);
+            let tileRefinesReg = select(1.0, 1.0 - activeRegWeight, activeRegWeight > 0.001 && tileTsY >= activeRegTsY * 0.85);
+            compositeSample = mix(compositeSample, tileSample, slotWeight * tileLandGate * tileRefinesReg);
             break;
         }
     }
@@ -241,7 +263,7 @@ fn vs_main(input: VertexInput) -> VertexOutput {
     out.uv = input.uv;
 
     // Sample DEM elevation at vertex for terrain-following cloud lift
-    let demSampleGlobal = textureSampleLevel(u_demTexture, u_demSampler, input.uv, 0.0);
+    let demSampleGlobal = unpackGlobalDemRG(textureSampleLevel(u_demTexture, u_demSampler, input.uv, 0.0));
     let demSample = select(demSampleGlobal, sampleRegionalComposite(input.uv, demSampleGlobal, 0.0), cloud.u_layerIndex == 0u);
     let elevMeters = decodeElevation(demSample);
 
@@ -597,11 +619,11 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let demNorthGlobal = textureSampleLevel(u_demTexture, u_demSampler, uvNorth, 0.0);
     let demSouthGlobal = textureSampleLevel(u_demTexture, u_demSampler, uvSouth, 0.0);
 
-    let demCenter = sampleRegionalComposite(in.uv, demCenterGlobal, 0.0);
-    let demEast = demEastGlobal;
-    let demWest = demWestGlobal;
-    let demNorth = demNorthGlobal;
-    let demSouth = demSouthGlobal;
+    let demCenter = sampleRegionalComposite(in.uv, unpackGlobalDemRG(demCenterGlobal), 0.0);
+    let demEast = unpackGlobalDemRG(demEastGlobal);
+    let demWest = unpackGlobalDemRG(demWestGlobal);
+    let demNorth = unpackGlobalDemRG(demNorthGlobal);
+    let demSouth = unpackGlobalDemRG(demSouthGlobal);
 
     let zTerrain = decodeElevation(demCenter);
     let elevEast = decodeElevation(demEast);
@@ -728,10 +750,15 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     var cloudColor: vec3<f32>;
 
     if (cloud.u_theme == 0u) {
-        // Theme 0 (Marie Tharp 1977): Soft warm white with subtle underside darkening / cast shadows
+        // Theme 0 (Marie Tharp 1977): Pelagic bathymetry-preserving ocean veil + warm lithographic cream crowns & slate undersides
         let coreWhite = vec3<f32>(0.96, 0.96, 0.94);
         let undersideShade = vec3<f32>(0.82, 0.85, 0.89) * selfShadow;
         cloudColor = mix(undersideShade, coreWhite * phaseFactor * selfShadow, smoothstep(0.15, 0.70, featheredCloud));
+        let shellOceanMask = 1.0 - smoothstep(0.35, 0.65, demCenter.b);
+        let stippleCoord0 = vec2<f32>(in.uv.x * cosLat, in.uv.y) * 680.0;
+        let stippleMod0 = 1.0 - (hash12(stippleCoord0) - 0.5) * 0.045 * (1.0 - smoothstep(0.35, 0.80, featheredCloud));
+        cloudColor *= stippleMod0;
+        alpha = alpha * mix(1.0, 0.64, shellOceanMask) * stippleMod0;
     } else if (cloud.u_theme == 1u) {
         // Theme 1 (Cream Rag): Warm ivory watercolor washes absorbed into cellulose paper fiber tooth (u_paper_tooth)
         let ivoryWash = vec3<f32>(0.98, 0.95, 0.89);
@@ -764,12 +791,17 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         cloudColor = stratumPigment * toothFactor * phaseFactor * selfShadow;
         alpha = alpha * mix(0.85, 1.0, toothFactor);
     } else if (cloud.u_theme == 2u) {
-        // Theme 2 (Prussian Cyanotype 1842): Actinic white wisps, photochemical blueprint exposure
+        // Theme 2 (Prussian Cyanotype 1842): Actinic white wisps, ferroprussiate blueprint troughs & photochemical perimeter stipple
         let actinicWhite = vec3<f32>(0.95, 0.98, 1.00);
         let gamma = max(0.5, cloud.u_mediumProperties.z);
         let actinicDensity = pow(featheredCloud, gamma);
         cloudColor = actinicWhite * phaseFactor * selfShadow;
-        alpha = actinicDensity * baseLayerOpacity * cloud.u_layerOpacity.w * horizonAtten;
+        let prussianTrough = vec3<f32>(0.16, 0.36, 0.60) * selfShadow;
+        cloudColor = mix(prussianTrough, cloudColor, smoothstep(0.12, 0.68, actinicDensity));
+        let cyanStippleCoord = vec2<f32>(in.uv.x * cosLat, in.uv.y) * 960.0;
+        let cyanPerimeter = smoothstep(0.05, 0.32, actinicDensity) * (1.0 - smoothstep(0.48, 0.85, actinicDensity));
+        let cyanStipple = 1.0 - (hash12(cyanStippleCoord) - 0.5) * (0.02 + 0.10 * cyanPerimeter);
+        alpha = actinicDensity * baseLayerOpacity * cloud.u_layerOpacity.w * horizonAtten * cyanStipple;
     } else {
         // Fallback branch
         cloudColor = vec3<f32>(0.96, 0.96, 0.94);
@@ -784,6 +816,10 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         shadowWashColor = vec3<f32>(0.043, 0.114, 0.227); // Theme 2 Prussian Cyanotype navy #0B1D3A
     }
     cloudColor = mix(shadowWashColor, cloudColor, interdeckShadow);
+    if (cloud.u_theme == 2u) {
+        cloudColor.g = min(cloudColor.g, cloudColor.b);
+        cloudColor.r = min(cloudColor.r, cloudColor.g);
+    }
 
     // Premultiplied Alpha Transparent Clear & Compositing
     // Output must be premultiplied alpha: vec4<f32>(color.rgb * alpha, alpha)

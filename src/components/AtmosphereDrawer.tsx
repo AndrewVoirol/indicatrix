@@ -6,8 +6,6 @@
 // ============================================================================
 
 import React, { useState, useCallback } from 'react';
-import { VernierSlider } from './ui/VernierSlider';
-import { SegmentedControl } from './ui/SegmentedControl';
 import { TactileSwitch } from './ui/TactileSwitch';
 import { TimelineScrubber, TimelineScrubberState } from './hud/TimelineScrubber';
 import { AtmosphericColumnInstrument } from './hud/instruments/AtmosphericColumnInstrument';
@@ -16,7 +14,6 @@ import { CloudShadowInstrument } from './hud/instruments/CloudShadowInstrument';
 import { CloudDriftSpeedInstrument } from './hud/instruments/CloudDriftSpeedInstrument';
 import { PrognosticModelCard } from './hud/instruments/PrognosticModelCard';
 import { StratosphericTelemetryInstrument } from './hud/instruments/StratosphericTelemetryInstrument';
-import { DataProvenanceOverlay } from './hud/DataProvenanceOverlay';
 import { VolumetricCloudDynamicsInstrument } from './hud/instruments/VolumetricCloudDynamicsInstrument';
 import type { ResolutionTier } from '../types';
 import type { MeteorologicalProvenance } from '../core/data/WeatherNextDataSource';
@@ -27,6 +24,8 @@ export type PrognosticModelBackend =
   | 'google-weathernext3'
   | 'gfs'
   | 'weathernext'
+  | 'satellite'
+  | 'live-satellite'
   | 'ecmwf'
   | 'off'
   | 'climatology';
@@ -35,13 +34,15 @@ export function isWeatherNextModel(model?: string): boolean {
   return model === 'weathernext3' || model === 'google-weathernext3' || model === 'weathernext';
 }
 
+export function isSatelliteModel(model?: string): boolean {
+  return model === 'satellite' || model === 'live-satellite';
+}
+
 export interface AtmosphereDrawerProps {
   theme?: 0 | 1 | 2;
   isLight?: boolean;
   showClouds?: boolean;
   onShowCloudsChange?: (v: boolean) => void;
-  showAtmosphere?: boolean;
-  onShowAtmosphereChange?: (v: boolean) => void;
   showCloudLow?: boolean;
   onShowCloudLowChange?: (v: boolean) => void;
   showCloudMid?: boolean;
@@ -58,14 +59,10 @@ export interface AtmosphereDrawerProps {
   onAtmosphericScaleChange?: (v: number) => void;
   shadowIntensity?: number;
   onShadowIntensityChange?: (v: number) => void;
-  verticalScaleMode?: number;
-  onVerticalScaleModeChange?: (v: number) => void;
   rainShadowFeedback?: number;
   onRainShadowFeedbackChange?: (v: number) => void;
   pluvialGamma?: number;
   onPluvialGammaChange?: (v: number) => void;
-  weatherOpticalMode?: number;
-  onWeatherOpticalModeChange?: (mode: number) => void;
   thermodynamicGating?: boolean;
   onThermodynamicGatingChange?: (enabled: boolean) => void;
   prognosticModel?: PrognosticModelBackend;
@@ -76,9 +73,7 @@ export interface AtmosphereDrawerProps {
   timelineMinutes?: number;
   onTimelineChange?: (state: TimelineScrubberState) => void;
 
-  onSnapCamera?: (snap: 'equator' | 'pole' | 'seam' | 'isometric' | 'horizon') => void;
   onTogglePlanetaryLayer?: (id: string, force?: boolean) => void;
-  isRadarActive?: boolean;
   hideScrubber?: boolean;
   className?: string;
   resolution?: ResolutionTier;
@@ -97,28 +92,21 @@ export interface AtmosphereDrawerProps {
   onCloudExtinctionChange?: (v: number) => void;
   volumetricClouds?: boolean;
   onVolumetricCloudsChange?: (v: boolean) => void;
-  roughness?: number;
-  onRoughnessChange?: (v: number) => void;
-  paperTooth?: number;
-  onPaperToothChange?: (v: number) => void;
   provenance?: MeteorologicalProvenance;
   windSpeedMultiplier?: number;
   onWindSpeedMultiplierChange?: (v: number) => void;
   windParticleLifetime?: number;
   onWindParticleLifetimeChange?: (v: number) => void;
   isWindActive?: boolean;
+  isActive?: boolean;
 }
 
 export const AtmosphereDrawer: React.FC<AtmosphereDrawerProps> = ({
   theme = 0,
   isLight = false,
-  roughness: propRoughness,
-  onRoughnessChange,
-  paperTooth: propPaperTooth,
-  onPaperToothChange,
   hideScrubber = false,
-  isRadarActive = false,
   isWindActive = false,
+  isActive = true,
   provenance,
   windSpeedMultiplier,
   onWindSpeedMultiplierChange,
@@ -126,8 +114,6 @@ export const AtmosphereDrawer: React.FC<AtmosphereDrawerProps> = ({
   onWindParticleLifetimeChange,
   showClouds: propShowClouds,
   onShowCloudsChange,
-  showAtmosphere: propShowAtmosphere,
-  onShowAtmosphereChange,
   showCloudLow: propShowCloudLow,
   onShowCloudLowChange,
   showCloudMid: propShowCloudMid,
@@ -148,8 +134,6 @@ export const AtmosphereDrawer: React.FC<AtmosphereDrawerProps> = ({
   onRainShadowFeedbackChange,
   pluvialGamma: propPluvialGamma,
   onPluvialGammaChange,
-  weatherOpticalMode: propWeatherOpticalMode,
-  onWeatherOpticalModeChange,
   thermodynamicGating: propThermodynamicGating,
   onThermodynamicGatingChange,
   prognosticModel: propPrognosticModel,
@@ -160,7 +144,6 @@ export const AtmosphereDrawer: React.FC<AtmosphereDrawerProps> = ({
   timelineMinutes,
   onTimelineChange,
 
-  onSnapCamera,
   onTogglePlanetaryLayer,
   className = '',
   resolution,
@@ -179,39 +162,6 @@ export const AtmosphereDrawer: React.FC<AtmosphereDrawerProps> = ({
   volumetricClouds: propVolumetricClouds,
   onVolumetricCloudsChange,
 }) => {
-  const [internalRoughness, setInternalRoughness] = useState<number>(() => {
-    if (typeof window !== 'undefined' && (window as any).__INDICATRIX_LIVE_UNIFORMS__?.roughness !== undefined) {
-      return (window as any).__INDICATRIX_LIVE_UNIFORMS__.roughness;
-    }
-    if (typeof window !== 'undefined' && (window as any).__INDICATRIX_LIVE_UNIFORMS__?.paperTooth !== undefined) {
-      return (window as any).__INDICATRIX_LIVE_UNIFORMS__.paperTooth;
-    }
-    return propRoughness ?? propPaperTooth ?? 1.0;
-  });
-
-  const curRoughness = propRoughness !== undefined ? propRoughness : (propPaperTooth !== undefined ? propPaperTooth : internalRoughness);
-
-  const handleRoughnessChange = (val: number) => {
-    const clamped = Math.max(0.0, Math.min(1.0, val));
-    setInternalRoughness(clamped);
-    onRoughnessChange?.(clamped);
-    onPaperToothChange?.(clamped);
-    if (typeof window !== 'undefined') {
-      if (!(window as any).__INDICATRIX_LIVE_UNIFORMS__) {
-        (window as any).__INDICATRIX_LIVE_UNIFORMS__ = {};
-      }
-      (window as any).__INDICATRIX_LIVE_UNIFORMS__.roughness = clamped;
-      (window as any).__INDICATRIX_LIVE_UNIFORMS__.paperTooth = clamped;
-      const engine = (window as any).__INDICATRIX_WEBGPU_ENGINE__ || (window as any).__ENGINE;
-      if (engine && typeof engine.updateUniforms === 'function') {
-        engine.updateUniforms({ roughness: clamped, paperTooth: clamped });
-      }
-    }
-  };
-
-  const handleRoughnessToggle = (enabled: boolean) => {
-    handleRoughnessChange(enabled ? 1.0 : 0.0);
-  };
   const [internalShowClouds, setInternalShowClouds] = useState<boolean>(true);
   const [internalShowCloudLow, setInternalShowCloudLow] = useState<boolean>(true);
   const [internalShowCloudMid, setInternalShowCloudMid] = useState<boolean>(true);
@@ -223,13 +173,14 @@ export const AtmosphereDrawer: React.FC<AtmosphereDrawerProps> = ({
   const [internalShadowIntensity, setInternalShadowIntensity] = useState<number>(0.45);
   const [internalRainShadowFeedback, setInternalRainShadowFeedback] = useState<number>(0.0);
   const [internalPluvialGamma, setInternalPluvialGamma] = useState<number>(0.0);
-  const [internalWeatherOpticalMode, setInternalWeatherOpticalMode] = useState<number>(0);
   const [internalThermodynamicGating, setInternalThermodynamicGating] = useState<boolean>(true);
   const [internalPrognosticModel, setInternalPrognosticModel] = useState<PrognosticModelBackend>(propPrognosticModel ?? 'gfs');
   const [internalPrognosticVariable, setInternalPrognosticVariable] = useState<string>(propPrognosticVariable ?? 'total_precipitation_1hr_mean');
+  const prevPropPrognosticVariableRef = React.useRef<string | undefined>(propPrognosticVariable);
 
   React.useEffect(() => {
-    if (propPrognosticVariable !== undefined) {
+    if (propPrognosticVariable !== undefined && propPrognosticVariable !== prevPropPrognosticVariableRef.current) {
+      prevPropPrognosticVariableRef.current = propPrognosticVariable;
       setInternalPrognosticVariable(propPrognosticVariable);
     }
   }, [propPrognosticVariable]);
@@ -278,12 +229,6 @@ export const AtmosphereDrawer: React.FC<AtmosphereDrawerProps> = ({
     }
     return propVolumetricClouds ?? true;
   });
-  const [internalShowAtmosphere, setInternalShowAtmosphere] = useState<boolean>(() => {
-    if (typeof window !== 'undefined' && (window as any).__INDICATRIX_LIVE_UNIFORMS__?.showAtmosphere !== undefined) {
-      return Boolean((window as any).__INDICATRIX_LIVE_UNIFORMS__.showAtmosphere);
-    }
-    return propShowAtmosphere ?? false;
-  });
 
   const curCloudThickness = propCloudThickness !== undefined ? propCloudThickness : internalCloudThickness;
   const curCloudLowTop = propCloudLowTop !== undefined ? propCloudLowTop : internalCloudLowTop;
@@ -292,7 +237,6 @@ export const AtmosphereDrawer: React.FC<AtmosphereDrawerProps> = ({
   const curCloudFreqVert = propCloudFreqVert !== undefined ? propCloudFreqVert : internalCloudFreqVert;
   const curCloudExtinction = propCloudExtinction !== undefined ? propCloudExtinction : internalCloudExtinction;
   const curVolumetricClouds = propVolumetricClouds !== undefined ? propVolumetricClouds : internalVolumetricClouds;
-  const curShowAtmosphere = propShowAtmosphere !== undefined ? propShowAtmosphere : internalShowAtmosphere;
 
   const updateLiveUniforms = useCallback((delta: Record<string, any>) => {
     if (typeof window !== 'undefined') {
@@ -375,12 +319,6 @@ export const AtmosphereDrawer: React.FC<AtmosphereDrawerProps> = ({
     updateLiveUniforms({ volumetricClouds: val });
   };
 
-  const handleAtmosphereScatterToggle = (val: boolean) => {
-    setInternalShowAtmosphere(val);
-    onShowAtmosphereChange?.(val);
-    updateLiveUniforms({ showAtmosphere: val });
-  };
-
   const curShowClouds = propShowClouds !== undefined ? propShowClouds : internalShowClouds;
   const curShowCloudLow = propShowCloudLow !== undefined ? propShowCloudLow : internalShowCloudLow;
   const curShowCloudMid = propShowCloudMid !== undefined ? propShowCloudMid : internalShowCloudMid;
@@ -392,11 +330,12 @@ export const AtmosphereDrawer: React.FC<AtmosphereDrawerProps> = ({
   const curShadowIntensity = propShadowIntensity !== undefined ? propShadowIntensity : internalShadowIntensity;
   const curRainShadowFeedback = propRainShadowFeedback !== undefined ? propRainShadowFeedback : internalRainShadowFeedback;
   const curPluvialGamma = propPluvialGamma !== undefined ? propPluvialGamma : internalPluvialGamma;
-  const curWeatherOpticalMode = propWeatherOpticalMode !== undefined ? propWeatherOpticalMode : internalWeatherOpticalMode;
   const curThermodynamicGating = propThermodynamicGating !== undefined ? propThermodynamicGating : internalThermodynamicGating;
   const curPrognosticModel = propPrognosticModel !== undefined ? propPrognosticModel : internalPrognosticModel;
-  const curPrognosticVariable = internalPrognosticVariable;
-  const isGfs = curPrognosticModel === 'gfs' || curPrognosticModel === 'noaa-gfs';
+  const curPrognosticVariable =
+    propPrognosticVariable !== undefined && propPrognosticVariable !== prevPropPrognosticVariableRef.current
+      ? propPrognosticVariable
+      : internalPrognosticVariable;
   const isWeatherNext =
     curPrognosticModel === 'weathernext3' ||
     curPrognosticModel === 'google-weathernext3' ||
@@ -404,6 +343,15 @@ export const AtmosphereDrawer: React.FC<AtmosphereDrawerProps> = ({
 
   const handlePrognosticModelChange = (model: PrognosticModelBackend) => {
     setInternalPrognosticModel(model);
+    const isWn =
+      model === 'weathernext3' ||
+      model === 'google-weathernext3' ||
+      model === 'weathernext';
+    if (!isWn) {
+      setInternalPrognosticVariable((prev) =>
+        prev === 'wind_10m_vector' || prev === 'ivt' ? prev : 'none'
+      );
+    }
     onPrognosticModelChange?.(model);
     if (typeof window !== 'undefined' && (window as any).__INDICATRIX_SET_PROGNOSTIC_MODEL__) {
       (window as any).__INDICATRIX_SET_PROGNOSTIC_MODEL__(model);
@@ -418,31 +366,12 @@ export const AtmosphereDrawer: React.FC<AtmosphereDrawerProps> = ({
     }
   };
 
-  const handleWeatherOpticalModeChange = (mode: number) => {
-    if (typeof mode !== 'number' || !Number.isFinite(mode)) return;
-    const validMode = Math.floor(mode) === 1 ? 1 : 0;
-    setInternalWeatherOpticalMode(validMode);
-    onWeatherOpticalModeChange?.(validMode);
-    if (typeof window !== 'undefined') {
-      if ((window as any).__INDICATRIX_SET_WEATHER_OPTICAL_MODE__) {
-        (window as any).__INDICATRIX_SET_WEATHER_OPTICAL_MODE__(validMode);
-      }
-      if ((window as any).__INDICATRIX_WEBGPU_ENGINE__) {
-        (window as any).__INDICATRIX_WEBGPU_ENGINE__.setWeatherOpticalMode(validMode);
-      }
-    }
-  };
-
   const handleToggleClouds = (val: boolean) => {
     setInternalShowClouds(val);
     onShowCloudsChange?.(val);
-    if (typeof window !== 'undefined') {
-      if ((window as any).__INDICATRIX_LIVE_UNIFORMS__) {
-        (window as any).__INDICATRIX_LIVE_UNIFORMS__.showClouds = val;
-      }
-      if ((window as any).__INDICATRIX_SET_CLOUD_OPTIONS__) {
-        (window as any).__INDICATRIX_SET_CLOUD_OPTIONS__({ showClouds: val });
-      }
+    updateLiveUniforms({ showClouds: val });
+    if (typeof window !== 'undefined' && (window as any).__INDICATRIX_SET_CLOUD_OPTIONS__) {
+      (window as any).__INDICATRIX_SET_CLOUD_OPTIONS__({ showClouds: val });
     }
   };
 
@@ -450,52 +379,33 @@ export const AtmosphereDrawer: React.FC<AtmosphereDrawerProps> = ({
     if (stratum === 'low') {
       setInternalShowCloudLow(active);
       onShowCloudLowChange?.(active);
-      if (typeof window !== 'undefined') {
-        if ((window as any).__INDICATRIX_LIVE_UNIFORMS__) {
-          (window as any).__INDICATRIX_LIVE_UNIFORMS__.showCloudLow = active;
-        }
-        if ((window as any).__INDICATRIX_SET_CLOUD_OPTIONS__) {
-          (window as any).__INDICATRIX_SET_CLOUD_OPTIONS__({ showCloudLow: active });
-        }
+      updateLiveUniforms({ showCloudLow: active });
+      if (typeof window !== 'undefined' && (window as any).__INDICATRIX_SET_CLOUD_OPTIONS__) {
+        (window as any).__INDICATRIX_SET_CLOUD_OPTIONS__({ showCloudLow: active });
       }
     } else if (stratum === 'mid') {
       setInternalShowCloudMid(active);
       onShowCloudMidChange?.(active);
-      if (typeof window !== 'undefined') {
-        if ((window as any).__INDICATRIX_LIVE_UNIFORMS__) {
-          (window as any).__INDICATRIX_LIVE_UNIFORMS__.showCloudMid = active;
-        }
-        if ((window as any).__INDICATRIX_SET_CLOUD_OPTIONS__) {
-          (window as any).__INDICATRIX_SET_CLOUD_OPTIONS__({ showCloudMid: active });
-        }
+      updateLiveUniforms({ showCloudMid: active });
+      if (typeof window !== 'undefined' && (window as any).__INDICATRIX_SET_CLOUD_OPTIONS__) {
+        (window as any).__INDICATRIX_SET_CLOUD_OPTIONS__({ showCloudMid: active });
       }
     } else if (stratum === 'high') {
       setInternalShowCloudHigh(active);
       onShowCloudHighChange?.(active);
-      if (typeof window !== 'undefined') {
-        if ((window as any).__INDICATRIX_LIVE_UNIFORMS__) {
-          (window as any).__INDICATRIX_LIVE_UNIFORMS__.showCloudHigh = active;
-        }
-        if ((window as any).__INDICATRIX_SET_CLOUD_OPTIONS__) {
-          (window as any).__INDICATRIX_SET_CLOUD_OPTIONS__({ showCloudHigh: active });
-        }
+      updateLiveUniforms({ showCloudHigh: active });
+      if (typeof window !== 'undefined' && (window as any).__INDICATRIX_SET_CLOUD_OPTIONS__) {
+        (window as any).__INDICATRIX_SET_CLOUD_OPTIONS__({ showCloudHigh: active });
       }
     }
   };
 
-  const handleToggleCloudLow = () => handleToggleStrata('low', !curShowCloudLow);
-  const handleToggleCloudMid = () => handleToggleStrata('mid', !curShowCloudMid);
-  const handleToggleCloudHigh = () => handleToggleStrata('high', !curShowCloudHigh);
   const handleToggleFalseColor = (active: boolean) => {
     setInternalCloudFalseColor(active);
     onCloudFalseColorChange?.(active);
-    if (typeof window !== 'undefined') {
-      if ((window as any).__INDICATRIX_LIVE_UNIFORMS__) {
-        (window as any).__INDICATRIX_LIVE_UNIFORMS__.cloudFalseColor = active;
-      }
-      if ((window as any).__INDICATRIX_SET_CLOUD_OPTIONS__) {
-        (window as any).__INDICATRIX_SET_CLOUD_OPTIONS__({ cloudFalseColor: active });
-      }
+    updateLiveUniforms({ cloudFalseColor: active });
+    if (typeof window !== 'undefined' && (window as any).__INDICATRIX_SET_CLOUD_OPTIONS__) {
+      (window as any).__INDICATRIX_SET_CLOUD_OPTIONS__({ cloudFalseColor: active });
     }
   };
 
@@ -504,15 +414,18 @@ export const AtmosphereDrawer: React.FC<AtmosphereDrawerProps> = ({
     const clamped = Math.max(0, Math.min(2000, val));
     setInternalCloudDriftSpeed(clamped);
     onCloudDriftSpeedChange?.(clamped);
+    updateLiveUniforms({ cloudDriftSpeed: clamped });
     if (typeof window !== 'undefined' && (window as any).__INDICATRIX_SET_CLOUD_OPTIONS__) {
       (window as any).__INDICATRIX_SET_CLOUD_OPTIONS__({ cloudDriftSpeed: clamped });
     }
   };
 
   const handleCloudOpacityChange = (val: number) => {
+    if (typeof val !== 'number' || !Number.isFinite(val)) return;
     const clamped = Math.max(0.1, Math.min(1.0, val));
     setInternalCloudOpacity(clamped);
     onCloudOpacityChange?.(clamped);
+    updateLiveUniforms({ cloudOpacity: clamped });
     if (typeof window !== 'undefined' && (window as any).__INDICATRIX_SET_CLOUD_OPTIONS__) {
       (window as any).__INDICATRIX_SET_CLOUD_OPTIONS__({ cloudOpacity: clamped });
     }
@@ -523,6 +436,7 @@ export const AtmosphereDrawer: React.FC<AtmosphereDrawerProps> = ({
     const clamped = Math.max(1.0, Math.min(12.0, val));
     setInternalAtmosphericScale(clamped);
     onAtmosphericScaleChange?.(clamped);
+    updateLiveUniforms({ atmosphericScale: clamped });
     if (typeof window !== 'undefined') {
       if ((window as any).__INDICATRIX_SET_ATMOSPHERIC_SCALE__) {
         (window as any).__INDICATRIX_SET_ATMOSPHERIC_SCALE__(clamped);
@@ -538,6 +452,7 @@ export const AtmosphereDrawer: React.FC<AtmosphereDrawerProps> = ({
     const clamped = Math.max(0.0, Math.min(0.60, val));
     setInternalShadowIntensity(clamped);
     onShadowIntensityChange?.(clamped);
+    updateLiveUniforms({ shadowIntensity: clamped });
     if (typeof window !== 'undefined') {
       if ((window as any).__INDICATRIX_SET_SHADOW_INTENSITY__) {
         (window as any).__INDICATRIX_SET_SHADOW_INTENSITY__(clamped);
@@ -553,6 +468,7 @@ export const AtmosphereDrawer: React.FC<AtmosphereDrawerProps> = ({
     const clamped = Math.max(0.0, Math.min(1.0, val));
     setInternalRainShadowFeedback(clamped);
     onRainShadowFeedbackChange?.(clamped);
+    updateLiveUniforms({ rainShadowFeedback: clamped });
     if (typeof window !== 'undefined') {
       if ((window as any).__INDICATRIX_SET_RAIN_SHADOW_FEEDBACK__) {
         (window as any).__INDICATRIX_SET_RAIN_SHADOW_FEEDBACK__(clamped);
@@ -565,6 +481,7 @@ export const AtmosphereDrawer: React.FC<AtmosphereDrawerProps> = ({
     const clamped = Math.max(0.0, Math.min(2.0, val));
     setInternalPluvialGamma(clamped);
     onPluvialGammaChange?.(clamped);
+    updateLiveUniforms({ pluvialGamma: clamped });
     if (typeof window !== 'undefined') {
       if ((window as any).__INDICATRIX_SET_PLUVIAL_GAMMA__) {
         (window as any).__INDICATRIX_SET_PLUVIAL_GAMMA__(clamped);
@@ -578,6 +495,7 @@ export const AtmosphereDrawer: React.FC<AtmosphereDrawerProps> = ({
   const handleThermodynamicGatingChange = (enabled: boolean) => {
     setInternalThermodynamicGating(enabled);
     onThermodynamicGatingChange?.(enabled);
+    updateLiveUniforms({ thermodynamicGating: enabled });
     if (typeof window !== 'undefined') {
       if ((window as any).__INDICATRIX_SET_THERMODYNAMIC_GATING__) {
         (window as any).__INDICATRIX_SET_THERMODYNAMIC_GATING__(enabled);
@@ -595,8 +513,18 @@ export const AtmosphereDrawer: React.FC<AtmosphereDrawerProps> = ({
   const handleTimelineChange = (state: TimelineScrubberState) => {
     onTimelineChange?.(state);
     if (typeof window !== 'undefined') {
-      if ((window as any).__INDICATRIX_SET_TIMELINE_MINUTES__) {
+      if (!onTimelineChange && (window as any).__INDICATRIX_SET_TIMELINE_MINUTES__) {
         (window as any).__INDICATRIX_SET_TIMELINE_MINUTES__(state.absoluteMinutes);
+      }
+      if (onTimelineChange) {
+        if (
+          weatherNextDataSource &&
+          typeof weatherNextDataSource.setTime === 'function' &&
+          (isWeatherNext || isSatelliteModel(curPrognosticModel))
+        ) {
+          weatherNextDataSource.setTime(state.bracketHour, state.tau);
+        }
+        return;
       }
       const engine = (window as any).__INDICATRIX_WEBGPU_ENGINE__ || (window as any).__ENGINE;
       if (engine && typeof engine.updateAtmosphereUniforms === 'function') {
@@ -608,23 +536,19 @@ export const AtmosphereDrawer: React.FC<AtmosphereDrawerProps> = ({
         });
       }
 
-      // Dual-zone dispatch: Radar zone (-60m..0) vs Forecast zone (0..+48h)
-      if (state.isRadarZone || state.absoluteMinutes < 0) {
-        const radarDS = (window as any).__INDICATRIX_LIVE_RADAR_DATA_SOURCE__;
-        if (radarDS && !radarDS.disposed) {
-          radarDS.setAbsoluteMinutes(state.absoluteMinutes);
-          const radarRing = (window as any).__INDICATRIX_RADAR_RING_BUFFER__;
-          if (radarRing && !radarRing.disposed && engine && engine.precipRingBuffer !== radarRing) {
-            engine.setPrecipitationRingBuffer(radarRing);
-          }
-          radarDS.uploadToRingBuffer();
-        }
-      }
-
-      if (isWeatherNext) {
+      const isSat = isSatelliteModel(curPrognosticModel);
+      if (isWeatherNext || isSat) {
         const wnRing = (window as any).__INDICATRIX_WEATHERNEXT_RING_BUFFER__;
-        if (wnRing && !wnRing.disposed && engine && engine.precipRingBuffer !== wnRing && !state.isRadarZone && state.absoluteMinutes >= 0) {
+        if (wnRing && !wnRing.disposed && engine && engine.precipRingBuffer !== wnRing && state.absoluteMinutes >= 0 && isWeatherNext) {
           engine.setPrecipitationRingBuffer(wnRing);
+        }
+        if (engine && state.absoluteMinutes >= 0) {
+          const targetHour = Math.min(11, Math.max(0, state.bracketHour));
+          if (isSat && typeof engine.loadSatelliteCloudLayers === 'function') {
+            engine.loadSatelliteCloudLayers(targetHour).catch(() => {});
+          } else if (typeof engine.loadWeatherNextCloudLayers === 'function') {
+            engine.loadWeatherNextCloudLayers(targetHour).catch(() => {});
+          }
         }
         const ds =
           weatherNextDataSource ||
@@ -654,6 +578,7 @@ export const AtmosphereDrawer: React.FC<AtmosphereDrawerProps> = ({
           type="button"
           role="switch"
           aria-checked={curShowClouds}
+          aria-label="Master Atmosphere Deck (All Cloud Layers)"
           title="Master Atmosphere Deck (All Cloud Layers)"
           onClick={() => handleToggleClouds(!curShowClouds)}
           className="sr-only"
@@ -678,6 +603,7 @@ export const AtmosphereDrawer: React.FC<AtmosphereDrawerProps> = ({
             onToggleFalseColor={handleToggleFalseColor}
             onAtmosphericScaleChange={handleAtmosphericScaleChange}
             onCloudOpacityChange={handleCloudOpacityChange}
+            isActive={isActive}
           />
 
           {/* Cloud Drift Speed Instrument (R4) */}
@@ -686,6 +612,7 @@ export const AtmosphereDrawer: React.FC<AtmosphereDrawerProps> = ({
             theme={theme}
             isLight={isLight}
             onChange={handleCloudDriftChange}
+            isActive={isActive}
           />
 
           {/* Shadow Intensity Instrument (R4) */}
@@ -695,6 +622,7 @@ export const AtmosphereDrawer: React.FC<AtmosphereDrawerProps> = ({
             isLight={isLight}
             isGfsActive={curShowClouds && curShowCloudLow}
             onChange={handleShadowIntensityChange}
+            isActive={isActive}
           />
 
           {/* Orographic Moisture Profile Instrument (R3) */}
@@ -706,74 +634,20 @@ export const AtmosphereDrawer: React.FC<AtmosphereDrawerProps> = ({
             onRainShadowChange={handleRainShadowFeedbackChange}
             onPluvialGammaChange={handlePluvialGammaChange}
             onThermodynamicGatingChange={handleThermodynamicGatingChange}
+            isActive={isActive}
           />
         </div>
       )}
 
       {(curShowClouds || Boolean(isWindActive) || Boolean(onTogglePlanetaryLayer)) && (
         <div className="space-y-2.5">
-          {/* Precipitation Style Segmented Toggle (Stage 3) */}
-          <div
-            className="p-2 rounded-[3px] border shadow-sm bg-[var(--theme-card-bg)] border-[var(--theme-card-border)] space-y-1"
-            data-instrument="precipitation-style"
-          >
-            <div className="flex items-center justify-between text-nano">
-              <span className="font-bold text-[var(--theme-text-primary)] uppercase tracking-wider">
-                Precipitation Style
-              </span>
-              <span className="text-[var(--theme-text-muted)] font-mono text-nano">
-                {curWeatherOpticalMode === 1 ? 'Doppler' : 'Cartographic'}
-              </span>
-            </div>
-            <SegmentedControl<number>
-              size="sm"
-              value={curWeatherOpticalMode}
-              onChange={handleWeatherOpticalModeChange}
-              className="grid grid-cols-2 gap-1 font-mono text-body tracking-wider w-full"
-              options={[
-                {
-                  id: 0,
-                  label: 'Cartographic',
-                  title: 'Cartographic (Historical Cartographic Pigmentation)',
-                  className: 'w-full py-1',
-                  icon: (
-                    <div
-                      className="w-8 h-2 rounded-[1px] border border-black/20 shadow-2xs"
-                      style={{
-                        background:
-                          theme === 1
-                            ? 'linear-gradient(to right, #FAF7F2, #B3A492, #4A3E31)'
-                            : theme === 2
-                            ? 'linear-gradient(to right, #09131F, #2A4869, #D9E6F2)'
-                            : 'linear-gradient(to right, #182230, #64748B, #F1F5F9)',
-                      }}
-                      title="Archival pigment wash gradient"
-                    />
-                  ),
-                },
-                {
-                  id: 1,
-                  label: 'Doppler Radar',
-                  title: 'Meteorological Spectral Doppler Radar',
-                  className: 'w-full py-1',
-                  icon: (
-                    <div
-                      className="w-8 h-2 rounded-[1px] border border-black/20 shadow-2xs"
-                      style={{
-                        background:
-                          'linear-gradient(to right, #22c55e 0%, #eab308 35%, #ef4444 70%, #a855f7 100%)',
-                      }}
-                      title="Meteorological reflectivity dBZ spectrum"
-                    />
-                  ),
-                },
-              ]}
-            />
-          </div>
-
           {/* Plate IV.A: Consolidated Prognostic Model & Data Provenance Card (R5) */}
           <PrognosticModelCard
-            prognosticModel={curPrognosticModel}
+            prognosticModel={
+              curPrognosticModel === 'ecmwf' || curPrognosticModel === 'off' || curPrognosticModel === 'climatology'
+                ? 'gfs'
+                : curPrognosticModel
+            }
             onPrognosticModelChange={handlePrognosticModelChange}
             prognosticVariable={curPrognosticVariable}
             onPrognosticVariableChange={handlePrognosticVariableChange}
@@ -788,6 +662,7 @@ export const AtmosphereDrawer: React.FC<AtmosphereDrawerProps> = ({
             windParticleLifetime={windParticleLifetime}
             onWindParticleLifetimeChange={onWindParticleLifetimeChange}
             isWindActive={isWindActive}
+            isActive={isActive}
           />
 
           {/* Plate IV.B: Atmospheric Chronology & Temporal Scrubber */}
@@ -801,8 +676,8 @@ export const AtmosphereDrawer: React.FC<AtmosphereDrawerProps> = ({
               <TimelineScrubber
                 value={timelineMinutes}
                 onTimeChange={handleTimelineChange}
-                isRadarActive={isRadarActive}
-                onEnableRadar={onTogglePlanetaryLayer ? () => onTogglePlanetaryLayer('live-doppler-radar', true) : undefined}
+                prognosticModel={curPrognosticModel}
+                weatherNextDataSource={weatherNextDataSource}
               />
             </div>
           )}
@@ -812,13 +687,9 @@ export const AtmosphereDrawer: React.FC<AtmosphereDrawerProps> = ({
             theme={theme}
             isLight={isLight}
             cloudFalseColor={curCloudFalseColor}
+            cloudThickness={curCloudThickness}
+            isActive={isActive}
             resolution={resolution}
-          />
-
-          {/* Data Provenance & Geodetic Authority Overlay Card (Phase 5) */}
-          <DataProvenanceOverlay
-            theme={theme}
-            isLight={isLight}
           />
         </div>
       )}
@@ -826,91 +697,14 @@ export const AtmosphereDrawer: React.FC<AtmosphereDrawerProps> = ({
       {curShowClouds && (
         <div className="space-y-2.5">
           {/* 3D Volumetric Raymarch Station (Graduated from Beta) */}
-          <div className="p-2 rounded-[3px] border border-[var(--theme-card-border)] bg-[var(--theme-card-bg)] flex items-center justify-between transition-all shadow-sm">
-            <div className="flex flex-col">
-              <span className="text-micro font-bold uppercase tracking-wider text-[var(--theme-text-primary)]">
-                3D Volumetric Raymarch
-              </span>
-              <span className="text-nano text-[var(--theme-text-secondary)] font-mono">
-                {curVolumetricClouds ? 'Active · Multi-rate raymarching' : 'Bypassed · Fast raster strata (80+ FPS)'}
-              </span>
-            </div>
+          <div className="p-2 rounded-[3px] border border-[var(--theme-card-border)] bg-[var(--theme-card-bg)] transition-all shadow-sm">
             <TactileSwitch
               id="beta-volumetric-clouds"
-              label={curVolumetricClouds ? 'Active' : 'Off'}
+              label="3D Volumetric Raymarch"
+              sublabel={curVolumetricClouds ? 'Active · Multi-rate raymarching' : 'Bypassed · Fast raster strata (80+ FPS)'}
               checked={curVolumetricClouds}
               onChange={handleVolumetricCloudsToggle}
               title="Toggle 3D volumetric raymarched clouds"
-              indicatorColor={theme === 1 ? 'var(--theme-text-accent)' : '#38BDF8'}
-            />
-          </div>
-
-          {/* Atmospheric Scatter / Rayleigh & Mie Limb Scattering Station */}
-          <div className="p-2 rounded-[3px] border border-[var(--theme-card-border)] bg-[var(--theme-card-bg)] flex items-center justify-between transition-all shadow-sm">
-            <div className="flex flex-col">
-              <span className="text-micro font-bold uppercase tracking-wider text-[var(--theme-text-primary)]">
-                Atmospheric Scatter
-              </span>
-              <span className="text-nano text-[var(--theme-text-secondary)] font-mono">
-                {curShowAtmosphere ? 'Active · Rayleigh & Mie limb scattering' : 'Bypassed · Limb scatter off'}
-              </span>
-            </div>
-            <TactileSwitch
-              id="sidebar-atmospheric-scatter"
-              label={curShowAtmosphere ? 'Active' : 'Off'}
-              checked={curShowAtmosphere}
-              onChange={handleAtmosphereScatterToggle}
-              title="Toggle Rayleigh & Mie atmospheric limb scattering"
-              indicatorColor={theme === 1 ? 'var(--theme-text-accent)' : '#38BDF8'}
-            />
-          </div>
-
-          {/* Appearance / Medium Controls: Parchment Texture / Paper Tooth */}
-          <div
-            className="p-2 rounded-[3px] border border-[var(--theme-card-border)] bg-[var(--theme-card-bg)] space-y-2 transition-all shadow-sm"
-            data-instrument="appearance-medium-controls"
-          >
-            <div className="flex items-center justify-between text-nano">
-              <span className="font-bold text-[var(--theme-text-primary)] uppercase tracking-wider">
-                Appearance / Medium
-              </span>
-              <span className="text-[var(--theme-text-muted)] font-mono text-nano">
-                {curRoughness === 0 ? 'Clean Digital GIS' : 'Archival Paper Tooth'}
-              </span>
-            </div>
-
-            <div className="flex items-center justify-between">
-              <div className="flex flex-col">
-                <span className="text-micro font-bold uppercase tracking-wider text-[var(--theme-text-primary)]">
-                  Parchment Texture / Paper Tooth
-                </span>
-                <span className="text-nano text-[var(--theme-text-secondary)] font-mono">
-                  {curRoughness > 0.0
-                    ? `${Math.round(curRoughness * 100)}% · Historical archival print tooth`
-                    : '0% · Clean digital viewing (grain suppressed)'}
-                </span>
-              </div>
-              <TactileSwitch
-                id="sidebar-paper-tooth-toggle"
-                label={curRoughness > 0.0 ? 'Archival' : 'Digital'}
-                checked={curRoughness > 0.0}
-                onChange={handleRoughnessToggle}
-                title="Parchment Texture / Paper Tooth"
-                indicatorColor={theme === 1 ? 'var(--theme-text-accent)' : '#38BDF8'}
-              />
-            </div>
-
-            <VernierSlider
-              id="sidebar-paper-tooth-slider"
-              label="Parchment Texture / Paper Tooth"
-              sublabel="Procedural grain & stipple amplitude"
-              min={0.0}
-              max={1.0}
-              step={0.05}
-              value={curRoughness}
-              readout={`${Math.round(curRoughness * 100)}%`}
-              onChange={handleRoughnessChange}
-              className="!border-0 !bg-transparent !p-0 !shadow-none"
             />
           </div>
 
@@ -952,61 +746,12 @@ export const AtmosphereDrawer: React.FC<AtmosphereDrawerProps> = ({
                   isLight={isLight}
                 />
 
-                {/* 5. Quick Camera Pitch Buttons */}
-                <div className="pt-2 border-t border-[var(--theme-card-border-50)] space-y-1">
-                  <span className="text-nano font-mono uppercase tracking-wider text-[var(--theme-text-muted)]">
-                    Camera Pitch Angle
-                  </span>
-                  <div className="grid grid-cols-4 gap-1">
-                    {[
-                      { label: '0° Nadir', pitch: 0 },
-                      { label: '45° Oblique', pitch: 45 },
-                      { label: '55° Limb', pitch: 55 },
-                      { label: '78° Horizon', pitch: 78 },
-                    ].map((btn) => (
-                      <button
-                        key={btn.label}
-                        type="button"
-                        onClick={() => {
-                          if (typeof window !== 'undefined' && (window as any).__INDICATRIX_CAMERA__?.setPitch) {
-                            (window as any).__INDICATRIX_CAMERA__.setPitch(btn.pitch);
-                          }
-                        }}
-                        className="py-1 px-1 rounded-[2px] border text-center font-mono text-micro uppercase tracking-wider bg-[var(--theme-control-bg)] hover:bg-[var(--theme-control-hover-bg)] text-[var(--theme-text-primary)] border-[var(--theme-control-border)] transition-colors cursor-pointer truncate"
-                      >
-                        {btn.label}
-                      </button>
-                    ))}
-                  </div>
-                </div>
-
-                {/* 6. Diagnostic Test Locations & Reset */}
-                <div className="pt-2 border-t border-[var(--theme-card-border-50)] flex items-center justify-between gap-1">
-                  <div className="flex gap-1 flex-wrap">
-                    {[
-                      { label: 'Iceland', loc: 'iceland' },
-                      { label: 'Hawaii', loc: 'hawaii' },
-                      { label: 'Aleutians', loc: 'aleutians' },
-                      { label: 'Atlantic', loc: 'atlantic' },
-                    ].map((btn) => (
-                      <button
-                        key={btn.label}
-                        type="button"
-                        onClick={() => {
-                          if (typeof window !== 'undefined' && (window as any).tuneClouds) {
-                            (window as any).tuneClouds({ location: btn.loc });
-                          }
-                        }}
-                        className="py-0.5 px-1.5 rounded-[2px] border text-center font-mono text-micro uppercase tracking-wider bg-[var(--theme-control-bg)] hover:bg-[var(--theme-control-hover-bg)] text-[var(--theme-text-primary)] border-[var(--theme-control-border)] transition-colors cursor-pointer"
-                      >
-                        {btn.label}
-                      </button>
-                    ))}
-                  </div>
+                {/* Reset Calibrated Physics */}
+                <div className="pt-2 border-t border-[var(--theme-card-border-50)]">
                   <button
                     type="button"
                     onClick={handleResetCloudDefaults}
-                    className="py-0.5 px-2 rounded-[2px] border text-center font-mono text-micro uppercase font-bold tracking-wider bg-[var(--theme-status-amber-20)] hover:bg-[var(--theme-status-amber-30)] text-[var(--theme-status-amber)] border-[var(--theme-status-amber-40)] transition-colors cursor-pointer shrink-0"
+                    className="w-full py-1 px-2 rounded-[2px] border text-center font-mono text-micro uppercase font-bold tracking-wider bg-[var(--theme-status-amber-20)] hover:bg-[var(--theme-status-amber-30)] text-[var(--theme-status-amber)] border-[var(--theme-status-amber-40)] transition-colors cursor-pointer"
                     title="Reset all volumetric cloud levers to calibrated defaults"
                   >
                     Reset Calibrated Physics

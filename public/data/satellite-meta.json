@@ -1,0 +1,60 @@
+{
+  "source": "NASA EOSDIS GIBS (VIIRS NOAA-21/NOAA-20/SNPP Band I5 11.45\u00b5m + MODIS/VIIRS L2 CTH & CF)",
+  "model": "nasa_gibs_3d_volumetric_composite",
+  "mode": "live_nasa_gibs",
+  "ingestedAtUTC": "2026-11-11T22:39:54.526094+00:00",
+  "observationTimestampUTC": "2026-11-11T22:39:54.526094+00:00",
+  "gridDimensions": {
+    "width": 3600,
+    "height": 1801,
+    "resolutionDeg": 0.1,
+    "latitudeOrientation": "row_0_north",
+    "longitudeOrientation": "col_0_antimeridian_-180"
+  },
+  "textureEncoding": {
+    "format": "r16float",
+    "bytesPerTexel": 2,
+    "rawRowBytes": 7200,
+    "paddedRowBytes": 7424,
+    "isPrePadded": true,
+    "sliceByteLength": 13370624
+  },
+  "layers": {
+    "viirs_ir_night": "VIIRS_SNPP_Brightness_Temp_BandI5_Night,VIIRS_NOAA20_Brightness_Temp_BandI5_Night,VIIRS_NOAA21_Brightness_Temp_BandI5_Night",
+    "viirs_ir_day": "VIIRS_SNPP_Brightness_Temp_BandI5_Day,VIIRS_NOAA20_Brightness_Temp_BandI5_Day,VIIRS_NOAA21_Brightness_Temp_BandI5_Day",
+    "cth_night": "MODIS_Terra_Cloud_Top_Height_Night,MODIS_Aqua_Cloud_Top_Height_Night,VIIRS_SNPP_Cloud_Top_Height_Night,VIIRS_NOAA20_Cloud_Top_Height_Night",
+    "cth_day": "MODIS_Terra_Cloud_Top_Height_Day,MODIS_Aqua_Cloud_Top_Height_Day,VIIRS_SNPP_Cloud_Top_Height_Day,VIIRS_NOAA20_Cloud_Top_Height_Day",
+    "cf_night": "MODIS_Terra_Cloud_Fraction_Night,MODIS_Aqua_Cloud_Fraction_Night",
+    "cf_day": "MODIS_Terra_Cloud_Fraction_Day,MODIS_Aqua_Cloud_Fraction_Day"
+  },
+  "strata": {
+    "low": {
+      "file": "/data/satellite-cloud-low-latest.bin",
+      "byteLength": 13370624,
+      "mean": 0.3658,
+      "p90": 0.9524,
+      "clearSkyFraction": 0.3896
+    },
+    "mid": {
+      "file": "/data/satellite-cloud-mid-latest.bin",
+      "byteLength": 13370624,
+      "mean": 0.163,
+      "p90": 0.6792,
+      "clearSkyFraction": 0.6748
+    },
+    "high": {
+      "file": "/data/satellite-cloud-high-latest.bin",
+      "byteLength": 13370624,
+      "mean": 0.0978,
+      "p90": 0.5293,
+      "clearSkyFraction": 0.8364
+    },
+    "radiative_optical_depth": {
+      "file": "/data/satellite-radiative-optical-depth-latest.bin",
+      "byteLength": 13370624,
+      "mean": 0.355,
+      "p90": 0.7234,
+      "clearSkyFraction": 0.2843
+    }
+  }
+}

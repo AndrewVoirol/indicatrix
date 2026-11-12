@@ -6,15 +6,15 @@
 // ============================================================================
 
 import React from 'react';
-import { SimulationMode, GeodesicOverlayMode, LoadedDataInfo, ResolutionTier } from '../../types';
-import { UnifiedRightSidebar, PrognosticModelBackend, isWeatherNextModel, DataLayerItem } from './UnifiedRightSidebar';
+import { SimulationMode, LoadedDataInfo, ResolutionTier } from '../../types';
+import { UnifiedRightSidebar, PrognosticModelBackend, isWeatherNextModel, isSatelliteModel, DataLayerItem } from './UnifiedRightSidebar';
 import { DataLayerToastNotification, ToastMessage } from './DataLayerToastNotification';
-import { BlendModeType, DataLayerRenderStyle } from '../../core/data/DataLayerCatalog';
+import { BlendModeType } from '../../core/data/DataLayerCatalog';
 import { TimelineScrubberState } from './TimelineScrubber';
 import type { MeteorologicalProvenance } from '../../core/data/WeatherNextDataSource';
 
 export type { DataLayerItem, ToastMessage, LoadedDataInfo, ResolutionTier, PrognosticModelBackend, MeteorologicalProvenance };
-export { isWeatherNextModel };
+export { isWeatherNextModel, isSatelliteModel };
 export { DataProvenanceOverlay } from './DataProvenanceOverlay';
 
 export interface TelemetryHUDProps {
@@ -23,10 +23,6 @@ export interface TelemetryHUDProps {
   theme: 0 | 1 | 2;
   onThemeToggle: () => void;
   onSelectThemeMode?: (mode: 0 | 1 | 2) => void;
-  showSoundings?: boolean;
-  onSoundingsToggle?: () => void;
-  showTriangulation?: boolean;
-  onTriangulationToggle?: () => void;
   showCartouche?: boolean;
   onCartoucheToggle?: () => void;
   backend: 'webgl2' | 'webgpu';
@@ -38,24 +34,16 @@ export interface TelemetryHUDProps {
   onLayerModeChange: (l: 0 | 1 | 2) => void;
   mode: SimulationMode;
   onModeChange: (m: SimulationMode) => void;
-  cursorPhysicsEnabled: boolean;
-  onCursorPhysicsToggle: (enabled: boolean) => void;
-  activeOverlay: GeodesicOverlayMode;
-  onOverlayChange: (o: GeodesicOverlayMode) => void;
-  showLandmarks: boolean;
-  onLandmarksToggle: () => void;
-  showTissot: boolean;
-  onTissotToggle: () => void;
   showVectors: boolean;
   onVectorsToggle: () => void;
   showToponymy?: boolean;
   onToponymyToggle?: () => void;
   onToponymyChange?: (enabled: boolean) => void;
   alpha: number;
-  fps: number;
-  latStr: string;
-  lonStr: string;
-  mapScaleStr: string;
+  fps?: number;
+  latStr?: string;
+  lonStr?: string;
+  mapScaleStr?: string;
   cameraPosition?: [number, number, number];
   dataInfo: LoadedDataInfo;
   onSnapCamera: (v: 'equator' | 'pole' | 'seam' | 'isometric' | 'horizon') => void;
@@ -75,11 +63,6 @@ export interface TelemetryHUDProps {
   onAmbientOcclusionChangeDataLayer?: (id: string, ao: number) => void;
   onPaperToothChangeDataLayer?: (id: string, tooth: number) => void;
   onReorderDataLayer?: (id: string, direction: 'up' | 'down') => void;
-  onSelectRenderStyle?: (style: DataLayerRenderStyle) => void;
-  fractureIntensity?: number;
-  onFractureIntensityChange?: (v: number) => void;
-  fluidVortexStrength?: number;
-  onFluidVortexStrengthChange?: (v: number) => void;
   gpuReport?: any;
   isCatalogOpen?: boolean;
   onCatalogOpenChange?: (open: boolean) => void;
@@ -91,8 +74,6 @@ export interface TelemetryHUDProps {
   onSelectDemoSequence?: (seq: 'hawaii' | 'cape-cod' | 'grand-canyon' | 'fuji') => void;
   showClouds?: boolean;
   onShowCloudsChange?: (v: boolean) => void;
-  showAtmosphere?: boolean;
-  onShowAtmosphereChange?: (v: boolean) => void;
   showCloudLow?: boolean;
   onShowCloudLowChange?: (v: boolean) => void;
   showCloudMid?: boolean;
@@ -123,14 +104,10 @@ export interface TelemetryHUDProps {
   onAtmosphericScaleChange?: (v: number) => void;
   shadowIntensity?: number;
   onShadowIntensityChange?: (v: number) => void;
-  verticalScaleMode?: number;
-  onVerticalScaleModeChange?: (v: number) => void;
   rainShadowFeedback?: number;
   onRainShadowFeedbackChange?: (v: number) => void;
   pluvialGamma?: number;
   onPluvialGammaChange?: (v: number) => void;
-  weatherOpticalMode?: number;
-  onWeatherOpticalModeChange?: (v: number) => void;
   thermodynamicGating?: boolean;
   onThermodynamicGatingChange?: (v: boolean) => void;
   prognosticModel?: PrognosticModelBackend;
@@ -143,11 +120,6 @@ export interface TelemetryHUDProps {
   onPurityModeToggle?: () => void;
   contourActive?: boolean;
   onContourActiveToggle?: (active: boolean) => void;
-  cdlodEnabled?: boolean;
-  onCdlodToggle?: (enabled: boolean) => void;
-  cdlodDiagnosticMode?: number;
-  onCdlodDiagnosticModeChange?: (mode: number) => void;
-  setCdlodDiagnosticMode?: (mode: number) => void;
   provenance?: MeteorologicalProvenance;
   windSpeedMultiplier?: number;
   onWindSpeedMultiplierChange?: (v: number) => void;
@@ -168,7 +140,7 @@ export interface TelemetryHUDProps {
   onBedrockIncisionChange?: (val: number) => void;
 }
 
-export const TelemetryHUD: React.FC<TelemetryHUDProps> = (props) => {
+const TelemetryHUDInner: React.FC<TelemetryHUDProps> = (props) => {
   if (props.isZenMode) return null;
 
   return (
@@ -180,10 +152,6 @@ export const TelemetryHUD: React.FC<TelemetryHUDProps> = (props) => {
         theme={props.theme}
         onThemeToggle={props.onThemeToggle}
         onSelectThemeMode={props.onSelectThemeMode}
-        showSoundings={props.showSoundings}
-        onSoundingsToggle={props.onSoundingsToggle}
-        showTriangulation={props.showTriangulation}
-        onTriangulationToggle={props.onTriangulationToggle}
         showCartouche={props.showCartouche}
         onCartoucheToggle={props.onCartoucheToggle}
         backend={props.backend}
@@ -195,14 +163,6 @@ export const TelemetryHUD: React.FC<TelemetryHUDProps> = (props) => {
         onLayerModeChange={props.onLayerModeChange}
         mode={props.mode}
         onModeChange={props.onModeChange}
-        cursorPhysicsEnabled={props.cursorPhysicsEnabled}
-        onCursorPhysicsToggle={props.onCursorPhysicsToggle}
-        activeOverlay={props.activeOverlay}
-        onOverlayChange={props.onOverlayChange}
-        showLandmarks={props.showLandmarks}
-        onLandmarksToggle={props.onLandmarksToggle}
-        showTissot={props.showTissot}
-        onTissotToggle={props.onTissotToggle}
         showVectors={props.showVectors}
         onVectorsToggle={props.onVectorsToggle}
         showToponymy={props.showToponymy}
@@ -231,11 +191,6 @@ export const TelemetryHUD: React.FC<TelemetryHUDProps> = (props) => {
         onAmbientOcclusionChangeDataLayer={props.onAmbientOcclusionChangeDataLayer}
         onPaperToothChangeDataLayer={props.onPaperToothChangeDataLayer}
         onReorderDataLayer={props.onReorderDataLayer}
-        onSelectRenderStyle={props.onSelectRenderStyle}
-        fractureIntensity={props.fractureIntensity}
-        onFractureIntensityChange={props.onFractureIntensityChange}
-        fluidVortexStrength={props.fluidVortexStrength}
-        onFluidVortexStrengthChange={props.onFluidVortexStrengthChange}
         gpuReport={props.gpuReport}
         isCatalogOpen={props.isCatalogOpen}
         onCatalogOpenChange={props.onCatalogOpenChange}
@@ -247,8 +202,6 @@ export const TelemetryHUD: React.FC<TelemetryHUDProps> = (props) => {
         onSelectDemoSequence={props.onSelectDemoSequence}
         showClouds={props.showClouds}
         onShowCloudsChange={props.onShowCloudsChange}
-        showAtmosphere={props.showAtmosphere}
-        onShowAtmosphereChange={props.onShowAtmosphereChange}
         showCloudLow={props.showCloudLow}
         onShowCloudLowChange={props.onShowCloudLowChange}
         showCloudMid={props.showCloudMid}
@@ -279,14 +232,10 @@ export const TelemetryHUD: React.FC<TelemetryHUDProps> = (props) => {
         onAtmosphericScaleChange={props.onAtmosphericScaleChange}
         shadowIntensity={props.shadowIntensity}
         onShadowIntensityChange={props.onShadowIntensityChange}
-        verticalScaleMode={props.verticalScaleMode}
-        onVerticalScaleModeChange={props.onVerticalScaleModeChange}
         rainShadowFeedback={props.rainShadowFeedback}
         onRainShadowFeedbackChange={props.onRainShadowFeedbackChange}
         pluvialGamma={props.pluvialGamma}
         onPluvialGammaChange={props.onPluvialGammaChange}
-        weatherOpticalMode={props.weatherOpticalMode}
-        onWeatherOpticalModeChange={props.onWeatherOpticalModeChange}
         thermodynamicGating={props.thermodynamicGating}
         onThermodynamicGatingChange={props.onThermodynamicGatingChange}
         prognosticModel={props.prognosticModel}
@@ -299,11 +248,6 @@ export const TelemetryHUD: React.FC<TelemetryHUDProps> = (props) => {
         onPurityModeToggle={props.onPurityModeToggle}
         contourActive={props.contourActive}
         onContourActiveToggle={props.onContourActiveToggle}
-        cdlodEnabled={props.cdlodEnabled}
-        onCdlodToggle={props.onCdlodToggle}
-        cdlodDiagnosticMode={props.cdlodDiagnosticMode}
-        onCdlodDiagnosticModeChange={props.onCdlodDiagnosticModeChange}
-        setCdlodDiagnosticMode={props.setCdlodDiagnosticMode}
         provenance={props.provenance}
         windSpeedMultiplier={props.windSpeedMultiplier}
         onWindSpeedMultiplierChange={props.onWindSpeedMultiplierChange}
@@ -332,3 +276,5 @@ export const TelemetryHUD: React.FC<TelemetryHUDProps> = (props) => {
     </>
   );
 };
+
+export const TelemetryHUD = TelemetryHUDInner;

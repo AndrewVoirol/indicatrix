@@ -5,21 +5,46 @@
 // ============================================================================
 
 import React from 'react';
+import type { MeteorologicalProvenance } from '../../core/data/WeatherNextDataSource';
 
 export interface CuratorsColophonProps {
   theme: 0 | 1 | 2;
   isWeatherActive?: boolean;
-  isRadarActive?: boolean;
+  prognosticModel?: string;
+  provenance?: MeteorologicalProvenance;
+  timelineMinutes?: number;
   className?: string;
 }
 
 export const CuratorsColophon: React.FC<CuratorsColophonProps> = ({
-  theme,
+  theme: _theme,
   isWeatherActive = false,
-  isRadarActive = false,
+  prognosticModel,
+  provenance,
+  timelineMinutes = 0,
   className = '',
 }) => {
+  const isGfs = prognosticModel === 'gfs' || prognosticModel === 'noaa-gfs';
+  const isSat = prognosticModel === 'satellite' || prognosticModel === 'live-satellite';
   const activeBadgeStyle = 'bg-[var(--theme-status-sage-15)] text-[var(--theme-status-sage)]';
+  const activeModelBadge = isGfs
+    ? '[NOAA GFS: ACTIVE]'
+    : isSat
+    ? '[LIVE SATELLITE: ACTIVE]'
+    : '[WEATHERNEXT: ACTIVE]';
+
+  const leadHours = Math.max(0, Math.floor((Number.isFinite(timelineMinutes) ? timelineMinutes : 0) / 60));
+  const activeMeteoSpec = isGfs
+    ? 'NOAA NCEP GFS 0.25° Operational Grid (1440×721 · 10m / 500 / 250 hPa · 0h Analysis)'
+    : isSat
+    ? leadHours > 0
+      ? `NASA EOSDIS GIBS → WeatherNext 3 (+${leadHours}h Handoff · 3600×1801 · 0.1°)`
+      : 'NASA EOSDIS GIBS (VIIRS Band I5 11.45µm + MODIS/VIIRS L2 CTH & CF · 3600×1801 · 0.1°)'
+    : `Google DeepMind WeatherNext 3 (3600×1801 · 0.1° Zarr v3${
+        provenance?.runTimestamp && provenance.runTimestamp.includes('T')
+          ? ` · ${provenance.runTimestamp.slice(11, 13)}Z Cycle`
+          : ''
+      })`;
 
   return (
     <div
@@ -42,34 +67,28 @@ export const CuratorsColophon: React.FC<CuratorsColophonProps> = ({
           <li className="flex items-start gap-1">
             <span className="opacity-50 select-none">•</span>
             <span>
-              <strong className="text-current font-semibold">Crust & Bathymetry:</strong> NOAA ETOPO 2022 (15″ DEM)
+              <strong className="text-current font-semibold">Crust & Bathymetry:</strong> GEBCO 2024 / NOAA ETOPO 2022 (15″ DEM)
             </span>
           </li>
           <li className="flex items-start gap-1">
             <span className="opacity-50 select-none">•</span>
             <span className="flex-1">
-              <strong className="text-current font-semibold">Atmospheric Modeling:</strong> WeatherNext 3 (0.1°) & NOAA GFS (10 m winds)
+              <strong className="text-current font-semibold">Atmospheric & Precipitation:</strong> Google DeepMind WeatherNext 3 (0.1° / 10 km), NASA EOSDIS GIBS (VIIRS 11.45µm + MODIS/VIIRS CTH & CF), & NOAA GFS (0.25° 10m / 500 / 250 hPa)
               {isWeatherActive && (
-                <span
-                  data-testid="colophon-badge-weathernext"
-                  className={`ml-1.5 px-1.5 py-0.5 rounded-[2px] text-nano font-mono font-bold tracking-wider uppercase align-middle inline-block ${activeBadgeStyle}`}
-                >
-                  [WEATHERNEXT: ACTIVE]
-                </span>
-              )}
-            </span>
-          </li>
-          <li className="flex items-start gap-1">
-            <span className="opacity-50 select-none">•</span>
-            <span className="flex-1">
-              <strong className="text-current font-semibold">Precipitation Radar:</strong> RainViewer Radar
-              {isRadarActive && (
-                <span
-                  data-testid="colophon-badge-radar"
-                  className={`ml-1.5 px-1.5 py-0.5 rounded-[2px] text-nano font-mono font-bold tracking-wider uppercase align-middle inline-block ${activeBadgeStyle}`}
-                >
-                  [RADAR: ACTIVE]
-                </span>
+                <>
+                  <span
+                    data-testid="colophon-badge-weathernext"
+                    className={`ml-1.5 px-1.5 py-0.5 rounded-[2px] text-nano font-mono font-bold tracking-wider uppercase align-middle inline-block ${activeBadgeStyle}`}
+                  >
+                    {activeModelBadge}
+                  </span>
+                  <span
+                    data-testid="colophon-active-meteo-spec"
+                    className="block mt-0.5 text-[var(--theme-text-muted)] text-pico"
+                  >
+                    Active Feed: {activeMeteoSpec}
+                  </span>
+                </>
               )}
             </span>
           </li>

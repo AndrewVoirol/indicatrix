@@ -417,18 +417,19 @@ export function computeGoldenHourRimIntensity(
  */
 export function computeSunsetSolarColor(
   baseSunColor: Vec3,
-  sunAltitudeDeg: number
+  sunAltitudeDeg: number,
+  theme?: number
 ): Vec3 {
   const sunAlt = Math.max(0.0, Math.min(90.0, sunAltitudeDeg));
   if (sunAlt >= 15.0) return [baseSunColor[0], baseSunColor[1], baseSunColor[2]];
   const t = Math.max(0.0, Math.min(1.0, (15.0 - sunAlt) / (15.0 - 3.0)));
   const sunsetWarmth = t * t * (3.0 - 2.0 * t);
   const factor = sunsetWarmth * 0.75;
-  const warmColor: Vec3 = [1.00, 0.72, 0.42];
+  const targetColor: Vec3 = theme === 2 ? [0.76, 0.91, 1.00] : [1.00, 0.72, 0.42];
   return [
-    baseSunColor[0] * (1.0 - factor) + warmColor[0] * factor,
-    baseSunColor[1] * (1.0 - factor) + warmColor[1] * factor,
-    baseSunColor[2] * (1.0 - factor) + warmColor[2] * factor,
+    baseSunColor[0] * (1.0 - factor) + targetColor[0] * factor,
+    baseSunColor[1] * (1.0 - factor) + targetColor[1] * factor,
+    baseSunColor[2] * (1.0 - factor) + targetColor[2] * factor,
   ];
 }
 
@@ -1415,5 +1416,172 @@ export function evaluateMacroChartF32(
     normal: norm,
   };
 }
+
+export interface AdaptiveRaymarchStepBudget {
+  activeMaxSteps: number;
+  activeStepDiv: number;
+  stepScale: number;
+  baseStepSize: number;
+  opticalStepSize: number;
+}
+
+/**
+ * Track 4 view-angle & unfurl adaptive raymarch step-budget calculator.
+ * Smoothly adapts active step budget across spherical/planar and nadir/oblique regimes
+ * while scaling opticalStepSize by (46 / activeStepDiv) so integrated Beer-Lambert
+ * optical thickness remains invariant to step count across both nadir and grazing rays.
+ */
+export function computeAdaptiveRaymarchStepBudget(
+  entryLimbCos: number,
+  unfurl: number,
+  atmosSpan: number,
+  deltaR: number,
+  maxStepsUniform: number = 64,
+  hasMipDem: boolean = true
+): AdaptiveRaymarchStepBudget {
+  const maxSteps = Math.max(1, Math.min(64, Math.trunc(maxStepsUniform)));
+  const clampedCos = Math.max(0.0, Math.min(1.0, entryLimbCos));
+  const clampedUnfurl = Math.max(0.0, Math.min(1.0, unfurl));
+
+  const steepFactor = smoothstep(0.22, 0.92, clampedCos);
+  const sphereStepsF = 38.0 + (26.0 - 38.0) * steepFactor;
+  const planarStepsF = 32.0 + (26.0 - 32.0) * steepFactor;
+  const planarBlend = smoothstep(0.75, 0.98, clampedUnfurl);
+  const targetStepsF = sphereStepsF + (planarStepsF - sphereStepsF) * planarBlend;
+
+  const activeMaxSteps = Math.max(18, Math.min(maxSteps, Math.round(targetStepsF)));
+  const activeStepDiv = Math.max(16.0, activeMaxSteps - 2);
+  const stepScale = 46.0 / activeStepDiv;
+  const safeSpan = Math.max(0.0001, atmosSpan);
+  const baseStepSize = safeSpan / activeStepDiv;
+  const effOpticalSpan = hasMipDem ? deltaR * 0.48 : deltaR;
+  const opticalStepSize = Math.min(
+    baseStepSize * 1.28,
+    (effOpticalSpan / Math.max(1, maxSteps)) * 2.35 * stepScale
+  );
+
+  return {
+    activeMaxSteps,
+    activeStepDiv,
+    stepScale,
+    baseStepSize,
+    opticalStepSize,
+  };
+}
+
+/**
+ * Choice G: Jacobian-conserving non-linear boundary-layer raymarch step warp.
+ * Concentrates raymarch steps near the terrain/boundary-layer end of the ray at close zoom
+ * while returning the exact analytical derivative ds/du so Beer-Lambert optical thickness
+ * int_0^1 sigma_t * (ds/du) du === int_0^1 sigma_t ds is strictly conserved.
+ */
+export function computeBoundaryLayerStepWarp(
+  u: number,
+  zoomWeight: number,
+  downwardRay: boolean = true,
+  gamma: number = 1.75
+): { s: number; jacobian: number } {
+  const uClamped = Math.max(0.0, Math.min(1.0, u));
+  const w = Math.max(0.0, Math.min(1.0, zoomWeight));
+  const g = Math.max(1.0, Math.min(3.0, gamma));
+  if (w <= 1e-5 || Math.abs(g - 1.0) <= 1e-5) {
+    return { s: uClamped, jacobian: 1.0 };
+  }
+  if (downwardRay) {
+    const comp = Math.max(1e-4, 1.0 - uClamped);
+    const sWarp = 1.0 - Math.pow(comp, g);
+    const dsWarp = g * Math.pow(comp, g - 1.0);
+    return {
+      s: uClamped * (1.0 - w) + sWarp * w,
+      jacobian: (1.0 - w) + w * dsWarp,
+    };
+  }
+  const base = Math.max(1e-4, uClamped);
+  const sWarp = Math.pow(base, g);
+  const dsWarp = g * Math.pow(base, g - 1.0);
+  return {
+    s: uClamped * (1.0 - w) + sWarp * w,
+    jacobian: (1.0 - w) + w * dsWarp,
+  };
+}
+
+/**
+ * Choice H: Mode-aware inverse manifold mapping (lambda, phi, h) across all 4 Indicatrix projections:
+ * - Mode 0: Nested Harmonic Roll -> Equirectangular 2:1 (invertMacroChart)
+ * - Mode 1: Parchment Scroll -> Web Mercator (+/- 85 deg = +/- 3.13 R)
+ * - Mode 2: Tectonic Crust Fracture -> Web Mercator
+ * - Mode 3: Hydrodynamic Fluid -> Web Mercator
+ */
+export function invertPlanarManifoldCPU(
+  worldPos: Vec3,
+  unfurl: number,
+  radius: number = 5.0,
+  mode: number = 0
+): InvertedMacroCoord {
+  const activeMode = Math.max(0, Math.min(3, Math.trunc(mode)));
+  if (activeMode === 0) {
+    return invertMacroChart(worldPos, unfurl, radius);
+  }
+
+  const [px, py, pz] = worldPos;
+  const alpha = Math.max(0.0, Math.min(1.0, unfurl));
+  const rSph = Math.max(1e-5, Math.hypot(px, py, pz));
+  const lambdaSph = Math.atan2(px, pz);
+  const phiSph = Math.asin(Math.max(-0.9998, Math.min(0.9998, py / rSph)));
+  const hSph = rSph - radius;
+
+  if (alpha <= 0.0005) {
+    return { lambda: lambdaSph, phi: phiSph, h: hSph };
+  }
+
+  const mercNormY = py / Math.max(1e-5, radius);
+  const mercClampedY = Math.max(-3.1313, Math.min(3.1313, mercNormY));
+  const phiMerc = 2.0 * Math.atan(Math.exp(mercClampedY)) - Math.PI * 0.5;
+  const phiMercUnbounded = Math.abs(mercNormY) > 3.1313
+    ? Math.sign(mercNormY) * (Math.PI * 0.5 + (Math.abs(mercNormY) - 3.1313) * 0.25)
+    : phiMerc;
+  const lambdaMerc = px / Math.max(1e-5, radius);
+
+  if (alpha >= 0.9995) {
+    return { lambda: lambdaMerc, phi: phiMercUnbounded, h: pz };
+  }
+
+  if (activeMode === 1) {
+    const tCyl = smoothstep(0.0, 0.20, alpha);
+    const tRoll = Math.sin(Math.PI * smoothstep(0.15, 0.40, alpha));
+    const tUnroll = smoothstep(0.20, 1.0, alpha);
+    const s = Math.max(1e-4, 1.0 - tUnroll);
+
+    let phi = (1.0 - tUnroll) * phiSph + tUnroll * phiMerc;
+    for (let i = 0; i < 4; i++) {
+      const pClamped = Math.max(-1.4835, Math.min(1.4835, phi));
+      const mercY = Math.log(Math.tan(Math.PI * 0.25 + pClamped * 0.5)) * radius;
+      const secP = 1.0 / Math.max(0.087, Math.cos(pClamped));
+      const f = (1.0 - tUnroll) * radius * Math.sin(pClamped) + tUnroll * mercY - py;
+      const df = (1.0 - tUnroll) * radius * Math.cos(pClamped) + tUnroll * radius * secP;
+      phi = Math.max(-1.4835, Math.min(1.4835, pClamped - f / Math.max(1e-4, df)));
+    }
+    const rCyl = radius * Math.cos(phi) * (1.0 - tCyl) + radius * tCyl;
+    const rScroll = rCyl * (1.0 - 0.20 * tRoll);
+    const Rc = rScroll / s;
+    const Cz = rScroll * (s - 1.0 / s);
+    const dz = pz - Cz;
+    const lambdaDev = Math.atan2(px, dz) / s;
+    const hDev = Math.hypot(px, dz) - Rc;
+    return { lambda: lambdaDev, phi, h: hDev };
+  }
+
+  const tFlat = activeMode === 2 ? smoothstep(0.15, 1.0, alpha) : alpha;
+  const volLift = activeMode === 3
+    ? radius * 0.50 * Math.sin(Math.PI * alpha)
+    : (alpha <= 0.15 ? 0.06 * radius * (alpha / 0.15) : 0.06 * radius * (1.0 - tFlat));
+  return {
+    lambda: lambdaSph * (1.0 - tFlat) + lambdaMerc * tFlat,
+    phi: phiSph * (1.0 - tFlat) + phiMercUnbounded * tFlat,
+    h: (hSph - volLift) * (1.0 - tFlat) + pz * tFlat,
+  };
+}
+
+
 
 

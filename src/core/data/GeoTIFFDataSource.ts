@@ -9,6 +9,8 @@
 // ============================================================================
 
 import { IDataSource, DataSourceCategory, BoundingBox3D, SpatialDataChunk } from './IDataSource';
+import { decodeWorkerPool } from '../workers/DecodeWorkerPool';
+import type { GeoTIFFDecodeTilesResponse } from '../workers/decodeTasks';
 
 export interface GeoTIFFMetadata {
   projection: string;
@@ -72,6 +74,8 @@ export class GeoTIFFDataSource implements IDataSource<GeoTIFFMetadata> {
 
   // In-memory 256x256 tile cache to eliminate redundant network transfers
   private tileCache: Map<string, Float32Array> = new Map();
+  private endpointCache: Map<string, { parsed: ParsedTIFFData; tiles: Map<string, Float32Array> }> = new Map();
+  private static readonly MAX_CACHED_ENDPOINTS = 16;
   private lastChunk: SpatialDataChunk<GeoTIFFMetadata> | null = null;
   private gpuBuffer: GPUBuffer | WebGLBuffer | null = null;
 
@@ -119,16 +123,36 @@ export class GeoTIFFDataSource implements IDataSource<GeoTIFFMetadata> {
    */
   public async connect(endpointUrl: string): Promise<boolean> {
     const normalized = this.normalizeUrl(endpointUrl);
-    if (this.endpointUrl && this.endpointUrl !== normalized) {
-      this.tileCache.clear();
-    }
+    const switchingEndpoint = Boolean(this.endpointUrl && this.endpointUrl !== normalized);
     this.endpointUrl = normalized;
 
     // Mock/synthetic testing endpoint bypass (avoids DNS ENOTFOUND in test environments)
     if (this.isMockOrTestEndpoint()) {
+      if (switchingEndpoint) {
+        this.tileCache = new Map();
+      }
       this.initSyntheticMetadata();
       this.isConnected = true;
       return true;
+    }
+
+    // Restore cached IFD metadata and decoded tile map when revisiting a previously connected COG endpoint
+    const cachedEntry = this.endpointCache.get(normalized);
+    if (cachedEntry) {
+      // Refresh LRU insertion order
+      this.endpointCache.delete(normalized);
+      this.endpointCache.set(normalized, cachedEntry);
+      this.metadata = cachedEntry.parsed.metadata;
+      this.tileOffsets = cachedEntry.parsed.tileOffsets;
+      this.tileByteCounts = cachedEntry.parsed.tileByteCounts;
+      this.levels = cachedEntry.parsed.levels;
+      this.tileCache = cachedEntry.tiles;
+      this.isConnected = true;
+      return true;
+    }
+
+    if (switchingEndpoint) {
+      this.tileCache = new Map();
     }
 
     try {
@@ -141,6 +165,13 @@ export class GeoTIFFDataSource implements IDataSource<GeoTIFFMetadata> {
         this.tileByteCounts = parsed.tileByteCounts;
         this.levels = parsed.levels;
         this.isConnected = true;
+        if (this.endpointCache.size >= GeoTIFFDataSource.MAX_CACHED_ENDPOINTS) {
+          const oldestKey = this.endpointCache.keys().next().value;
+          if (oldestKey !== undefined) {
+            this.endpointCache.delete(oldestKey);
+          }
+        }
+        this.endpointCache.set(normalized, { parsed, tiles: this.tileCache });
         return true;
       }
     } catch {
@@ -521,6 +552,7 @@ export class GeoTIFFDataSource implements IDataSource<GeoTIFFMetadata> {
    */
   public clearCache(): void {
     this.tileCache.clear();
+    this.endpointCache.clear();
   }
 
   /**
@@ -591,6 +623,170 @@ export class GeoTIFFDataSource implements IDataSource<GeoTIFFMetadata> {
   }
 
   /**
+   * Map geographic (lon, lat) directly to exact Level-0 (IFD 0) 256x256 tile indices
+   * using true raster pixel dimensions so non-multiple-of-256 COGs (e.g. 5400x3600) suffer zero drift.
+   */
+  public lonLatToLevel0Tile(lon: number, lat: number): { tileX: number; tileY: number; tilesAcross: number; tilesDown: number } {
+    const lv0 = this.levels.length > 0 ? this.levels[0] : null;
+    const width = lv0 ? lv0.width : (this.metadata?.width || 256);
+    const height = lv0 ? lv0.height : (this.metadata?.height || 256);
+    const tileW = lv0 ? lv0.tileWidth : (this.metadata?.tileWidth || 256);
+    const tileH = lv0 ? lv0.tileHeight : (this.metadata?.tileHeight || 256);
+    const tilesAcross = lv0 ? lv0.tilesAcross : (this.metadata?.tilesAcross || Math.max(1, Math.ceil(width / tileW)));
+    const tilesDown = lv0 ? lv0.tilesDown : (this.metadata?.tilesDown || Math.max(1, Math.ceil(height / tileH)));
+
+    const metaBounds = this.metadata?.bounds;
+    let px: number;
+    let py: number;
+    if (
+      metaBounds &&
+      metaBounds.maxLon > metaBounds.minLon &&
+      metaBounds.maxLat > metaBounds.minLat &&
+      (metaBounds.maxLon - metaBounds.minLon < 350.0 || metaBounds.maxLat - metaBounds.minLat < 170.0)
+    ) {
+      const normX = Math.max(0.0, Math.min(0.999999, (lon - metaBounds.minLon) / (metaBounds.maxLon - metaBounds.minLon)));
+      const normY = Math.max(0.0, Math.min(0.999999, (metaBounds.maxLat - lat) / (metaBounds.maxLat - metaBounds.minLat)));
+      px = normX * width;
+      py = normY * height;
+    } else {
+      px = Math.max(0.0, Math.min(0.999999, (lon + 180.0) / 360.0)) * width;
+      py = Math.max(0.0, Math.min(0.999999, (90.0 - lat) / 180.0)) * height;
+    }
+
+    const tileX = Math.max(0, Math.min(tilesAcross - 1, Math.floor(px / tileW)));
+    const tileY = Math.max(0, Math.min(tilesDown - 1, Math.floor(py / tileH)));
+    return { tileX, tileY, tilesAcross, tilesDown };
+  }
+
+  /**
+   * Compute exact pixel-aligned geographic bounding box and valid UV scale (uvScaleX, uvScaleY)
+   * for a Level-0 (IFD 0) 256x256 tile, handling right/bottom partial edge tiles cleanly.
+   */
+  public getLevel0TileGeometry(
+    tileX: number,
+    tileY: number
+  ): { bounds: BoundingBox3D; uvScaleX: number; uvScaleY: number } | null {
+    if (!this.metadata?.bounds) return null;
+    const lv0 = this.levels.length > 0 ? this.levels[0] : null;
+    const width = lv0 ? lv0.width : (this.metadata.width || 256);
+    const height = lv0 ? lv0.height : (this.metadata.height || 256);
+    const tileW = lv0 ? lv0.tileWidth : (this.metadata.tileWidth || 256);
+    const tileH = lv0 ? lv0.tileHeight : (this.metadata.tileHeight || 256);
+
+    const startX = tileX * tileW;
+    const startY = tileY * tileH;
+    if (startX >= width || startY >= height || startX < 0 || startY < 0) return null;
+
+    const validW = Math.max(1, Math.min(tileW, width - startX));
+    const validH = Math.max(1, Math.min(tileH, height - startY));
+    const { minLon, maxLon, minLat, maxLat } = this.metadata.bounds;
+    const spanLon = maxLon - minLon;
+    const spanLat = maxLat - minLat;
+
+    return {
+      bounds: {
+        minLon: minLon + (startX / width) * spanLon,
+        maxLon: minLon + ((startX + validW) / width) * spanLon,
+        minLat: maxLat - ((startY + validH) / height) * spanLat,
+        maxLat: maxLat - (startY / height) * spanLat,
+        minAlt: -10924,
+        maxAlt: 8848,
+      },
+      uvScaleX: validW / tileW,
+      uvScaleY: validH / tileH,
+    };
+  }
+
+  /**
+   * Coalesces all uncached 256x256 tiles of a COG IFD level into a single contiguous HTTP Range request,
+   * slicing and decompressing each tile into `this.tileCache` in parallel so full-region and global
+   * overview mosaic loads issue 1 HTTP Range request instead of N separate per-tile Range requests.
+   */
+  public async prefetchLevelRange(level: number = 0): Promise<void> {
+    const targetLevel = (level >= 0 && level < this.levels.length) ? this.levels[level] : null;
+    const offsets = targetLevel ? targetLevel.tileOffsets : this.tileOffsets;
+    const byteCounts = targetLevel ? targetLevel.tileByteCounts : this.tileByteCounts;
+    const tilesAcross = targetLevel ? targetLevel.tilesAcross : (this.metadata?.tilesAcross || 1);
+    const tilesDown = targetLevel ? targetLevel.tilesDown : (this.metadata?.tilesDown || 1);
+    const compression = targetLevel ? targetLevel.compression : (this.metadata?.compression || 1);
+    const sampleFormat = targetLevel ? targetLevel.sampleFormat : (this.metadata?.sampleFormat || 3);
+    const bitsPerSample = targetLevel ? targetLevel.bitsPerSample : (this.metadata?.bitsPerSample || 32);
+    const tileW = targetLevel ? targetLevel.tileWidth : (this.metadata?.tileWidth || 256);
+    const tileH = targetLevel ? targetLevel.tileHeight : (this.metadata?.tileHeight || 256);
+
+    if (!this.endpointUrl || offsets.length <= 1 || this.isMockOrTestEndpoint()) return;
+
+    const pending: Array<{ tx: number; ty: number; cacheKey: string; offset: number; byteCount: number }> = [];
+    let minOffset = Infinity;
+    let maxEnd = 0;
+
+    for (let ty = 0; ty < tilesDown; ty++) {
+      for (let tx = 0; tx < tilesAcross; tx++) {
+        const cacheKey = `${level}/${tx}/${ty}`;
+        if (this.tileCache.has(cacheKey)) continue;
+        const tileIndex = ty * tilesAcross + tx;
+        if (tileIndex < 0 || tileIndex >= offsets.length) continue;
+        const offset = offsets[tileIndex];
+        const byteCount = byteCounts[tileIndex] || 0;
+        if (offset > 0 && byteCount > 0) {
+          pending.push({ tx, ty, cacheKey, offset, byteCount });
+          if (offset < minOffset) minOffset = offset;
+          if (offset + byteCount > maxEnd) maxEnd = offset + byteCount;
+        }
+      }
+    }
+
+    if (pending.length <= 1 || maxEnd <= minOffset || maxEnd - minOffset > 24 * 1024 * 1024) return;
+
+    try {
+      const coalescedBuffer = await this.readRange(minOffset, maxEnd - minOffset);
+      if (coalescedBuffer.byteLength < maxEnd - minOffset) return;
+      if (decodeWorkerPool.canUseWorkers()) {
+        const mid = Math.ceil(pending.length / 2);
+        const batches = [pending.slice(0, mid), pending.slice(mid)].filter((b) => b.length > 0);
+        const batchResults = await Promise.all(
+          batches.map((batch) => {
+            const tiles = batch.map(({ cacheKey, offset, byteCount }) => {
+              const relStart = offset - minOffset;
+              const rawBuffer = coalescedBuffer.slice(relStart, relStart + byteCount);
+              return {
+                cacheKey,
+                rawBuffer,
+                compression,
+                tileW,
+                tileH,
+                sampleFormat,
+                bitsPerSample,
+              };
+            });
+            return decodeWorkerPool.run<GeoTIFFDecodeTilesResponse>(
+              { type: 'geotiff_decode_tiles', tiles },
+              tiles.map((t) => t.rawBuffer)
+            );
+          })
+        );
+        for (const res of batchResults) {
+          for (const t of res.tiles) {
+            this.tileCache.set(t.cacheKey, new Float32Array(t.elevBuffer));
+          }
+        }
+      } else {
+        await Promise.all(
+          pending.map(async ({ cacheKey, offset, byteCount }) => {
+            const relStart = offset - minOffset;
+            const rawSlice = new Uint8Array(coalescedBuffer, relStart, byteCount);
+            const decompressed = await this.decompressTile(rawSlice, compression);
+            const elevation = this.decodeTileSamples(decompressed, tileW, tileH, sampleFormat, bitsPerSample);
+            this.tileCache.set(cacheKey, elevation);
+          })
+        );
+      }
+    } catch {
+      // Fall back to individual per-tile fetchTile() calls if coalesced range read fails
+    }
+  }
+
+  /**
    * Fetch single 256x256 elevation tile from Cloud-Optimized GeoTIFF via HTTP Range Request
    */
   public async fetchTile(tileX: number, tileY: number, level: number = 0): Promise<Float32Array> {
@@ -620,8 +816,30 @@ export class GeoTIFFDataSource implements IDataSource<GeoTIFFMetadata> {
         if (offset > 0 && byteCount > 0) {
           try {
             const rawTile = await this.readRange(offset, byteCount);
-            const decompressed = await this.decompressTile(new Uint8Array(rawTile), compression);
-            const elevation = this.decodeTileSamples(decompressed, tileW, tileH, sampleFormat, bitsPerSample);
+            let elevation: Float32Array;
+            if (decodeWorkerPool.canUseWorkers()) {
+              const res = await decodeWorkerPool.run<GeoTIFFDecodeTilesResponse>(
+                {
+                  type: 'geotiff_decode_tiles',
+                  tiles: [
+                    {
+                      cacheKey,
+                      rawBuffer: rawTile,
+                      compression,
+                      tileW,
+                      tileH,
+                      sampleFormat,
+                      bitsPerSample,
+                    },
+                  ],
+                },
+                [rawTile]
+              );
+              elevation = new Float32Array(res.tiles[0].elevBuffer);
+            } else {
+              const decompressed = await this.decompressTile(new Uint8Array(rawTile), compression);
+              elevation = this.decodeTileSamples(decompressed, tileW, tileH, sampleFormat, bitsPerSample);
+            }
             this.tileCache.set(cacheKey, elevation);
             return elevation;
           } catch {
@@ -654,8 +872,8 @@ export class GeoTIFFDataSource implements IDataSource<GeoTIFFMetadata> {
       try {
         const ds = new DecompressionStream('deflate');
         const writer = ds.writable.getWriter();
-        writer.write(data as unknown as BufferSource);
-        writer.close();
+        void writer.write(data as unknown as BufferSource).catch(() => {});
+        void writer.close().catch(() => {});
         const reader = ds.readable.getReader();
         const chunks: Uint8Array[] = [];
         while (true) {
@@ -675,8 +893,8 @@ export class GeoTIFFDataSource implements IDataSource<GeoTIFFMetadata> {
         try {
           const dsRaw = new DecompressionStream('deflate-raw');
           const writer = dsRaw.writable.getWriter();
-          writer.write(data as unknown as BufferSource);
-          writer.close();
+          void writer.write(data as unknown as BufferSource).catch(() => {});
+          void writer.close().catch(() => {});
           const reader = dsRaw.readable.getReader();
           const chunks: Uint8Array[] = [];
           while (true) {
@@ -820,6 +1038,7 @@ export class GeoTIFFDataSource implements IDataSource<GeoTIFFMetadata> {
     this.lastChunk = null;
     this.gpuBuffer = null;
     this.tileCache.clear();
+    this.endpointCache.clear();
     this.levels = [];
     this.isConnected = false;
   }

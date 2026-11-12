@@ -17,10 +17,19 @@ import {
   getProvenanceTelemetry,
 } from '../../core/DevToolsAPI';
 
+import type { MeteorologicalProvenance } from '../../core/data/WeatherNextDataSource';
+
 export interface DataProvenanceOverlayProps {
   theme?: 0 | 1 | 2; // 0: Marie Tharp, 1: Cream Rag, 2: Prussian Cyanotype
   isLight?: boolean;
+  isActive?: boolean;
   className?: string;
+
+  // Meteorological Provenance Parity (Live Satellite / WeatherNext 3 / NOAA GFS)
+  prognosticModel?: string;
+  isWeatherActive?: boolean;
+  provenance?: MeteorologicalProvenance;
+  timelineMinutes?: number;
 
   // Controlled/Testing Prop Overrides
   baseDataset?: string;
@@ -33,6 +42,28 @@ export interface DataProvenanceOverlayProps {
   waterDepthMeters?: number;
 }
 
+export function formatActiveAtmosphericDataset(
+  prognosticModel?: string,
+  timelineMinutes: number = 0,
+  provenance?: MeteorologicalProvenance
+): string {
+  if (prognosticModel === 'gfs' || prognosticModel === 'noaa-gfs') {
+    return 'NOAA NCEP GFS 0.25° Operational Grid (1440×721 · 10m / 500 / 250 hPa · 0h)';
+  }
+  if (prognosticModel === 'satellite' || prognosticModel === 'live-satellite') {
+    const leadH = Math.max(0, Math.floor((Number.isFinite(timelineMinutes) ? timelineMinutes : 0) / 60));
+    if (leadH > 0) {
+      return `NASA EOSDIS GIBS → WeatherNext 3 (+${leadH}h Handoff · 3600×1801 · 0.1°)`;
+    }
+    return 'NASA EOSDIS GIBS · VIIRS Band I5 (11.45µm) + MODIS/VIIRS CTH & CF (3600×1801 · 0.1°)';
+  }
+  const cycleTag =
+    provenance?.runTimestamp && provenance.runTimestamp.includes('T')
+      ? ` · ${provenance.runTimestamp.slice(11, 13)}Z`
+      : '';
+  return `Google DeepMind WeatherNext 3 · Zarr v3 (3600×1801 · 0.1°${cycleTag})`;
+}
+
 /**
  * Determines the active high-resolution regional inset dataset based on
  * litmus test region coordinates and active engine regional DEM state.
@@ -43,6 +74,9 @@ export function getActiveInsetDataset(lat?: number, lon?: number, activeRegionId
   }
   if (activeRegionId === 'grand-canyon') {
     return 'USGS 3DEP (30m)';
+  }
+  if (activeRegionId === 'yellowstone' || activeRegionId === 'flatirons-chautauqua') {
+    return 'USGS 3DEP (10m)';
   }
   if (activeRegionId === 'fuji') {
     return 'Copernicus GLO-30 (30m)';
@@ -63,6 +97,14 @@ export function getActiveInsetDataset(lat?: number, lon?: number, activeRegionId
     // Grand Canyon litmus bounds: 35.9°N-36.5°N, 112.5°W-111.5°W
     if (lon >= -112.5 && lon <= -111.5 && lat >= 35.9 && lat <= 36.5) {
       return 'USGS 3DEP (30m)';
+    }
+    // Yellowstone litmus bounds: 44.1°N-45.1°N, 111.15°W-109.8°W
+    if (lon >= -111.15 && lon <= -109.8 && lat >= 44.1 && lat <= 45.1) {
+      return 'USGS 3DEP (10m)';
+    }
+    // Front Range & Flatirons litmus bounds: 39.85°N-40.35°N, 105.75°W-105.15°W
+    if (lon >= -105.75 && lon <= -105.15 && lat >= 39.85 && lat <= 40.35) {
+      return 'USGS 3DEP (10m)';
     }
     // Mount Fuji litmus bounds: 35.2°N-35.5°N, 138.5°E-139.0°E
     if (lon >= 138.5 && lon <= 139.0 && lat >= 35.2 && lat <= 35.5) {
@@ -112,7 +154,12 @@ export function formatWaterDepth(depthMeters?: number): string {
 export const DataProvenanceOverlay: React.FC<DataProvenanceOverlayProps> = ({
   theme: propTheme,
   isLight = false,
+  isActive = true,
   className = '',
+  prognosticModel,
+  isWeatherActive,
+  provenance,
+  timelineMinutes = 0,
   baseDataset: propBaseDataset,
   insetDataset: propInsetDataset,
   verticalDatum: propVerticalDatum,
@@ -122,13 +169,16 @@ export const DataProvenanceOverlay: React.FC<DataProvenanceOverlayProps> = ({
   groundElevationMeters: propElev,
   waterDepthMeters: propDepth,
 }) => {
+  const atmosphericDatasetLabel =
+    prognosticModel !== undefined
+      ? isWeatherActive === false
+        ? 'Inactive (Cloud Strata Off)'
+        : formatActiveAtmosphericDataset(prognosticModel, timelineMinutes, provenance)
+      : null;
   // DOM element refs for zero-thrash, zero-reconciliation in-place text updates
   const baseSpanRef = useRef<HTMLSpanElement>(null);
   const insetSpanRef = useRef<HTMLSpanElement>(null);
   const datumSpanRef = useRef<HTMLSpanElement>(null);
-  const latSpanRef = useRef<HTMLSpanElement>(null);
-  const lonSpanRef = useRef<HTMLSpanElement>(null);
-  const altSpanRef = useRef<HTMLSpanElement>(null);
   const elevSpanRef = useRef<HTMLSpanElement>(null);
   const depthSpanRef = useRef<HTMLSpanElement>(null);
 
@@ -141,9 +191,6 @@ export const DataProvenanceOverlay: React.FC<DataProvenanceOverlayProps> = ({
       ? getActiveInsetDataset(propLat, propLon)
       : initialData.insetDataset);
   const initialDatum = propVerticalDatum ?? initialData.verticalDatum;
-  const initialLat = propLat ?? initialData.latitude;
-  const initialLon = propLon ?? initialData.longitude;
-  const initialAlt = propAlt ?? initialData.altitudeMeters;
   const initialElev = propElev ?? initialData.groundElevationMeters;
   const initialDepth = propDepth ?? initialData.waterDepthMeters;
 
@@ -162,15 +209,6 @@ export const DataProvenanceOverlay: React.FC<DataProvenanceOverlayProps> = ({
       if (datumSpanRef.current && propVerticalDatum === undefined) {
         datumSpanRef.current.textContent = data.verticalDatum;
       }
-      if (latSpanRef.current && propLat === undefined) {
-        latSpanRef.current.textContent = formatLatitude(data.latitude);
-      }
-      if (lonSpanRef.current && propLon === undefined) {
-        lonSpanRef.current.textContent = formatLongitude(data.longitude);
-      }
-      if (altSpanRef.current && propAlt === undefined) {
-        altSpanRef.current.textContent = formatAltitude(data.altitudeMeters);
-      }
       if (elevSpanRef.current && propElev === undefined) {
         elevSpanRef.current.textContent = formatGroundElevation(data.groundElevationMeters);
       }
@@ -182,7 +220,14 @@ export const DataProvenanceOverlay: React.FC<DataProvenanceOverlayProps> = ({
     // 1. Subscribe to reactive events from DevToolsAPI
     const unsubscribe = subscribeProvenanceTelemetry(applyTelemetryToDOM);
 
-    // 2. Fallback gentle 10Hz polling loop to handle out-of-band camera or test manipulations
+    if (!isActive) {
+      return () => {
+        isMounted = false;
+        unsubscribe();
+      };
+    }
+
+    // 2. Fallback gentle 10Hz polling loop while active to handle out-of-band camera or test manipulations
     const interval = setInterval(() => {
       if (!isMounted) return;
       if (typeof window === 'undefined') return;
@@ -239,6 +284,7 @@ export const DataProvenanceOverlay: React.FC<DataProvenanceOverlayProps> = ({
       clearInterval(interval);
     };
   }, [
+    isActive,
     propBaseDataset,
     propInsetDataset,
     propVerticalDatum,
@@ -322,52 +368,32 @@ export const DataProvenanceOverlay: React.FC<DataProvenanceOverlayProps> = ({
             {initialDatum}
           </span>
         </div>
+
+        {/* Active Atmospheric Authority (1:1 Parity with Staged Weather Metadata) */}
+        {atmosphericDatasetLabel !== null && (
+          <div className="flex flex-col gap-0.5">
+            <span className="text-[var(--theme-text-muted)] text-[9px] uppercase tracking-wider">
+              Active Atmospheric Authority:
+            </span>
+            <span
+              data-testid="provenance-atmospheric-dataset"
+              className="font-semibold text-[var(--theme-text-accent)] text-body truncate"
+              title={atmosphericDatasetLabel}
+            >
+              {atmosphericDatasetLabel}
+            </span>
+          </div>
+        )}
       </div>
 
-      {/* 3. Real-time Cursor Telemetry Matrix */}
+      {/* 3. Real-time Surface Elevation & Bathymetry Readout */}
       <div className="pt-2 border-t border-[var(--theme-card-border-50)] space-y-1.5">
         <div className="flex items-center justify-between text-[9px] uppercase tracking-wider text-[var(--theme-text-muted)]">
-          <span className="font-bold">Cursor Telemetry</span>
+          <span className="font-bold">Surface Elevation & Bathymetry</span>
           <span className="text-nano text-[var(--theme-text-muted)]">10 Hz Live</span>
         </div>
 
         <div className="grid grid-cols-2 gap-x-2 gap-y-1.5 text-body">
-          {/* Latitude */}
-          <div className="flex justify-between items-center">
-            <span className="text-[var(--theme-text-muted)] text-[9px] shrink-0">Latitude:</span>
-            <span
-              data-testid="telemetry-cursor-lat"
-              ref={latSpanRef}
-              className="font-semibold text-[var(--theme-text-primary)] tabular-nums truncate text-right ml-1"
-            >
-              {formatLatitude(initialLat)}
-            </span>
-          </div>
-
-          {/* Longitude */}
-          <div className="flex justify-between items-center">
-            <span className="text-[var(--theme-text-muted)] text-[9px] shrink-0">Longitude:</span>
-            <span
-              data-testid="telemetry-cursor-lon"
-              ref={lonSpanRef}
-              className="font-semibold text-[var(--theme-text-primary)] tabular-nums truncate text-right ml-1"
-            >
-              {formatLongitude(initialLon)}
-            </span>
-          </div>
-
-          {/* Altitude */}
-          <div className="flex justify-between items-center">
-            <span className="text-[var(--theme-text-muted)] text-[9px] shrink-0">Altitude:</span>
-            <span
-              data-testid="telemetry-cursor-alt"
-              ref={altSpanRef}
-              className="font-semibold text-[var(--theme-text-primary)] tabular-nums truncate text-right ml-1"
-            >
-              {formatAltitude(initialAlt)}
-            </span>
-          </div>
-
           {/* Ground Elevation */}
           <div className="flex justify-between items-center">
             <span className="text-[var(--theme-text-muted)] text-[9px] shrink-0">Ground Elevation:</span>
@@ -379,20 +405,18 @@ export const DataProvenanceOverlay: React.FC<DataProvenanceOverlayProps> = ({
               {formatGroundElevation(initialElev)}
             </span>
           </div>
-        </div>
 
-        {/* Water Depth */}
-        <div className="pt-1 border-t border-[var(--theme-card-border-30)] flex items-center justify-between text-body">
-          <span className="text-[var(--theme-text-muted)] text-[9px] uppercase tracking-wider">
-            Water Depth:
-          </span>
-          <span
-            data-testid="telemetry-water-depth"
-            ref={depthSpanRef}
-            className="font-semibold text-[var(--theme-text-accent)] tabular-nums"
-          >
-            {formatWaterDepth(initialDepth)}
-          </span>
+          {/* Water Depth */}
+          <div className="flex justify-between items-center">
+            <span className="text-[var(--theme-text-muted)] text-[9px] shrink-0">Water Depth:</span>
+            <span
+              data-testid="telemetry-water-depth"
+              ref={depthSpanRef}
+              className="font-semibold text-[var(--theme-text-accent)] tabular-nums truncate text-right ml-1"
+            >
+              {formatWaterDepth(initialDepth)}
+            </span>
+          </div>
         </div>
       </div>
     </div>

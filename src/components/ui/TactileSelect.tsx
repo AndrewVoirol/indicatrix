@@ -168,7 +168,11 @@ export const TactileSelect: React.FC<TactileSelectProps> = ({
         data-expanded={isOpen}
         aria-haspopup="listbox"
         aria-controls={listboxId}
-        aria-label={ariaLabel}
+        aria-label={
+          selectedOption?.label
+            ? `${selectedOption.label}${selectedOption.coordinates ? ` ⌞ ${selectedOption.coordinates}` : ''} (${ariaLabel})`
+            : ariaLabel
+        }
         disabled={disabled}
         onClick={handleToggle}
         className={`w-full py-1.5 px-2.5 rounded-[2px] border text-left flex items-center justify-between transition-all cursor-pointer border-[var(--theme-control-border)] bg-[var(--theme-control-bg)] text-[var(--theme-text-primary)] hover:border-[var(--theme-card-border-hover)] hover:bg-[var(--theme-control-hover-bg)] ${

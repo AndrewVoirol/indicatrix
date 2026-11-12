@@ -113,6 +113,10 @@ fn evaluateMacroChart(lonRad: f32, latRad: f32, h: f32, alpha: f32, radius: f32)
 // Mode 0: Equirectangular 2:1 Developable Folio Wave Kinematics & Analytical Normal
 // ----------------------------------------------------------------------------
 fn evaluateModeZero(pos3D: vec3<f32>, target2D: vec2<f32>, unfurl: f32) -> DeformedVertex {
+    return evaluateModeZeroFlex(pos3D, target2D, unfurl, 0.0);
+}
+
+fn evaluateModeZeroFlex(pos3D: vec3<f32>, target2D: vec2<f32>, unfurl: f32, motionAmp: f32) -> DeformedVertex {
     var out: DeformedVertex;
     let alpha = clamp(unfurl, 0.0, 1.0);
     let lonRad = select(atan2(pos3D.x, pos3D.z), target2D.x / RADIUS, abs(target2D.x) > 0.00001 || abs(target2D.y) > 0.00001);
@@ -233,7 +237,7 @@ fn evaluateModeZero(pos3D: vec3<f32>, target2D: vec2<f32>, unfurl: f32) -> Defor
         curZ + dz_lip + dz_corner + dz_margin + dz_polar + dz_wave + dz_lift
     );
 
-    // Closed-form analytical normal N_base = T_lambda x T_phi
+    // Closed-form analytical normal N_base = T_lambda x T_phi + additive orthotropic corner tilt
     let dyDPhi = RADIUS * mix(cosLat, 1.0, tStraighten);
     let negDrDPhi = RADIUS * sinLat * (1.0 - tParallel);
     var bracket: f32;
@@ -244,10 +248,28 @@ fn evaluateModeZero(pos3D: vec3<f32>, target2D: vec2<f32>, unfurl: f32) -> Defor
         let u2 = uAngle * uAngle;
         bracket = sLocal * (lonRad * lonRad * (0.5 - u2 / 24.0) + (1.0 - u2 * 0.5));
     }
-    let rawNx = dyDPhi * sin(uAngle);
-    let rawNy = negDrDPhi * bracket;
-    let rawNz = dyDPhi * cos(uAngle);
-    let rawNorm = vec3<f32>(rawNx, rawNy, rawNz);
+    var rawNorm = vec3<f32>(dyDPhi * sin(uAngle), negDrDPhi * bracket, dyDPhi * cos(uAngle));
+
+    // Orthotropic 310 GSM Cotton-Rag Corner Stiffness (D_MD / D_CD ~ 1.85):
+    // Strictly dirty-gated to active motion (0.00 ms GPU cost whenever motionAmp == 0.0 at rest)
+    // and C^2-attenuated by env * tParallel so boundary positions/normals are exact at endpoints.
+    if (alpha > 0.001 && alpha < 0.999 && motionAmp > 0.001) {
+        let clampedMotion = clamp(motionAmp, 0.0, 1.0);
+        let orthoCornerEnv = sin(cornerZone * PI * 0.5) * env * tParallel * clampedMotion;
+        let orthoFlexMag = orthoCornerEnv * RADIUS * 0.036;
+        out.pos += vec3<f32>(
+            normX * orthoFlexMag * 0.64,
+            -sinLat * orthoFlexMag * 0.22,
+            normZ * orthoFlexMag * 0.78
+        );
+        let cornerTilt = orthoCornerEnv * 0.16 * dyDPhi;
+        let lonSign = select(-1.0, 1.0, lonRad >= 0.0);
+        rawNorm += vec3<f32>(
+            -normZ * lonSign * cornerTilt * 0.58,
+            -sinLat * cornerTilt * 0.82,
+            normX * lonSign * cornerTilt * 0.58
+        );
+    }
     out.normal = select(vec3<f32>(0.0, 0.0, 1.0), normalize(rawNorm), length(rawNorm) > 0.00001);
 
     return out;
@@ -409,7 +431,7 @@ fn evaluateManifoldCore(
         }
 
         default: {
-            out = evaluateModeZero(pos3D, mercator2D, unfurl);
+            out = evaluateModeZeroFlex(pos3D, mercator2D, unfurl, curVel.w);
         }
     }
 

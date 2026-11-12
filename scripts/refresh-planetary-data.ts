@@ -3,10 +3,9 @@
 // Canonical Planetary Data Ingestion & Refresh Orchestrator
 // Updates:
 //   1. public/data/gfs-wind-latest.bin & gfs-cloud-*-latest.bin ($0.00 NOAA GFS)
-//   2. public/data/radar-loop-latest.bin ($0.00 RainViewer Doppler Radar)
-//   3. public/data/tle-starlink.json ($0.00 CelesTrak Starlink & ISS TLE Ephemeris)
-//   4. public/data/weathernext/*.bin (Optional --with-weathernext, gated at >= 24h age)
-//   5. public/data/ingestion-status.json (Authoritative HUD Freshness Telemetry)
+//   2. public/data/tle-starlink.json ($0.00 CelesTrak Starlink & ISS TLE Ephemeris)
+//   3. public/data/weathernext/*.bin (Optional --with-weathernext, gated at >= 24h age)
+//   4. public/data/ingestion-status.json (Authoritative HUD Freshness Telemetry)
 // ============================================================================
 
 import fs from 'fs';
@@ -16,6 +15,7 @@ import { fileURLToPath } from 'url';
 import { fetchOrGenerateGFS } from './fetch-or-generate-gfs-wind';
 import { fetchOrGenerateGFSClouds } from './fetch-or-generate-gfs-clouds';
 import { fetchOrGenerateTLE } from './fetch-or-generate-tle-starlink';
+import { mountWorktreeAssets, syncWorktreeLiveFeedsToCanonical } from './mount-worktree-assets';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -45,8 +45,8 @@ export interface IngestionStatusManifest {
   feeds: {
     weathernext3: FeedTelemetry;
     gfs: FeedTelemetry;
-    radar: FeedTelemetry;
     starlink: FeedTelemetry;
+    satellite?: FeedTelemetry;
   };
 }
 
@@ -100,7 +100,7 @@ export function buildIngestionStatusManifest(
   nowIso: string = new Date().toISOString(),
   wnGateHours: number = 24,
   freeGateHours: number = 3,
-  errors: Partial<Record<'weathernext3' | 'gfs' | 'radar' | 'starlink', string>> = {}
+  errors: Partial<Record<'weathernext3' | 'gfs' | 'starlink' | 'satellite', string>> = {}
 ): IngestionStatusManifest {
   const nowMs = Date.parse(nowIso) || Date.now();
 
@@ -138,8 +138,17 @@ export function buildIngestionStatusManifest(
     try {
       const gfsMeta = JSON.parse(fs.readFileSync(gfsMetaPath, 'utf8'));
       gfsPulledUTC = gfsMeta.generatedAt || gfsMeta.ingestedAtUTC || fs.statSync(gfsMetaPath).mtime.toISOString();
-      gfsCycle = gfsMeta.cycle ? `${gfsMeta.cycle}Z` : undefined;
-      gfsInitUTC = gfsMeta.forecastTime || gfsMeta.generatedAt;
+      const rawGfsCycle = gfsMeta.cycle || gfsMeta.modelRunCycle;
+      gfsCycle = rawGfsCycle ? (String(rawGfsCycle).endsWith('Z') ? String(rawGfsCycle) : `${rawGfsCycle}Z`) : undefined;
+      if (gfsMeta.forecastTime || gfsMeta.generatedAt) {
+        gfsInitUTC = gfsMeta.forecastTime || gfsMeta.generatedAt;
+      } else if (typeof gfsMeta.modelRunDate === 'string' && gfsMeta.modelRunDate.length === 8 && gfsCycle) {
+        const y = gfsMeta.modelRunDate.slice(0, 4);
+        const m = gfsMeta.modelRunDate.slice(4, 6);
+        const d = gfsMeta.modelRunDate.slice(6, 8);
+        const hh = gfsCycle.replace('Z', '').padStart(2, '0');
+        gfsInitUTC = `${y}-${m}-${d}T${hh}:00:00Z`;
+      }
     } catch {
       // Fallback to bin mtime
     }
@@ -154,27 +163,7 @@ export function buildIngestionStatusManifest(
     ? 'stale'
     : 'ok';
 
-  // 3. RainViewer Live Doppler Radar Telemetry
-  let radarPulledUTC: string | null = null;
-  let radarFrames: number | undefined;
-  const radarMetaPath = path.join(dataDir, 'radar-loop-meta.json');
-  if (fs.existsSync(radarMetaPath)) {
-    try {
-      const radarMeta = JSON.parse(fs.readFileSync(radarMetaPath, 'utf8'));
-      radarPulledUTC = radarMeta.generatedAt || fs.statSync(radarMetaPath).mtime.toISOString();
-      radarFrames = radarMeta.frameCount;
-    } catch {
-      // Ignore
-    }
-  }
-  const radarAge = computeAgeHours(radarPulledUTC, nowMs);
-  const radarStatus: 'ok' | 'stale' | 'error' = errors.radar
-    ? 'error'
-    : radarAge === null || radarAge > 12
-    ? 'stale'
-    : 'ok';
-
-  // 4. CelesTrak Starlink & ISS TLE Telemetry
+  // 3. CelesTrak Starlink & ISS TLE Telemetry
   let tlePulledUTC: string | null = null;
   let tleCount: number | undefined;
   const tlePath = path.join(dataDir, 'tle-starlink.json');
@@ -193,6 +182,29 @@ export function buildIngestionStatusManifest(
   const tleStatus: 'ok' | 'stale' | 'error' = errors.starlink
     ? 'error'
     : tleAge === null || tleAge > 24
+    ? 'stale'
+    : 'ok';
+
+  // 4. NASA EOSDIS GIBS 3D Volumetric Satellite Cloud Telemetry
+  let satPulledUTC: string | null = null;
+  let satMode: string | undefined;
+  const satMetaPath = path.join(dataDir, 'satellite-meta.json');
+  if (fs.existsSync(satMetaPath)) {
+    try {
+      const satMeta = JSON.parse(fs.readFileSync(satMetaPath, 'utf8'));
+      satPulledUTC =
+        satMeta.ingestedAtUTC ||
+        satMeta.observationTimestampUTC ||
+        fs.statSync(satMetaPath).mtime.toISOString();
+      satMode = satMeta.mode;
+    } catch {
+      // Ignore
+    }
+  }
+  const satAge = computeAgeHours(satPulledUTC, nowMs);
+  const satStatus: 'ok' | 'stale' | 'error' = errors.satellite
+    ? 'error'
+    : satAge === null || satAge > 12
     ? 'stale'
     : 'ok';
 
@@ -221,14 +233,6 @@ export function buildIngestionStatusManifest(
         status: gfsStatus,
         ...(errors.gfs ? { message: errors.gfs } : {}),
       },
-      radar: {
-        lastPulledUTC: radarPulledUTC,
-        lastAttemptUTC: nowIso,
-        frameCount: radarFrames,
-        ageHours: radarAge,
-        status: radarStatus,
-        ...(errors.radar ? { message: errors.radar } : {}),
-      },
       starlink: {
         lastPulledUTC: tlePulledUTC,
         lastAttemptUTC: nowIso,
@@ -236,6 +240,14 @@ export function buildIngestionStatusManifest(
         ageHours: tleAge,
         status: tleStatus,
         ...(errors.starlink ? { message: errors.starlink } : {}),
+      },
+      satellite: {
+        lastPulledUTC: satPulledUTC,
+        lastAttemptUTC: nowIso,
+        modelCycle: satMode,
+        ageHours: satAge,
+        status: satStatus,
+        ...(errors.satellite ? { message: errors.satellite } : {}),
       },
     },
   };
@@ -254,9 +266,27 @@ export async function refreshAllPlanetaryData(
   options: RefreshOptions = {}
 ): Promise<{ gfsBytes: number; tleSatellites: number; ingestionStatus: IngestionStatusManifest }> {
   const isTest = Boolean(process.env.VITEST) || process.env.NODE_ENV === 'test';
+  const freezeVal = String(process.env.INDICATRIX_FREEZE_INGESTION || '').toLowerCase();
+  const isIngestionFrozen = freezeVal === '1' || freezeVal === 'true';
   const maxWnAgeHours = options.maxWeatherNextAgeHours ?? 24;
   const maxFreeAgeHours = options.maxFreeFeedAgeHours ?? 3;
-  const errors: Partial<Record<'weathernext3' | 'gfs' | 'radar' | 'starlink', string>> = {};
+  const errors: Partial<Record<'weathernext3' | 'gfs' | 'starlink' | 'satellite', string>> = {};
+
+  if (!isTest && isIngestionFrozen) {
+    console.log('[SKIP] INDICATRIX_FREEZE_INGESTION active — skipping planetary data refresh.');
+    const gfsPath = path.join(dataDir, 'gfs-wind-latest.bin');
+    let existingManifest: IngestionStatusManifest;
+    try {
+      existingManifest = JSON.parse(fs.readFileSync(statusFilePath, 'utf8')) as IngestionStatusManifest;
+    } catch {
+      existingManifest = buildIngestionStatusManifest(new Date().toISOString(), maxWnAgeHours, maxFreeAgeHours);
+    }
+    return {
+      gfsBytes: fs.existsSync(gfsPath) ? fs.statSync(gfsPath).size : 0,
+      tleSatellites: existingManifest.feeds.starlink.satelliteCount ?? 0,
+      ingestionStatus: existingManifest,
+    };
+  }
 
   if (!isTest && !acquireLock()) {
     console.log('[SKIP] Another planetary refresh is currently in progress (.refresh.lock active).');
@@ -271,6 +301,11 @@ export async function refreshAllPlanetaryData(
   }
 
   try {
+    if (!isTest) {
+      try {
+        mountWorktreeAssets(projectRoot);
+      } catch {}
+    }
     const timestamp = new Date().toISOString();
     console.log(`[${timestamp}] Starting canonical planetary data refresh...`);
 
@@ -283,11 +318,11 @@ export async function refreshAllPlanetaryData(
 
     if (shouldSkipFree) {
       console.log(
-        `[SKIP] Free GFS/Radar/TLE feeds are fresh (${preManifest.feeds.gfs.ageHours}h old < ${maxFreeAgeHours}h gate).`
+        `[SKIP] Free GFS/TLE feeds are fresh (${preManifest.feeds.gfs.ageHours}h old < ${maxFreeAgeHours}h gate).`
       );
     } else {
       // 1. Refresh NOAA GFS Wind Grid ($0.00)
-      console.log('--- Step 1/4: Ingesting NOAA GFS Wind Velocity Field ($0.00) ---');
+      console.log('--- Step 1/3: Ingesting NOAA GFS Wind Velocity Field ($0.00) ---');
       try {
         await fetchOrGenerateGFS();
       } catch (err: any) {
@@ -296,7 +331,7 @@ export async function refreshAllPlanetaryData(
       }
 
       // 2. Refresh NOAA GFS Cloud Grids ($0.00)
-      console.log('--- Step 2/4: Ingesting NOAA GFS Multi-Stratum Cloud Field ($0.00) ---');
+      console.log('--- Step 2/3: Ingesting NOAA GFS Multi-Stratum Cloud Field ($0.00) ---');
       try {
         await fetchOrGenerateGFSClouds();
         console.log('[OK] GFS Cloud Grids generated.');
@@ -304,19 +339,8 @@ export async function refreshAllPlanetaryData(
         console.warn('[WARN] GFS Cloud refresh error:', err?.message || String(err));
       }
 
-      // 3. Refresh Live Doppler Radar ($0.00)
-      console.log('--- Step 3/4: Ingesting Live Doppler Radar Mosaics ($0.00) ---');
-      try {
-        const { fetchLiveRadarLoop } = await import('./fetch-live-radar');
-        await fetchLiveRadarLoop({ dryRun: isTest, forceWrite: !isTest });
-        console.log('[OK] Live Doppler Radar loop generated.');
-      } catch (err: any) {
-        errors.radar = err?.message || String(err);
-        console.warn('[WARN] Live Doppler Radar refresh deferred:', errors.radar);
-      }
-
-      // 4. Refresh CelesTrak Starlink & ISS TLEs ($0.00)
-      console.log('--- Step 4/4: Ingesting CelesTrak Starlink & ISS TLE Constellation ($0.00) ---');
+      // 3. Refresh CelesTrak Starlink & ISS TLEs ($0.00)
+      console.log('--- Step 3/4: Ingesting CelesTrak Starlink & ISS TLE Constellation ($0.00) ---');
       try {
         await fetchOrGenerateTLE();
       } catch (err: any) {
@@ -325,7 +349,47 @@ export async function refreshAllPlanetaryData(
       }
     }
 
-    // Optional Step 5: WeatherNext 3 Paid GCS Pull (Strictly Gated at >= 24 Hours Age)
+    // 4. Refresh NASA GIBS 3D Volumetric Satellite Cloud Strata ($0.00, gated outside VITEST)
+    if (!isTest) {
+      const satAge = preManifest.feeds.satellite?.ageHours ?? null;
+      const shouldSkipSat =
+        Boolean(options.autoGateFreeFeeds) && satAge !== null && satAge < maxFreeAgeHours;
+      if (shouldSkipSat) {
+        console.log(
+          `[SKIP] NASA GIBS satellite cloud feed is fresh (${satAge}h old < ${maxFreeAgeHours}h gate).`
+        );
+      } else {
+        console.log('--- Step 4/4: Ingesting NASA GIBS 3D Volumetric Satellite Cloud Strata ($0.00) ---');
+        try {
+          const homeDir = process.env.HOME || '/Users/andrewvoirol';
+          const uvCandidates = [
+            path.join(homeDir, '.local/bin/uv'),
+            '/opt/homebrew/bin/uv',
+            '/usr/local/bin/uv',
+            'uv',
+          ];
+          const uvBin = uvCandidates.find((p) => p === 'uv' || fs.existsSync(p)) || 'uv';
+          execFileSync(
+            uvBin,
+            [
+              'run',
+              '--with',
+              'pillow',
+              '--with',
+              'numpy',
+              'python',
+              path.join(projectRoot, 'scripts/fetch-live-satellite-clouds.py'),
+            ],
+            { cwd: projectRoot, stdio: 'inherit', timeout: 3 * 60 * 1000 }
+          );
+        } catch (err: any) {
+          errors.satellite = err?.message || String(err);
+          console.warn('[WARN] NASA GIBS satellite cloud refresh warning:', errors.satellite);
+        }
+      }
+    }
+
+    // Optional Step 4: WeatherNext 3 Paid GCS Pull (Strictly Gated at >= 24 Hours Age)
     if (options.withWeatherNext && !isTest) {
       const wnAge = preManifest.feeds.weathernext3.ageHours;
       const shouldPullWn =
@@ -386,6 +450,12 @@ export async function refreshAllPlanetaryData(
       maxFreeAgeHours,
       errors
     );
+    if (!isTest) {
+      const mirrored = syncWorktreeLiveFeedsToCanonical(projectRoot);
+      if (mirrored > 0) {
+        console.log(`[OK] Mirrored ${mirrored} live feed/metadata files back to canonical repository.`);
+      }
+    }
     console.log(`[${ingestionStatus.updatedAtUTC}] Canonical planetary data refresh complete.`);
 
     return {

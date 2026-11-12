@@ -10,12 +10,8 @@ export interface AtmosphereTabProps {
   resolution: ResolutionTier;
   timelineMinutes?: number;
   onTimelineChange?: (state: TimelineScrubberState) => void;
-  isRadarActive: boolean;
-  handleEnableRadar: () => void;
   propShowClouds?: boolean;
   handleToggleClouds: (val: boolean) => void;
-  propShowAtmosphere?: boolean;
-  onShowAtmosphereChange?: (v: boolean) => void;
   propShowCloudLow?: boolean;
   onShowCloudLowChange?: (v: boolean) => void;
   propShowCloudMid?: boolean;
@@ -46,22 +42,16 @@ export interface AtmosphereTabProps {
   onAtmosphericScaleChange?: (v: number) => void;
   propShadowIntensity?: number;
   onShadowIntensityChange?: (v: number) => void;
-  propVerticalScaleMode?: number;
-  onVerticalScaleModeChange?: (v: number) => void;
   propRainShadowFeedback?: number;
   onRainShadowFeedbackChange?: (v: number) => void;
   propPluvialGamma?: number;
   onPluvialGammaChange?: (v: number) => void;
-  propWeatherOpticalMode?: number;
-  weatherOpticalMode?: number;
-  onWeatherOpticalModeChange?: (v: number) => void;
   propThermodynamicGating?: boolean;
   onThermodynamicGatingChange?: (v: boolean) => void;
   prognosticModel?: PrognosticModelBackend;
   onPrognosticModelChange?: (model: PrognosticModelBackend) => void;
   prognosticVariable?: string;
   onPrognosticVariableChange?: (variable: string) => void;
-  onSnapCamera?: (v: 'equator' | 'pole' | 'seam' | 'isometric' | 'horizon') => void;
   handleTogglePlanetaryLayer: (id: string, force?: boolean) => void;
   provenance?: MeteorologicalProvenance;
   windSpeedMultiplier?: number;
@@ -69,28 +59,17 @@ export interface AtmosphereTabProps {
   windParticleLifetime?: number;
   onWindParticleLifetimeChange?: (v: number) => void;
   isWindActive: boolean;
-  roughness?: number;
-  onRoughnessChange?: (v: number) => void;
-  paperTooth?: number;
-  onPaperToothChange?: (v: number) => void;
+  isActive?: boolean;
 }
 
 export const AtmosphereTab: React.FC<AtmosphereTabProps> = ({
   theme,
   isLight,
-  roughness,
-  onRoughnessChange,
-  paperTooth,
-  onPaperToothChange,
   resolution,
   timelineMinutes,
   onTimelineChange,
-  isRadarActive,
-  handleEnableRadar,
   propShowClouds,
   handleToggleClouds,
-  propShowAtmosphere,
-  onShowAtmosphereChange,
   propShowCloudLow,
   onShowCloudLowChange,
   propShowCloudMid,
@@ -121,22 +100,16 @@ export const AtmosphereTab: React.FC<AtmosphereTabProps> = ({
   onAtmosphericScaleChange,
   propShadowIntensity,
   onShadowIntensityChange,
-  propVerticalScaleMode,
-  onVerticalScaleModeChange,
   propRainShadowFeedback,
   onRainShadowFeedbackChange,
   propPluvialGamma,
   onPluvialGammaChange,
-  propWeatherOpticalMode,
-  weatherOpticalMode: rawWeatherOpticalMode,
-  onWeatherOpticalModeChange,
   propThermodynamicGating,
   onThermodynamicGatingChange,
   prognosticModel,
   onPrognosticModelChange,
   prognosticVariable,
   onPrognosticVariableChange,
-  onSnapCamera,
   handleTogglePlanetaryLayer,
   provenance,
   windSpeedMultiplier,
@@ -144,14 +117,15 @@ export const AtmosphereTab: React.FC<AtmosphereTabProps> = ({
   windParticleLifetime,
   onWindParticleLifetimeChange,
   isWindActive,
+  isActive = true,
 }) => {
   return (
     <>
       <TimelineScrubber
         value={timelineMinutes}
         onTimeChange={onTimelineChange}
-        isRadarActive={isRadarActive}
-        onEnableRadar={handleEnableRadar}
+        prognosticModel={prognosticModel}
+        disabled={prognosticModel === 'gfs' || prognosticModel === 'noaa-gfs'}
         className="border-[var(--theme-card-border)] bg-[var(--theme-card-bg)] !p-2 shadow-sm rounded-[3px]"
       />
 
@@ -162,11 +136,8 @@ export const AtmosphereTab: React.FC<AtmosphereTabProps> = ({
         isLight={isLight}
         resolution={resolution}
         hideScrubber={true}
-        isRadarActive={isRadarActive}
         showClouds={propShowClouds}
         onShowCloudsChange={handleToggleClouds}
-        showAtmosphere={propShowAtmosphere}
-        onShowAtmosphereChange={onShowAtmosphereChange}
         showCloudLow={propShowCloudLow}
         onShowCloudLowChange={onShowCloudLowChange}
         showCloudMid={propShowCloudMid}
@@ -197,14 +168,10 @@ export const AtmosphereTab: React.FC<AtmosphereTabProps> = ({
         onAtmosphericScaleChange={onAtmosphericScaleChange}
         shadowIntensity={propShadowIntensity}
         onShadowIntensityChange={onShadowIntensityChange}
-        verticalScaleMode={propVerticalScaleMode}
-        onVerticalScaleModeChange={onVerticalScaleModeChange}
         rainShadowFeedback={propRainShadowFeedback}
         onRainShadowFeedbackChange={onRainShadowFeedbackChange}
         pluvialGamma={propPluvialGamma}
         onPluvialGammaChange={onPluvialGammaChange}
-        weatherOpticalMode={rawWeatherOpticalMode ?? propWeatherOpticalMode}
-        onWeatherOpticalModeChange={onWeatherOpticalModeChange}
         thermodynamicGating={propThermodynamicGating}
         onThermodynamicGatingChange={onThermodynamicGatingChange}
         prognosticModel={prognosticModel}
@@ -213,7 +180,6 @@ export const AtmosphereTab: React.FC<AtmosphereTabProps> = ({
         onPrognosticVariableChange={onPrognosticVariableChange}
         timelineMinutes={timelineMinutes}
         onTimelineChange={onTimelineChange}
-        onSnapCamera={onSnapCamera}
         onTogglePlanetaryLayer={handleTogglePlanetaryLayer}
         provenance={provenance}
         windSpeedMultiplier={windSpeedMultiplier}
@@ -221,10 +187,7 @@ export const AtmosphereTab: React.FC<AtmosphereTabProps> = ({
         windParticleLifetime={windParticleLifetime}
         onWindParticleLifetimeChange={onWindParticleLifetimeChange}
         isWindActive={isWindActive}
-        roughness={roughness}
-        onRoughnessChange={onRoughnessChange}
-        paperTooth={paperTooth}
-        onPaperToothChange={onPaperToothChange}
+        isActive={isActive}
       />
     </>
   );

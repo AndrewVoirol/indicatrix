@@ -6,6 +6,4 @@ export * from './VectorFieldDataSource';
 export * from './TLETrajectoryDataSource';
 export * from './CustomUserDataSource';
 export * from './DataLayerCatalog';
-export * from './LiveRadarDataSource';
 export * from './WeatherNextDataSource';
-export * from './archivalSoundings';

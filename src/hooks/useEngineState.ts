@@ -1,11 +1,13 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
 import { isWebGPUSupported } from '../webgpu/support';
-import { ThemeManager, ThemePalette, ThemeMode, ArchivalMediumId } from '../core/themes';
+import { ThemeManager, ThemePalette, ThemeMode } from '../core/themes';
 
-import { LoadedDataInfo, SimulationMode, GeodesicOverlayMode, ResolutionTier } from '../types';
+import { LoadedDataInfo, SimulationMode, ResolutionTier } from '../types';
 import { MeteorologicalProvenance } from '../core/data/WeatherNextDataSource';
+import { telemetryStore } from '../core/TelemetryStore';
+import { fetchWeatherNextMeta } from '../core/data/weatherNextMetaLoader';
 
-export type { SimulationMode, GeodesicOverlayMode, LoadedDataInfo, ResolutionTier, MeteorologicalProvenance };
+export type { SimulationMode, LoadedDataInfo, ResolutionTier, MeteorologicalProvenance };
 
 export function useEngineState() {
   const [backend, setBackend] = useState<'webgl2' | 'webgpu'>(
@@ -18,21 +20,33 @@ export function useEngineState() {
   }); // 0 = Tharp, 1 = Cream, 2 = Cyanotype
   const [themePalette, setThemePalette] = useState<ThemePalette>(ThemeManager.getInstance().getPalette());
   const [hasWebGPU, setHasWebGPU] = useState<boolean>(false);
-  const [alpha, setAlpha] = useState(0); 
+  const [alpha, setAlphaState] = useState(0);
+  const alphaValRef = useRef(0);
+  alphaValRef.current = alpha;
+  const setAlpha = useCallback((v: number | ((prev: number) => number)) => {
+    const prev = alphaValRef.current;
+    const next = typeof v === 'function' ? v(prev) : v;
+    const clamped = Number.isFinite(next) ? Math.max(0, Math.min(1, next)) : prev;
+    alphaValRef.current = clamped;
+    telemetryStore.setLiveUnfurl(null);
+    telemetryStore.setUnfurlScaleContext(clamped);
+    setAlphaState(clamped);
+  }, []);
   const [mode, setMode] = useState<SimulationMode>(0); // Default to Mode 0 (Linear Mix)
   const [layerMode, setLayerMode] = useState<0 | 1 | 2>(0); // Default to 0 (Both: Points + Hairlines)
   const [cursorPhysicsEnabled, setCursorPhysicsEnabled] = useState<boolean>(false);
-  const [resolution, setResolution] = useState<ResolutionTier>('1M');
-  const [fps, setFps] = useState(60);
+  const [resolution, setResolution] = useState<ResolutionTier>('100k');
+  const fps = telemetryStore.getFps();
+  const setFps = useCallback((v: number | ((prev: number) => number)) => {
+    const next = typeof v === 'function' ? v(telemetryStore.getFps()) : v;
+    telemetryStore.setFps(next);
+  }, []);
   const [isHudOpen, setIsHudOpen] = useState(true);
 
   // Cartographic Overlays state
-  const [activeOverlay, setActiveOverlay] = useState<GeodesicOverlayMode>('off');
-  const [showLandmarks, setShowLandmarks] = useState<boolean>(false);
-  const [showTissot, setShowTissot] = useState<boolean>(false);
   const [showVectors, setShowVectors] = useState<boolean>(true);
   const [showToponymy, setShowToponymyState] = useState<boolean>(true);
-  const setShowToponymy = (v: boolean | ((prev: boolean) => boolean)) => {
+  const setShowToponymy = useCallback((v: boolean | ((prev: boolean) => boolean)) => {
     setShowToponymyState((prev) => {
       const val = typeof v === 'function' ? v(prev) : v;
       if (typeof window !== 'undefined') {
@@ -41,11 +55,9 @@ export function useEngineState() {
       }
       return val;
     });
-  };
+  }, []);
 
   // Archival Cartographic Detail Toggles
-  const [showSoundings, setShowSoundings] = useState<boolean>(false);
-  const [showTriangulation, setShowTriangulation] = useState<boolean>(false);
   const [showCartouche, setShowCartouche] = useState<boolean>(true);
 
   // Auto-morph playback state
@@ -56,14 +68,15 @@ export function useEngineState() {
   const playbackClockRef = useRef<number>(0);
   const wasPlayingRef = useRef<boolean>(false);
 
-  // Live Simulation Parameters & GPU Profiler Telemetry
-  const [fractureIntensity, setFractureIntensity] = useState<number>(1.0);
-  const [fluidVortexStrength, setFluidVortexStrength] = useState<number>(1.0);
-  const [gpuReport, setGpuReport] = useState<any>(null);
+  // GPU Profiler Telemetry (delegated to leaf TelemetryStore — 0 <App /> commits)
+  const gpuReport = telemetryStore.getGpuReport();
+  const setGpuReport = useCallback((v: any) => {
+    const next = typeof v === 'function' ? v(telemetryStore.getGpuReport()) : v;
+    telemetryStore.setGpuReport(next);
+  }, []);
 
-  // Atmospheric Cloud Strata & Limb Scatter State (Milestone 5)
+  // Atmospheric Cloud Strata State (Milestone 5)
   const [showClouds, setShowCloudsState] = useState<boolean>(true);
-  const [showAtmosphere, setShowAtmosphereState] = useState<boolean>(false);
   const [showCloudLow, setShowCloudLowState] = useState<boolean>(true);
   const [showCloudMid, setShowCloudMidState] = useState<boolean>(true);
   const [showCloudHigh, setShowCloudHighState] = useState<boolean>(true);
@@ -78,37 +91,37 @@ export function useEngineState() {
   const [cloudFreqVert, setCloudFreqVertState] = useState<number>(12.0);
   const [cloudExtinction, setCloudExtinctionState] = useState<number>(28.0);
 
-  const setShowClouds = (v: boolean | ((prev: boolean) => boolean)) => {
+  const setShowClouds = useCallback((v: boolean | ((prev: boolean) => boolean)) => {
+    if (typeof v === 'boolean' && typeof window !== 'undefined') {
+      if (!(window as any).__INDICATRIX_LIVE_UNIFORMS__) {
+        (window as any).__INDICATRIX_LIVE_UNIFORMS__ = {};
+      }
+      (window as any).__INDICATRIX_LIVE_UNIFORMS__.showClouds = v;
+    }
     setShowCloudsState((prev) => {
       const val = typeof v === 'function' ? v(prev) : v;
-      if (typeof window !== 'undefined' && (window as any).__INDICATRIX_LIVE_UNIFORMS__) {
+      if (typeof window !== 'undefined') {
+        if (!(window as any).__INDICATRIX_LIVE_UNIFORMS__) {
+          (window as any).__INDICATRIX_LIVE_UNIFORMS__ = {};
+        }
         (window as any).__INDICATRIX_LIVE_UNIFORMS__.showClouds = val;
       }
       return val;
     });
-  };
-  const setShowAtmosphere = (v: boolean | ((prev: boolean) => boolean)) => {
-    setShowAtmosphereState((prev) => {
-      const val = typeof v === 'function' ? v(prev) : v;
-      if (typeof window !== 'undefined' && (window as any).__INDICATRIX_LIVE_UNIFORMS__) {
-        (window as any).__INDICATRIX_LIVE_UNIFORMS__.showAtmosphere = val;
-      }
-      return val;
-    });
-  };
-  const setShowCloudLow = (v: boolean | ((prev: boolean) => boolean)) => {
+  }, []);
+  const setShowCloudLow = useCallback((v: boolean | ((prev: boolean) => boolean)) => {
     setShowCloudLowState(v);
-  };
-  const setShowCloudMid = (v: boolean | ((prev: boolean) => boolean)) => {
+  }, []);
+  const setShowCloudMid = useCallback((v: boolean | ((prev: boolean) => boolean)) => {
     setShowCloudMidState(v);
-  };
-  const setShowCloudHigh = (v: boolean | ((prev: boolean) => boolean)) => {
+  }, []);
+  const setShowCloudHigh = useCallback((v: boolean | ((prev: boolean) => boolean)) => {
     setShowCloudHighState(v);
-  };
-  const setCloudFalseColor = (v: boolean | ((prev: boolean) => boolean)) => {
+  }, []);
+  const setCloudFalseColor = useCallback((v: boolean | ((prev: boolean) => boolean)) => {
     setCloudFalseColorState(v);
-  };
-  const setVolumetricClouds = (v: boolean | ((prev: boolean) => boolean)) => {
+  }, []);
+  const setVolumetricClouds = useCallback((v: boolean | ((prev: boolean) => boolean)) => {
     setVolumetricCloudsState((prev) => {
       const val = typeof v === 'function' ? v(prev) : v;
       if (typeof window !== 'undefined') {
@@ -119,22 +132,22 @@ export function useEngineState() {
       }
       return val;
     });
-  };
-  const setCloudDriftSpeed = (v: number | ((prev: number) => number)) => {
+  }, []);
+  const setCloudDriftSpeed = useCallback((v: number | ((prev: number) => number)) => {
     setCloudDriftSpeedState((prev) => {
       const val = typeof v === 'function' ? v(prev) : v;
       if (typeof val !== 'number' || !Number.isFinite(val)) return prev;
       return Math.max(0, Math.min(2000, val));
     });
-  };
-  const setCloudOpacity = (v: number | ((prev: number) => number)) => {
+  }, []);
+  const setCloudOpacity = useCallback((v: number | ((prev: number) => number)) => {
     setCloudOpacityState((prev) => {
       const val = typeof v === 'function' ? v(prev) : v;
       if (typeof val !== 'number' || !Number.isFinite(val)) return prev;
       return Math.max(0.1, Math.min(1.0, val));
     });
-  };
-  const setCloudThickness = (v: number | ((prev: number) => number)) => {
+  }, []);
+  const setCloudThickness = useCallback((v: number | ((prev: number) => number)) => {
     setCloudThicknessState((prev) => {
       const val = typeof v === 'function' ? v(prev) : v;
       if (typeof val !== 'number' || !Number.isFinite(val)) return prev;
@@ -145,8 +158,8 @@ export function useEngineState() {
       }
       return clamped;
     });
-  };
-  const setCloudLowTop = (v: number | ((prev: number) => number)) => {
+  }, []);
+  const setCloudLowTop = useCallback((v: number | ((prev: number) => number)) => {
     setCloudLowTopState((prev) => {
       const val = typeof v === 'function' ? v(prev) : v;
       if (typeof val !== 'number' || !Number.isFinite(val)) return prev;
@@ -157,8 +170,8 @@ export function useEngineState() {
       }
       return clamped;
     });
-  };
-  const setCloudErosion = (v: number | ((prev: number) => number)) => {
+  }, []);
+  const setCloudErosion = useCallback((v: number | ((prev: number) => number)) => {
     setCloudErosionState((prev) => {
       const val = typeof v === 'function' ? v(prev) : v;
       if (typeof val !== 'number' || !Number.isFinite(val)) return prev;
@@ -170,8 +183,8 @@ export function useEngineState() {
       }
       return clamped;
     });
-  };
-  const setCloudFreqHoriz = (v: number | ((prev: number) => number)) => {
+  }, []);
+  const setCloudFreqHoriz = useCallback((v: number | ((prev: number) => number)) => {
     setCloudFreqHorizState((prev) => {
       const val = typeof v === 'function' ? v(prev) : v;
       if (typeof val !== 'number' || !Number.isFinite(val)) return prev;
@@ -182,8 +195,8 @@ export function useEngineState() {
       }
       return clamped;
     });
-  };
-  const setCloudFreqVert = (v: number | ((prev: number) => number)) => {
+  }, []);
+  const setCloudFreqVert = useCallback((v: number | ((prev: number) => number)) => {
     setCloudFreqVertState((prev) => {
       const val = typeof v === 'function' ? v(prev) : v;
       if (typeof val !== 'number' || !Number.isFinite(val)) return prev;
@@ -194,8 +207,8 @@ export function useEngineState() {
       }
       return clamped;
     });
-  };
-  const setCloudExtinction = (v: number | ((prev: number) => number)) => {
+  }, []);
+  const setCloudExtinction = useCallback((v: number | ((prev: number) => number)) => {
     setCloudExtinctionState((prev) => {
       const val = typeof v === 'function' ? v(prev) : v;
       if (typeof val !== 'number' || !Number.isFinite(val)) return prev;
@@ -206,9 +219,9 @@ export function useEngineState() {
       }
       return clamped;
     });
-  };
+  }, []);
 
-  const setCloudOptions = (
+  const setCloudOptions = useCallback((
     options: Partial<{
       showClouds: boolean;
       showCloudLow: boolean;
@@ -264,7 +277,7 @@ export function useEngineState() {
     if (options.cloudExtinction !== undefined && typeof options.cloudExtinction === 'number' && Number.isFinite(options.cloudExtinction)) {
       setCloudExtinction(options.cloudExtinction);
     }
-  };
+  }, [setCloudThickness, setCloudLowTop, setCloudErosion, setCloudFreqHoriz, setCloudFreqVert, setCloudExtinction]);
 
   useEffect(() => {
     if (typeof window !== 'undefined') {
@@ -285,11 +298,11 @@ export function useEngineState() {
       };
       (window as any).__INDICATRIX_SET_CLOUD_OPTIONS__ = setCloudOptions;
     }
-  }, [showClouds, showCloudLow, showCloudMid, showCloudHigh, cloudDriftSpeed, cloudOpacity, cloudFalseColor, cloudThickness, cloudLowTop, cloudErosion, cloudFreqHoriz, cloudFreqVert, cloudExtinction]);
+  }, [showClouds, showCloudLow, showCloudMid, showCloudHigh, cloudDriftSpeed, cloudOpacity, cloudFalseColor, cloudThickness, cloudLowTop, cloudErosion, cloudFreqHoriz, cloudFreqVert, cloudExtinction, setCloudOptions]);
 
   const [cdlodDiagnosticMode, setCdlodDiagnosticModeState] = useState<number>(0);
 
-  const setCdlodDiagnosticMode = (mode: number | ((prev: number) => number)) => {
+  const setCdlodDiagnosticMode = useCallback((mode: number | ((prev: number) => number)) => {
     setCdlodDiagnosticModeState((prev) => {
       const val = typeof mode === 'function' ? mode(prev) : mode;
       const resolved = typeof val === 'number' && Number.isFinite(val) ? Math.max(0, Math.min(3, Math.round(val))) : 0;
@@ -299,20 +312,20 @@ export function useEngineState() {
       }
       return resolved;
     });
-  };
+  }, []);
 
   useEffect(() => {
     if (typeof window !== 'undefined') {
       (window as any).__INDICATRIX_CDLOD_DIAGNOSTIC_MODE__ = cdlodDiagnosticMode;
       (window as any).__INDICATRIX_SET_CDLOD_DIAGNOSTIC_MODE__ = setCdlodDiagnosticMode;
     }
-  }, [cdlodDiagnosticMode]);
+  }, [cdlodDiagnosticMode, setCdlodDiagnosticMode]);
 
   // Provenance & Wind Advection Telemetry State (Phase 3 Requirement)
   const [provenance, setProvenanceState] = useState<MeteorologicalProvenance>({
     modelName: 'Google DeepMind WeatherNext 3',
-    runTimestamp: '2026-03-30T00:00:00Z',
-    validTimestamp: '2026-03-30T00:00:00Z',
+    runTimestamp: '2026-10-24T10:00:00Z',
+    validTimestamp: '2026-10-24T10:00:00Z',
     forecastHour: 0,
     spatialResolutionDeg: 0.1,
     temporalBlendTau: 0.0,
@@ -322,6 +335,33 @@ export function useEngineState() {
       jetStream250hPa: true,
     },
   });
+
+  useEffect(() => {
+    if (typeof fetch !== 'function') return;
+    if (
+      (typeof navigator !== 'undefined' && /jsdom|HappyDOM/i.test(navigator.userAgent || '')) ||
+      (typeof process !== 'undefined' && process.env?.VITEST && !(fetch as any)?.mock)
+    ) {
+      return;
+    }
+    let cancelled = false;
+    fetchWeatherNextMeta('/data/weathernext/meta.json')
+      .then((data) => {
+        if (cancelled || !data) return;
+        const initTs = data?.forecastInitTimestamp;
+        if (typeof initTs === 'string' && initTs.includes('T')) {
+          setProvenanceState((prev) =>
+            prev.forecastHour === 0
+              ? { ...prev, runTimestamp: initTs, validTimestamp: initTs }
+              : { ...prev, runTimestamp: initTs }
+          );
+        }
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   const setProvenance = useCallback((prov: Partial<MeteorologicalProvenance> | ((prev: MeteorologicalProvenance) => MeteorologicalProvenance)) => {
     setProvenanceState((prev) => {
@@ -388,31 +428,19 @@ export function useEngineState() {
     vramMb: 4.57
   });
 
-  const [isolatedStratum, setIsolatedStratumState] = useState<number | null>(() => ThemeManager.getInstance().getIsolatedStratum());
-
   // Keep ThemeManager in sync
   useEffect(() => {
     const unsubscribe = ThemeManager.getInstance().subscribe((palette) => {
       setThemeState(palette.mode);
       setThemePalette(palette);
-      setIsolatedStratumState(ThemeManager.getInstance().getIsolatedStratum());
     });
     return unsubscribe;
   }, []);
 
-  const setTheme = (newMode: ThemeMode | ((prev: ThemeMode) => ThemeMode)) => {
+  const setTheme = useCallback((newMode: ThemeMode | ((prev: ThemeMode) => ThemeMode)) => {
     const resolvedMode = typeof newMode === 'function' ? newMode(ThemeManager.getInstance().getMode()) : newMode;
     ThemeManager.getInstance().setMode(resolvedMode);
-  };
-
-  const setMediumId = (id: ArchivalMediumId) => {
-    ThemeManager.getInstance().setMediumId(id);
-  };
-
-  const setIsolatedStratum = (stratum: number | null, swatch?: { name: string; hex: string; depth: string } | null) => {
-    ThemeManager.getInstance().setIsolatedStratum(stratum, swatch);
-    setIsolatedStratumState(stratum);
-  };
+  }, []);
 
   useEffect(() => {
     isWebGPUSupported().then((supported) => {
@@ -468,7 +496,7 @@ export function useEngineState() {
 
     if (!wasPlayingRef.current) {
       wasPlayingRef.current = true;
-      playbackClockRef.current = invertQuintic(alpha);
+      playbackClockRef.current = invertQuintic(alphaRef.current);
       if (playbackClockRef.current >= 1.0 && playDirection > 0) {
         setPlayDirection(-1);
       } else if (playbackClockRef.current <= 0.0 && playDirection < 0) {
@@ -478,7 +506,6 @@ export function useEngineState() {
 
     let animId: number;
     let lastT = performance.now();
-    let lastUiSync = performance.now();
 
     const tick = (now: number) => {
       const dt = (now - lastT) * 0.001;
@@ -494,16 +521,14 @@ export function useEngineState() {
       }
 
       const easedAlpha = evaluateEase(playbackClockRef.current);
+      alphaRef.current = easedAlpha;
 
       if (typeof window !== 'undefined') {
         (window as any).__INDICATRIX_ANIM_ALPHA__ = easedAlpha;
       }
 
-      // Throttled UI state sync at 20 Hz (every 50ms) to eliminate 120 Hz React Virtual DOM diff storms
-      if (now - lastUiSync >= 50) {
-        setAlpha(easedAlpha);
-        lastUiSync = now;
-      }
+      // Leaf TelemetryStore sync (120 Hz sextant tracking with 0 <App /> Virtual DOM commits/sec)
+      telemetryStore.setLiveUnfurl(easedAlpha);
 
       animId = requestAnimationFrame(tick);
     };
@@ -516,24 +541,32 @@ export function useEngineState() {
       // Guard against overwriting manual drag value on unmount
       if (typeof window === 'undefined' || (window as any).__INDICATRIX_SCRUB_ALPHA__ === undefined) {
         setAlpha(evaluateEase(playbackClockRef.current));
+      } else {
+        telemetryStore.setLiveUnfurl(null);
       }
     };
-  }, [isPlaying, playDirection, playbackSpeed]);
+  }, [isPlaying, playDirection, playbackSpeed, setAlpha]);
 
   // Centralized glide kinematics & mode coordination (R4)
   const glideAnimRef = useRef<number | null>(null);
   const alphaRef = useRef(alpha);
-  alphaRef.current = alpha;
+  if (glideAnimRef.current === null && !isPlaying) {
+    alphaRef.current = telemetryStore.getLiveUnfurl() ?? alpha;
+  }
   const modeRef = useRef(mode);
   modeRef.current = mode;
 
   const cancelGlide = useCallback(() => {
+    const wasGliding = glideAnimRef.current !== null;
     if (glideAnimRef.current !== null) {
       cancelAnimationFrame(glideAnimRef.current);
       glideAnimRef.current = null;
     }
-    if (typeof window !== 'undefined') {
-      (window as any).__INDICATRIX_SCRUB_ALPHA__ = undefined;
+    if (wasGliding) {
+      if (typeof window !== 'undefined') {
+        (window as any).__INDICATRIX_SCRUB_ALPHA__ = undefined;
+      }
+      telemetryStore.setLiveUnfurl(null);
     }
   }, []);
 
@@ -544,7 +577,6 @@ export function useEngineState() {
     const clampedTarget = Math.max(0.0, Math.min(1.0, targetAlpha));
     if (Math.abs(startAlpha - clampedTarget) < 0.0001) return;
     const startTime = performance.now();
-    let lastUiSync = startTime;
 
     const animate = (now: number) => {
       const elapsed = now - startTime;
@@ -556,12 +588,8 @@ export function useEngineState() {
       if (typeof window !== 'undefined') {
         (window as any).__INDICATRIX_SCRUB_ALPHA__ = cur;
       }
-      // UI state sync at ~60Hz (every 16ms) for smooth sextant reticle tracking
-      if (now - lastUiSync >= 16) {
-        setAlpha(cur);
-        lastUiSync = now;
-      }
       if (progress < 1.0) {
+        telemetryStore.setLiveUnfurl(cur);
         glideAnimRef.current = requestAnimationFrame(animate);
       } else {
         glideAnimRef.current = null;
@@ -573,7 +601,7 @@ export function useEngineState() {
       }
     };
     glideAnimRef.current = requestAnimationFrame(animate);
-  }, [cancelGlide]);
+  }, [cancelGlide, setAlpha]);
 
   const glideToMode = useCallback((targetMode: SimulationMode) => {
     if (modeRef.current === targetMode) return;
@@ -591,7 +619,6 @@ export function useEngineState() {
 
     const startAlpha = alphaRef.current;
     const startTime = performance.now();
-    let lastUiSync = startTime;
     let switchedMode = false;
 
     const animate = (now: number) => {
@@ -605,10 +632,7 @@ export function useEngineState() {
         if (typeof window !== 'undefined') {
           (window as any).__INDICATRIX_SCRUB_ALPHA__ = curAlpha;
         }
-        if (now - lastUiSync >= 16) {
-          setAlpha(curAlpha);
-          lastUiSync = now;
-        }
+        telemetryStore.setLiveUnfurl(curAlpha);
         glideAnimRef.current = requestAnimationFrame(animate);
       } else if (elapsed < 280) {
         // Singularity point: 30ms dwell window at alpha = 0.000 for clean mode handover
@@ -624,10 +648,7 @@ export function useEngineState() {
         if (typeof window !== 'undefined') {
           (window as any).__INDICATRIX_SCRUB_ALPHA__ = 0.0;
         }
-        if (now - lastUiSync >= 16) {
-          setAlpha(0.0);
-          lastUiSync = now;
-        }
+        telemetryStore.setLiveUnfurl(0.0);
         glideAnimRef.current = requestAnimationFrame(animate);
       } else if (elapsed < 630) {
         // Phase 2: 350ms cubic ease-out restore to startAlpha
@@ -647,10 +668,7 @@ export function useEngineState() {
         if (typeof window !== 'undefined') {
           (window as any).__INDICATRIX_SCRUB_ALPHA__ = curAlpha;
         }
-        if (now - lastUiSync >= 16) {
-          setAlpha(curAlpha);
-          lastUiSync = now;
-        }
+        telemetryStore.setLiveUnfurl(curAlpha);
         glideAnimRef.current = requestAnimationFrame(animate);
       } else {
         if (!switchedMode) {
@@ -670,7 +688,7 @@ export function useEngineState() {
       }
     };
     glideAnimRef.current = requestAnimationFrame(animate);
-  }, [cancelGlide]);
+  }, [cancelGlide, setAlpha]);
 
   useEffect(() => {
     if (isPlaying) {
@@ -690,9 +708,7 @@ export function useEngineState() {
   return {
     backend, setBackend,
     theme, setTheme,
-    setMediumId,
     themePalette,
-    isolatedStratum, setIsolatedStratum,
     hasWebGPU, setHasWebGPU,
     alpha, setAlpha,
     mode, setMode,
@@ -701,24 +717,16 @@ export function useEngineState() {
     resolution, setResolution,
     fps, setFps,
     isHudOpen, setIsHudOpen,
-    activeOverlay, setActiveOverlay,
-    showLandmarks, setShowLandmarks,
-    showTissot, setShowTissot,
     showVectors, setShowVectors,
     showToponymy, setShowToponymy,
-    showSoundings, setShowSoundings,
-    showTriangulation, setShowTriangulation,
     showCartouche, setShowCartouche,
     isPlaying, setIsPlaying,
     playDirection, setPlayDirection,
     playbackSpeed, setPlaybackSpeed,
     isZenMode, setIsZenMode,
-    fractureIntensity, setFractureIntensity,
-    fluidVortexStrength, setFluidVortexStrength,
     gpuReport, setGpuReport,
     dataInfo, setDataInfo,
     showClouds, setShowClouds,
-    showAtmosphere, setShowAtmosphere,
     showCloudLow, setShowCloudLow,
     showCloudMid, setShowCloudMid,
     showCloudHigh, setShowCloudHigh,

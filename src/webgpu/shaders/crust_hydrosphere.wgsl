@@ -26,7 +26,7 @@ struct SimUniforms {
     u_waterClarity: f32,
     u_peakExponent: f32,
     u_layerOpacity: f32,
-    u_renderStyle: u32,       // 0 = Architectural / Relief, 1 = Hybrid / Depth, 2 = Orbital
+    u_renderStyle: u32,       // 0 = Architectural / Relief, 1 = Hybrid / Depth
     u_isolatedStratum: f32,   // -1.0 = All active, 0.0..4.0 = Isolate specific stratum band
     u_mediumProperties: vec4<f32>, // x: inkAbsorption, y: fiberDensity, z: exposureGamma, w: stippleDensity
     u_shadowIntensity: f32, // Dynamic cloud ground shadow intensity (offset 272, float 68)
@@ -34,7 +34,7 @@ struct SimUniforms {
     u_cloudAltitudeKm: f32, // Dynamic cloud deck altitude in km (offset 280, float 70) _padShadow1: f32,
     u_verticalScaleMode: u32, // Vertical scale mode: 0 = Linear Legacy, 1 = Symmetrical Dual-Log (offset 284, float 71) _padShadow2: f32,
     u_pluvial_gamma: f32, // offset 288 (float 72)
-    u_weatherOpticalMode: u32, // offset 292 (uint 73)
+    _padWeatherOpticalMode: u32, // offset 292 (uint 73)
     u_lclBypass: f32, // offset 296 (float 74)
     u_purityMode: f32, // offset 300 (float 75)
     u_scrubTau: f32, // offset 304 (float 76)
@@ -49,8 +49,6 @@ struct SimUniforms {
 @group(0) @binding(0) var<uniform> sim: SimUniforms;
 @group(0) @binding(1) var u_demTexture: texture_2d<f32>;
 @group(0) @binding(2) var u_demSampler: sampler;
-@group(0) @binding(3) var u_orbitalTextures: texture_2d_array<f32>; // Layer 0: Day Blue Marble, Layer 1: Night Lights
-@group(0) @binding(4) var u_orbitalSampler: sampler;
 @group(0) @binding(5) var u_regionalDEMTexture: texture_2d<f32>;
 
 struct RegionalOverlayUniforms {
@@ -118,6 +116,7 @@ struct TileSlotDescriptor {
 
 @group(1) @binding(8) var u_tileCacheArray: texture_2d_array<f32>;
 @group(1) @binding(9) var<storage, read> u_tileSlots: array<TileSlotDescriptor>;
+@group(1) @binding(10) var u_midCloudTexture: texture_2d<f32>;
 
 struct CDLODInstance {
     minUV: vec2<f32>,
@@ -173,6 +172,18 @@ fn computeSunLightDir(azimuthDeg: f32, altitudeDeg: f32) -> vec3<f32> {
         cos(radAz) * cosAlt,
         sin(radAlt)
     ));
+}
+
+fn computeWorldSunLightDir(azimuthDeg: f32, altitudeDeg: f32) -> vec3<f32> {
+    let L_view = computeSunLightDir(azimuthDeg, altitudeDeg);
+    let L_world_cam = normalize(vec3<f32>(
+        dot(sim.u_viewMatrix[0].xyz, L_view),
+        dot(sim.u_viewMatrix[1].xyz, L_view),
+        dot(sim.u_viewMatrix[2].xyz, L_view)
+    ));
+    let blended = mix(L_world_cam, L_view, clamp(sim.u_unfurl, 0.0, 1.0));
+    let bLen = length(blended);
+    return select(L_view, blended / max(1e-5, bLen), bLen > 1e-4);
 }
 
 // Procedural 2D corner hash (Hoskins hash12 — zero sin() stripe degeneracy at close zoom)
@@ -549,18 +560,19 @@ fn computeHydrosphereShading(
     let ripples = evaluateMicroRipples(rippleUv, uniforms.u_time);
 
     let lambda = (uvCoord.x - 0.5) * (2.0 * PI);
-    let sphereTangentX = vec3<f32>(cos(lambda), 0.0, -sin(lambda));
-    let sphereTangentY = cross(baseNormal, sphereTangentX);
-    let flatTangentX = vec3<f32>(1.0, 0.0, 0.0);
-    let flatTangentY = vec3<f32>(0.0, 1.0, 0.0);
-    let tangentX = normalize(mix(sphereTangentX, flatTangentX, sim.u_unfurl));
-    let tangentY = normalize(mix(sphereTangentY, flatTangentY, sim.u_unfurl));
+    let unfurlHydro = clamp(sim.u_unfurl, 0.0, 1.0);
+    let thetaTanHydro = (1.0 - unfurlHydro) * lambda;
+    let tangentX = vec3<f32>(cos(thetaTanHydro), 0.0, -sin(thetaTanHydro));
+    let rawTangentY = cross(baseNormal, tangentX);
+    let lenTanY = length(rawTangentY);
+    let tangentY = select(vec3<f32>(0.0, 1.0, 0.0), rawTangentY / max(1e-5, lenTanY), lenTanY > 1e-4);
 
     let camDistToFrag = length(worldPos - sim.u_cameraPos.xyz);
     let rippleAtten = 1.0 - smoothstep(1.0, 7.0, max(0.0, camDistToFrag - RADIUS));
+    let orbitalFacetAtten = max(rippleAtten, 0.30);
     let perturbedNormal = normalize(
         baseNormal + 
-        (tangentX * ripples.normalPerturbation.x + tangentY * ripples.normalPerturbation.y) * (0.35 * rippleAtten)
+        (tangentX * ripples.normalPerturbation.x + tangentY * ripples.normalPerturbation.y) * (0.35 * orbitalFacetAtten)
     );
 
     let cosines = computeSlantPathCosines(baseNormal, sunDir, viewDir);
@@ -654,11 +666,12 @@ fn computeHydrosphereShading(
     // In deep ocean basins (>200m), rich archival paper tooth & pigment washes fully take hold.
     let washAlpha = mix(0.28, 0.72, smoothstep(8.0, 160.0, safeDepth));
 
+    let hydroGrainZoomScale = clamp(1.2 / max(length(sim.u_cameraPos.xyz) - 5.0, 0.025), 1.0, 48.0);
     if (sim.u_theme == 1u) {
         let cShoreWash = vec3<f32>(0.58, 0.70, 0.64);
         let cDeepWash  = vec3<f32>(0.24, 0.35, 0.46);
         let washTone = mix(cShoreWash, cDeepWash, depthBlend) * sunIllum;
-        let fiberFreq = 1800.0 * max(0.1, sim.u_mediumProperties.y);
+        let fiberFreq = 1800.0 * max(0.1, sim.u_mediumProperties.y) * hydroGrainZoomScale;
         var fiberTooth = 0.0;
         if (sim.u_roughness > 0.0) {
             fiberTooth = (hashPaper2D(uvCoord * fiberFreq) - 0.5) * (sim.u_roughness * 0.35);
@@ -668,18 +681,18 @@ fn computeHydrosphereShading(
         let cShallowCyan = vec3<f32>(0.20, 0.36, 0.54);
         let cDeepIndigo  = vec3<f32>(0.04, 0.09, 0.18);
         let cyanWash = mix(cShallowCyan, cDeepIndigo, depthBlend) * sunIllum;
-        let linenFreq = 1400.0 * max(0.1, sim.u_mediumProperties.y);
+        let linenFreq = 1400.0 * max(0.1, sim.u_mediumProperties.y) * hydroGrainZoomScale;
         var linenTooth = 0.0;
         if (sim.u_roughness > 0.0) {
             linenTooth = (hashPaper2D(uvCoord * linenFreq) - 0.5) * (sim.u_roughness * 0.30);
         }
         waterColor = mix(waterColor, cyanWash * (1.0 + linenTooth), washAlpha * 0.92);
-    } else if (sim.u_renderStyle < 2u) {
+    } else {
         // Theme 0 (Marie Tharp): Bruce Heezen & Marie Tharp / Heinrich Berann painted bathymetric wash
         let cTharpCoastal = vec3<f32>(0.08, 0.34, 0.42);
         let cTharpDeep    = vec3<f32>(0.02, 0.06, 0.14);
         let tharpWash = mix(cTharpCoastal, cTharpDeep, depthBlend) * sunIllum;
-        let boardFreq = 750.0 * max(0.1, sim.u_mediumProperties.y);
+        let boardFreq = 750.0 * max(0.1, sim.u_mediumProperties.y) * hydroGrainZoomScale;
         var boardTooth = 0.0;
         if (sim.u_roughness > 0.0) {
             boardTooth = (hashPaper2D(uvCoord * boardFreq) - 0.5) * (sim.u_roughness * 0.25);
@@ -694,7 +707,9 @@ fn computeHydrosphereShading(
 
     let H_spec = normalize(sunDir + viewDir);
     let NdotH = max(0.0, dot(perturbedNormal, H_spec));
-    let sunSpecular = pow(NdotH, 64.0);
+    let glintLatCos = max(0.15, cos((0.5 - uvCoord.y) * PI));
+    let glintFacet = hashPaper2D(vec2<f32>(uvCoord.x * glintLatCos, uvCoord.y) * 960.0 + vec2<f32>(uniforms.u_time * 0.025, -uniforms.u_time * 0.018));
+    let sunSpecular = pow(NdotH, 168.0) * (0.42 + 0.76 * glintFacet);
 
     // Dampen sky glare on the unfurled flat map so the ocean stays deep, clear, and visible
     let mapFresnelAtten = mix(1.0, 0.20, sim.u_unfurl);
@@ -703,19 +718,21 @@ fn computeHydrosphereShading(
     let specAtten = mix(1.0, 0.35, sim.u_unfurl);
 
     // Physically-based Fresnel sun glint on water surfaces:
-    // Couplings: direct solar radiance, cloud shadow attenuation, flat-sheet unfurl dampening, and paper substrate tooth
+    // Couplings: direct solar radiance, cloud shadow attenuation, flat-sheet unfurl dampening, and micro-facet Fresnel (zero normal-incidence Phong spotlight)
     let waterGlint = (sunSpecular * fresnel * specAtten * shadowFactor) * sunIllum * (1.0 - sim.u_roughness * 0.8);
+    let xdrGlintScalar = select(0.0, (pow(NdotH, 280.0) * (0.48 + 0.92 * glintFacet) + pow(NdotH, 84.0) * fresnel * 0.45) * fresnel * 6.4 * specAtten * shadowFactor * (1.0 - sim.u_roughness * 0.5), sim.u_cameraPosLow.w > 0.5);
+    let effWaterGlint = waterGlint + sunIllum * xdrGlintScalar;
 
     var mediumSpecular: vec3<f32>;
     if (sim.u_theme == 1u) {
         // Theme 1 (Cream Rag): Warm archival ivory/vellum ink luster
-        mediumSpecular = waterGlint * vec3<f32>(0.96, 0.94, 0.88);
+        mediumSpecular = effWaterGlint * vec3<f32>(0.96, 0.94, 0.88);
     } else if (sim.u_theme == 2u) {
         // Theme 2 (Prussian Cyanotype): Photochemical actinic blue-white exposure
-        mediumSpecular = waterGlint * vec3<f32>(0.85, 0.92, 1.00);
+        mediumSpecular = effWaterGlint * vec3<f32>(0.85, 0.92, 1.00);
     } else {
         // Theme 0 (Marie Tharp) / Base: Direct oceanic sun glint
-        mediumSpecular = waterGlint * vec3<f32>(1.00, 0.98, 0.94);
+        mediumSpecular = effWaterGlint * vec3<f32>(1.00, 0.98, 0.94);
     }
 
     let finalColor = waterColor * (1.0 - fresnel * 0.4) + skyReflection + mediumSpecular;
@@ -758,6 +775,20 @@ fn evaluateGridManifold(uv: vec2<f32>, unfurl: f32, mode: u32) -> DeformedVertex
     );
 }
 
+fn unpackGlobalDemRG(s: vec4<f32>) -> vec4<f32> {
+    let bNorm = s.r;
+    let aNorm = s.g;
+    let elevM = aNorm * 19772.0 - 10924.0;
+    return vec4<f32>(clamp(elevM / 8848.0, 0.0, 1.0), clamp(-elevM / 10924.0, 0.0, 1.0), bNorm, aNorm);
+}
+
+fn unpackDemRG(s: vec4<f32>) -> vec4<f32> {
+    let bNorm = s.r;
+    let elevM = s.g;
+    let aNorm = clamp((elevM + 10924.0) / 19772.0, 0.0, 1.0);
+    return vec4<f32>(clamp(elevM / 8848.0, 0.0, 1.0), clamp(-elevM / 10924.0, 0.0, 1.0), bNorm, aNorm);
+}
+
 fn decodeElevation(texColor: vec4<f32>) -> f32 {
     let normElev = texColor.a;
     return normElev * 19772.0 - 10924.0; // [-10,924m .. +8,848m]
@@ -788,7 +819,7 @@ fn evaluateSingleRegionalBoundsWeight(lon: f32, lat: f32) -> f32 {
     let regU = (lon - minLon) / (maxLon - minLon);
     let regV = (maxLat - lat) / (maxLat - minLat);
 
-    let blendDeg = 0.05;
+    let blendDeg = 0.08;
     let lonSpan = maxLon - minLon;
     let latSpan = maxLat - minLat;
     let marginU = clamp(blendDeg / lonSpan, 0.001, 0.49);
@@ -802,20 +833,49 @@ fn evaluateSingleRegionalBoundsWeight(lon: f32, lat: f32) -> f32 {
     return weightU * weightV;
 }
 
+var<private> p_cachedTileSlot: u32 = 0u;
+var<private> p_cachedTileMiss: u32 = 0u;
+var<private> p_skipComposite: bool = false;
+var<private> p_cachedPtDist: f32 = -1.0;
+var<private> p_cachedTileWeight: f32 = 0.0;
+var<private> p_cachedTileBathyWeight: f32 = 0.0;
+var<private> p_cachedTileTs: vec2<f32> = vec2<f32>(1.0, 1.0);
+var<private> p_cachedHasRegBathy: bool = false;
+var<private> p_cachedDuv: vec2<f32> = vec2<f32>(0.0, 0.0);
+
 fn getRegionalBlendWeight(uv: vec2<f32>) -> f32 {
+    if (p_skipComposite) {
+        return 0.0;
+    }
     let lon = uv.x * 360.0 - 180.0;
     let lat = 90.0 - uv.y * 180.0;
 
-    var bestTileWeight: f32 = 0.0;
+    if (p_cachedPtDist < 0.0) {
+        let ptManifold = evaluateGridManifold(uv, sim.u_unfurl, sim.u_mode);
+        p_cachedPtDist = length(sim.u_cameraPos.xyz - ptManifold.pos);
+        p_cachedTileBathyWeight = 0.0;
+    }
+    let ptDist = p_cachedPtDist;
+    let dispScaleGate = 1.0 - smoothstep(0.48, 0.68, sim.u_displacementScale * 2.8);
+    let tileZoomGate = (1.0 - smoothstep(0.45, 0.72, ptDist)) * dispScaleGate;
+    let regZoomGate = (1.0 - smoothstep(1.05, 1.85, ptDist)) * (1.0 - smoothstep(0.48, 0.68, sim.u_displacementScale * 2.8));
+    if ((u_regionalOverlay.u_regionalActive != 1u || regZoomGate <= 0.001) && (u_regionalOverlay.u_pad3 == 0u || tileZoomGate <= 0.001)) {
+        return 0.0;
+    }
+
+    var bestTileWeight: f32 = p_cachedTileWeight;
     let cBounds = u_regionalOverlay.u_pad1;
     let hasClusterBounds = cBounds.z > cBounds.x && cBounds.w > cBounds.y;
     let inTileCluster = !hasClusterBounds || (lon >= cBounds.x && lon <= cBounds.z && lat >= cBounds.y && lat <= cBounds.w);
-    let slotCount = select(0u, min(u_regionalOverlay.u_pad3, 64u), inTileCluster);
+    let slotCount = select(0u, min(u_regionalOverlay.u_pad3, 64u), inTileCluster && tileZoomGate > 0.001 && p_cachedTileMiss == 0u && bestTileWeight <= 0.0);
     let gridF = max(1.0, round(sqrt(f32(slotCount))));
     let gridN = u32(gridF);
     let relX = clamp((lon - cBounds.x) / max(1e-5, cBounds.z - cBounds.x), 0.0, 0.99999);
     let relY = clamp((cBounds.w - lat) / max(1e-5, cBounds.w - cBounds.y), 0.0, 0.99999);
-    let guessIdx = select(0u, min(slotCount - 1u, u32(floor(relY * gridF)) * gridN + u32(floor(relX * gridF))), slotCount > 0u);
+    let clusterBorderW = select(1.0, smoothstep(0.0, 0.18, min(relX, 1.0 - relX)) * smoothstep(0.0, 0.18, min(relY, 1.0 - relY)), hasClusterBounds);
+    let rawGuessIdx = select(0u, min(slotCount - 1u, u32(floor(relY * gridF)) * gridN + u32(floor(relX * gridF))), slotCount > 0u);
+    let cachedValid = p_cachedTileSlot < slotCount;
+    let guessIdx = select(rawGuessIdx, p_cachedTileSlot, cachedValid);
     for (var step: u32 = 0u; step < slotCount; step = step + 1u) {
         let i = select(select(step, step - 1u, step <= guessIdx), guessIdx, step == 0u);
         let slot = u_tileSlots[i];
@@ -824,7 +884,7 @@ fn getRegionalBlendWeight(uv: vec2<f32>) -> f32 {
             let tileU = (lon - b.x) / (b.z - b.x);
             let tileV = (b.w - lat) / (b.w - b.y);
             let edgeMask = u32(floor(slot.tileMeta.x / 64.0));
-            let blendDeg = 0.05;
+            let blendDeg = 0.12;
             let marginU = clamp(blendDeg / (b.z - b.x), 0.001, 0.49);
             let marginV = clamp(blendDeg / (b.w - b.y), 0.001, 0.49);
 
@@ -833,22 +893,39 @@ fn getRegionalBlendWeight(uv: vec2<f32>) -> f32 {
             let wNorth = select(smoothstep(0.0, marginV, tileV), 1.0, (edgeMask & 8u) != 0u);
             let wSouth = select(smoothstep(0.0, marginV, 1.0 - tileV), 1.0, (edgeMask & 2u) != 0u);
 
-            let slotWeight = min(wWest, wEast) * min(wNorth, wSouth);
+            let slotWeight = min(wWest, wEast) * min(wNorth, wSouth) * clusterBorderW * tileZoomGate;
             bestTileWeight = max(bestTileWeight, slotWeight);
             break;
         }
     }
 
-    return max(bestTileWeight, evaluateSingleRegionalBoundsWeight(lon, lat));
+    return max(bestTileWeight, evaluateSingleRegionalBoundsWeight(lon, lat) * regZoomGate);
 }
 
 fn getRegionalTexelSpacing(uv: vec2<f32>, fallbackTs: vec2<f32>) -> vec2<f32> {
+    if (p_skipComposite) {
+        return fallbackTs;
+    }
+    if (p_cachedTileMiss == 0u && p_cachedTileWeight > 0.0) {
+        return min(fallbackTs, p_cachedTileTs);
+    }
+    if (p_cachedTileMiss != 0u) {
+        return fallbackTs;
+    }
     let lon = uv.x * 360.0 - 180.0;
     let lat = 90.0 - uv.y * 180.0;
+    if (p_cachedPtDist < 0.0) {
+        let ptManifold = evaluateGridManifold(uv, sim.u_unfurl, sim.u_mode);
+        p_cachedPtDist = length(sim.u_cameraPos.xyz - ptManifold.pos);
+        p_cachedTileBathyWeight = 0.0;
+    }
+    let ptDist = p_cachedPtDist;
+    let dispScaleGate = 1.0 - smoothstep(0.48, 0.68, sim.u_displacementScale * 2.8);
+    let tileZoomGate = (1.0 - smoothstep(0.45, 0.72, ptDist)) * dispScaleGate;
     let cBounds = u_regionalOverlay.u_pad1;
     let hasClusterBounds = cBounds.z > cBounds.x && cBounds.w > cBounds.y;
     let inTileCluster = !hasClusterBounds || (lon >= cBounds.x && lon <= cBounds.z && lat >= cBounds.y && lat <= cBounds.w);
-    let slotCount = select(0u, min(u_regionalOverlay.u_pad3, 64u), inTileCluster);
+    let slotCount = select(0u, min(u_regionalOverlay.u_pad3, 64u), inTileCluster && tileZoomGate > 0.001 && p_cachedTileMiss == 0u);
     if (slotCount == 0u) {
         return fallbackTs;
     }
@@ -856,7 +933,9 @@ fn getRegionalTexelSpacing(uv: vec2<f32>, fallbackTs: vec2<f32>) -> vec2<f32> {
     let gridN = u32(gridF);
     let relX = clamp((lon - cBounds.x) / max(1e-5, cBounds.z - cBounds.x), 0.0, 0.99999);
     let relY = clamp((cBounds.w - lat) / max(1e-5, cBounds.w - cBounds.y), 0.0, 0.99999);
-    let guessIdx = min(slotCount - 1u, u32(floor(relY * gridF)) * gridN + u32(floor(relX * gridF)));
+    let rawGuessIdx = min(slotCount - 1u, u32(floor(relY * gridF)) * gridN + u32(floor(relX * gridF)));
+    let cachedValid = p_cachedTileSlot < slotCount;
+    let guessIdx = select(rawGuessIdx, p_cachedTileSlot, cachedValid);
     for (var step: u32 = 0u; step < slotCount; step = step + 1u) {
         let i = select(select(step, step - 1u, step <= guessIdx), guessIdx, step == 0u);
         let slot = u_tileSlots[i];
@@ -873,58 +952,34 @@ fn getRegionalTexelSpacing(uv: vec2<f32>, fallbackTs: vec2<f32>) -> vec2<f32> {
     return fallbackTs;
 }
 
-var<private> p_cachedTileSlot: u32 = 0u;
-
 fn sampleRegionalComposite(uv: vec2<f32>, globalSample: vec4<f32>, lod: f32) -> vec4<f32> {
+    if (p_skipComposite) {
+        return globalSample;
+    }
     let lon = uv.x * 360.0 - 180.0;
     let lat = 90.0 - uv.y * 180.0;
     var compositeSample = globalSample;
+    let globalElevM = globalSample.a * 19772.0 - 10924.0;
+    let isInlandBasin = globalSample.b > 0.90 && globalElevM < -2.0;
 
-    let cBounds = u_regionalOverlay.u_pad1;
-    let hasClusterBounds = cBounds.z > cBounds.x && cBounds.w > cBounds.y;
-    let inTileCluster = !hasClusterBounds || (lon >= cBounds.x && lon <= cBounds.z && lat >= cBounds.y && lat <= cBounds.w);
-    let slotCount = select(0u, min(u_regionalOverlay.u_pad3, 64u), inTileCluster);
-    let gridF = max(1.0, round(sqrt(f32(slotCount))));
-    let gridN = u32(gridF);
-    let relX = clamp((lon - cBounds.x) / max(1e-5, cBounds.z - cBounds.x), 0.0, 0.99999);
-    let relY = clamp((cBounds.w - lat) / max(1e-5, cBounds.w - cBounds.y), 0.0, 0.99999);
-    let rawGuessIdx = select(0u, min(slotCount - 1u, u32(floor(relY * gridF)) * gridN + u32(floor(relX * gridF))), slotCount > 0u);
-    let cachedValid = p_cachedTileSlot < slotCount;
-    let cb = u_tileSlots[select(0u, p_cachedTileSlot, cachedValid)].bounds;
-    let inCached = cachedValid && lon >= cb.x && lon <= cb.z && lat >= cb.y && lat <= cb.w && cb.z > cb.x && cb.w > cb.y;
-    let guessIdx = select(rawGuessIdx, p_cachedTileSlot, inCached);
-    for (var step: u32 = 0u; step < slotCount; step = step + 1u) {
-        let i = select(select(step, step - 1u, step <= guessIdx), guessIdx, step == 0u);
-        let slot = u_tileSlots[i];
-        let b = slot.bounds;
-        if (lon >= b.x && lon <= b.z && lat >= b.y && lat <= b.w && b.z > b.x && b.w > b.y) {
-            p_cachedTileSlot = i;
-            let tileU = clamp((lon - b.x) / (b.z - b.x), 0.0, 1.0);
-            let tileV = clamp((b.w - lat) / (b.w - b.y), 0.0, 1.0);
-            let edgeMask = u32(floor(slot.tileMeta.x / 64.0));
-            let blendDeg = 0.05;
-            let marginU = clamp(blendDeg / (b.z - b.x), 0.001, 0.49);
-            let marginV = clamp(blendDeg / (b.w - b.y), 0.001, 0.49);
-
-            let wWest  = select(smoothstep(0.0, marginU, tileU), 1.0, (edgeMask & 1u) != 0u);
-            let wEast  = select(smoothstep(0.0, marginU, 1.0 - tileU), 1.0, (edgeMask & 4u) != 0u);
-            let wNorth = select(smoothstep(0.0, marginV, tileV), 1.0, (edgeMask & 8u) != 0u);
-            let wSouth = select(smoothstep(0.0, marginV, 1.0 - tileV), 1.0, (edgeMask & 2u) != 0u);
-            let slotWeight = min(wWest, wEast) * min(wNorth, wSouth);
-
-            let effCols = max(1.0, slot.tileMeta.z * 256.0);
-            let effRows = max(1.0, slot.tileMeta.w * 256.0);
-            let sampU = (0.5 + tileU * (effCols - 1.0)) / 256.0;
-            let sampV = (0.5 + tileV * (effRows - 1.0)) / 256.0;
-            let tileSample = textureSampleLevel(u_tileCacheArray, u_demSampler, vec2<f32>(sampU, sampV), i32(slot.tileMeta.y), 0.0);
-            let tileLandGate = smoothstep(0.35, 0.65, globalSample.b);
-            let safeTileSample = vec4<f32>(tileSample.r, globalSample.g, globalSample.b, tileSample.a);
-            compositeSample = mix(compositeSample, safeTileSample, slotWeight * tileLandGate);
-            break;
-        }
+    if (p_cachedPtDist < 0.0) {
+        let ptManifold = evaluateGridManifold(uv, sim.u_unfurl, sim.u_mode);
+        p_cachedPtDist = length(sim.u_cameraPos.xyz - ptManifold.pos);
+        p_cachedTileBathyWeight = 0.0;
+    }
+    let ptDist = p_cachedPtDist;
+    let dispScaleGate = 1.0 - smoothstep(0.48, 0.68, sim.u_displacementScale * 2.8);
+    let tileZoomGate = (1.0 - smoothstep(0.45, 0.72, ptDist)) * dispScaleGate;
+    let regZoomGate = (1.0 - smoothstep(1.05, 1.85, ptDist)) * (1.0 - smoothstep(0.48, 0.68, sim.u_displacementScale * 2.8));
+    if ((u_regionalOverlay.u_regionalActive != 1u || regZoomGate <= 0.001) && (u_regionalOverlay.u_pad3 == 0u || tileZoomGate <= 0.001)) {
+        p_cachedTileMiss = 1u;
+        return globalSample;
     }
 
-    if (u_regionalOverlay.u_regionalActive == 1u) {
+    var activeRegWeight: f32 = 0.0;
+    var activeRegTsY: f32 = 1.0;
+    var activeSafeRegSample: vec4<f32> = globalSample;
+    if (u_regionalOverlay.u_regionalActive == 1u && regZoomGate > 0.001) {
         let bounds = u_regionalOverlay.u_regionalBounds;
         let minLon = bounds.x;
         let minLat = bounds.y;
@@ -937,11 +992,143 @@ fn sampleRegionalComposite(uv: vec2<f32>, globalSample: vec4<f32>, lod: f32) -> 
             let marginU = clamp(blendDeg / (maxLon - minLon), 0.001, 0.49);
             let marginV = clamp(blendDeg / (maxLat - minLat), 0.001, 0.49);
             let regW = smoothstep(0.0, marginU, min(regU, 1.0 - regU)) * smoothstep(0.0, marginV, min(regV, 1.0 - regV));
-            let regSample = textureSampleLevel(u_regionalDEMTexture, u_demSampler, vec2<f32>(regU, regV), 0.0);
+            let regDimsF = max(vec2<f32>(textureDimensions(u_regionalDEMTexture)), vec2<f32>(1.0));
+            activeRegTsY = (maxLat - minLat) / (180.0 * max(regDimsF.y, 1.0));
+            let targetScreenTsY = max(p_cachedDuv.y * 1.85, activeRegTsY);
+            let screenMipLod = log2(max(1.0, targetScreenTsY / max(activeRegTsY, 1e-7)));
+            let regMipLod = clamp(max(lod, screenMipLod), 0.0, 5.0);
+            let regSample = unpackDemRG(textureSampleLevel(u_regionalDEMTexture, u_demSampler, vec2<f32>(regU, regV), regMipLod));
             let regLandGate = smoothstep(0.35, 0.65, globalSample.b);
-            let safeRegSample = vec4<f32>(regSample.r, globalSample.g, globalSample.b, regSample.a);
-            compositeSample = mix(compositeSample, safeRegSample, regW * regLandGate);
+            let hasRegBathy = regSample.g > 0.00015;
+            p_cachedHasRegBathy = hasRegBathy;
+            let regCoastalMask = clamp(max(regLandGate, smoothstep(-140.0, -10.0, globalElevM)) + regSample.b + select(0.0, 1.0, hasRegBathy), 0.0, 1.0);
+            let effRegB = select(mix(globalSample.b, regSample.b, regCoastalMask), globalSample.b, isInlandBasin);
+            let regEstuaryG = max(globalSample.g, (1.0 - effRegB) * (4.5 / 10924.0));
+            let effRegG = select(select(regEstuaryG, globalSample.g, effRegB > 0.5), regSample.g, hasRegBathy);
+            let effRegA = select(select(min(globalSample.a, (10924.0 - 4.5) / 19772.0), regSample.a, effRegB > 0.01 || isInlandBasin), regSample.a, hasRegBathy);
+            let safeRegSample = vec4<f32>(regSample.r, effRegG, effRegB, effRegA);
+            activeSafeRegSample = safeRegSample;
+            activeRegWeight = regW * regCoastalMask * regZoomGate;
+            compositeSample = mix(compositeSample, safeRegSample, activeRegWeight);
         }
+    }
+
+    let cBounds = u_regionalOverlay.u_pad1;
+    let hasClusterBounds = cBounds.z > cBounds.x && cBounds.w > cBounds.y;
+    let inTileCluster = !hasClusterBounds || (lon >= cBounds.x && lon <= cBounds.z && lat >= cBounds.y && lat <= cBounds.w);
+    let canUseTileSlots = inTileCluster && tileZoomGate > 0.001 && p_cachedTileMiss == 0u;
+    let slotCount = select(0u, min(u_regionalOverlay.u_pad3, 64u), canUseTileSlots);
+    p_cachedTileMiss = select(1u, 0u, u_regionalOverlay.u_pad3 > 0u && tileZoomGate > 0.001);
+    let gridF = max(1.0, round(sqrt(f32(slotCount))));
+    let gridN = u32(gridF);
+    let relX = clamp((lon - cBounds.x) / max(1e-5, cBounds.z - cBounds.x), 0.0, 0.99999);
+    let relY = clamp((cBounds.w - lat) / max(1e-5, cBounds.w - cBounds.y), 0.0, 0.99999);
+    let clusterBorderW = select(1.0, smoothstep(0.0, 0.18, min(relX, 1.0 - relX)) * smoothstep(0.0, 0.18, min(relY, 1.0 - relY)), hasClusterBounds);
+    let rawGuessIdx = select(0u, min(slotCount - 1u, u32(floor(relY * gridF)) * gridN + u32(floor(relX * gridF))), slotCount > 0u);
+    let cachedValid = p_cachedTileSlot < slotCount;
+    let cb = u_tileSlots[select(0u, p_cachedTileSlot, cachedValid)].bounds;
+    let inCached = cachedValid && lon >= cb.x && lon <= cb.z && lat >= cb.y && lat <= cb.w && cb.z > cb.x && cb.w > cb.y;
+    let guessIdx = select(rawGuessIdx, p_cachedTileSlot, inCached);
+    var hitTile: bool = false;
+    for (var step: u32 = 0u; step < slotCount; step = step + 1u) {
+        let i = select(select(step, step - 1u, step <= guessIdx), guessIdx, step == 0u);
+        let slot = u_tileSlots[i];
+        let b = slot.bounds;
+        if (lon >= b.x && lon <= b.z && lat >= b.y && lat <= b.w && b.z > b.x && b.w > b.y) {
+            p_cachedTileSlot = i;
+            hitTile = true;
+            let tileU = clamp((lon - b.x) / (b.z - b.x), 0.0, 1.0);
+            let tileV = clamp((b.w - lat) / (b.w - b.y), 0.0, 1.0);
+            let edgeMask = u32(floor(slot.tileMeta.x / 64.0));
+            let blendDeg = 0.12;
+            let marginU = clamp(blendDeg / (b.z - b.x), 0.001, 0.49);
+            let marginV = clamp(blendDeg / (b.w - b.y), 0.001, 0.49);
+
+            let wWest  = select(smoothstep(0.0, marginU, tileU), 1.0, (edgeMask & 1u) != 0u);
+            let wEast  = select(smoothstep(0.0, marginU, 1.0 - tileU), 1.0, (edgeMask & 4u) != 0u);
+            let wNorth = select(smoothstep(0.0, marginV, tileV), 1.0, (edgeMask & 8u) != 0u);
+            let wSouth = select(smoothstep(0.0, marginV, 1.0 - tileV), 1.0, (edgeMask & 2u) != 0u);
+            let slotWeight = min(wWest, wEast) * min(wNorth, wSouth) * clusterBorderW * tileZoomGate;
+
+            let isRegionalCogTile = (u32(slot.tileMeta.x) & 63u) == 14u;
+            let effCols = max(1.0, slot.tileMeta.z * 256.0);
+            let effRows = max(1.0, slot.tileMeta.w * 256.0);
+            p_cachedTileTs = vec2<f32>(max(0.0001, b.z - b.x) / (360.0 * effCols), max(0.0001, b.w - b.y) / (180.0 * effRows));
+            let effSlotWeight = slotWeight;
+            let tileRefinesReg = select(1.0, 1.0 - activeRegWeight, activeRegWeight > 0.001 && p_cachedTileTs.y >= activeRegTsY * 0.85);
+            p_cachedTileWeight = effSlotWeight * tileRefinesReg;
+            let sampU = select((0.5 + tileU * (effCols - 1.0)) / 256.0, clamp(tileU * effCols, 0.5, effCols - 0.5) / 256.0, isRegionalCogTile);
+            let sampV = select((0.5 + tileV * (effRows - 1.0)) / 256.0, clamp(tileV * effRows, 0.5, effRows - 0.5) / 256.0, isRegionalCogTile);
+            let layerIdx = i32(slot.tileMeta.y);
+            let cogTileMipLod = select(0.0, clamp(max(lod, log2(max(1.0, (p_cachedDuv.y * 1.85) / max(p_cachedTileTs.y, 1e-7)))), 0.0, 6.0), isRegionalCogTile);
+            let tileSample0 = unpackDemRG(textureSampleLevel(u_tileCacheArray, u_demSampler, vec2<f32>(sampU, sampV), layerIdx, cogTileMipLod));
+            var tileSample = tileSample0;
+            if (!isRegionalCogTile) {
+                let tileBlurTexels = clamp(1.15 + 0.65 * (p_cachedDuv.y / max(p_cachedTileTs.y, 1e-6)), 1.15, 2.35);
+                let blurStepU = tileBlurTexels / 256.0;
+                let blurStepV = tileBlurTexels / 256.0;
+                let maxSampU = (effCols - 0.5) / 256.0;
+                let maxSampV = (effRows - 0.5) / 256.0;
+                let minSamp = 0.5 / 256.0;
+                let uvPP = vec2<f32>(clamp(sampU + blurStepU, minSamp, maxSampU), clamp(sampV + blurStepV, minSamp, maxSampV));
+                let uvNP = vec2<f32>(clamp(sampU - blurStepU, minSamp, maxSampU), clamp(sampV + blurStepV, minSamp, maxSampV));
+                let uvPN = vec2<f32>(clamp(sampU + blurStepU, minSamp, maxSampU), clamp(sampV - blurStepV, minSamp, maxSampV));
+                let uvNN = vec2<f32>(clamp(sampU - blurStepU, minSamp, maxSampU), clamp(sampV - blurStepV, minSamp, maxSampV));
+                let tileSamplePP = unpackDemRG(textureSampleLevel(u_tileCacheArray, u_demSampler, uvPP, layerIdx, 0.0));
+                let tileSampleNP = unpackDemRG(textureSampleLevel(u_tileCacheArray, u_demSampler, uvNP, layerIdx, 0.0));
+                let tileSamplePN = unpackDemRG(textureSampleLevel(u_tileCacheArray, u_demSampler, uvPN, layerIdx, 0.0));
+                let tileSampleNN = unpackDemRG(textureSampleLevel(u_tileCacheArray, u_demSampler, uvNN, layerIdx, 0.0));
+                let tileBlurW = 0.62;
+                tileSample = mix(tileSample0, 0.25 * (tileSamplePP + tileSampleNP + tileSamplePN + tileSampleNN), tileBlurW);
+            }
+
+            // Hard Offshore Bathymetry Protection Gate & Two-Sided Coastal/Fjord Confidence Mask:
+            // AWS Terrarium slippy tiles are land/coast/fjord-only and must NEVER override deep ocean bathymetry (globalElevM < -15.0 where tileSample.b <= 0.5).
+            let tileAddLand = clamp((tileSample.b - 0.504) * 2.04, 0.0, 1.0);
+            let tileCarveWater = clamp((0.496 - tileSample.b) * 2.04, 0.0, 1.0);
+            let fjordCarveGate = (1.0 - smoothstep(180.0, 480.0, globalElevM)) * (1.0 - select(0.0, 1.0, isInlandBasin));
+            let isOffshoreOcean = globalElevM < -15.0 && tileSample.b <= 0.504;
+            let tileLandGate = smoothstep(0.35, 0.65, globalSample.b);
+            let rawCoastalMask = clamp(max(tileLandGate, smoothstep(-15.0, -2.0, globalElevM)) + tileAddLand + tileCarveWater * fjordCarveGate, 0.0, 1.0);
+            let tileDepthM = tileSample.g * 10924.0;
+            let tileBathyGate = smoothstep(4.5, 14.0, tileDepthM) * smoothstep(0.22, 0.52, tileDepthM / max(10.0, -globalElevM)) * (1.0 - select(0.0, 1.0, isInlandBasin));
+            let tileCoastalMask = max(select(rawCoastalMask, 0.0, isOffshoreOcean), tileBathyGate);
+            let carvedLandMask = max(0.0, compositeSample.b * (1.0 - tileCarveWater * fjordCarveGate));
+            let targetTileB = max(carvedLandMask, tileAddLand);
+            let effTileB = select(mix(compositeSample.b, targetTileB, tileCoastalMask), compositeSample.b, isInlandBasin);
+            let tileEstuaryG = max(compositeSample.g, (1.0 - effTileB) * (4.5 / 10924.0));
+            let effTileG = select(tileEstuaryG, compositeSample.g, effTileB > 0.5 || compositeSample.g >= (4.5 / 10924.0));
+            let effTileA = select(min(compositeSample.a, (10924.0 - 4.5 * (1.0 - effTileB)) / 19772.0), tileSample.a, effTileB > 0.45 || isInlandBasin);
+            let depthRatio = tileDepthM / max(10.0, -globalElevM);
+            let deepStraitRatioGuard = smoothstep(0.68, 0.90, depthRatio) * (1.0 - smoothstep(1.12, 1.35, depthRatio));
+            let waterTileBlend = tileBathyGate * deepStraitRatioGuard * (1.0 - smoothstep(0.35, 0.55, effTileB));
+            let hasCogTileBathy = isRegionalCogTile && tileSample.g > 0.00015;
+            p_cachedHasRegBathy = p_cachedHasRegBathy || hasCogTileBathy;
+            p_cachedTileBathyWeight = max(p_cachedTileBathyWeight, p_cachedTileWeight * select(waterTileBlend, 1.0, hasCogTileBathy));
+            let finalTileG = mix(effTileG, max(tileSample.g, (1.0 - effTileB) * (4.5 / 10924.0)), waterTileBlend);
+            let finalTileA = mix(effTileA, min(tileSample.a, (10924.0 - 4.5 * (1.0 - effTileB)) / 19772.0), waterTileBlend);
+            let terrariumSafeSample = vec4<f32>(tileSample.r * clamp(effTileB * 2.0, 0.0, 1.0), finalTileG, effTileB, finalTileA);
+
+            let cogCoastalMask = clamp(max(tileLandGate, smoothstep(-140.0, -10.0, globalElevM)) + tileSample.b + select(0.0, 1.0, hasCogTileBathy), 0.0, 1.0);
+            let cogEffB = select(mix(compositeSample.b, tileSample.b, cogCoastalMask), compositeSample.b, isInlandBasin);
+            let cogEstuaryG = max(compositeSample.g, (1.0 - cogEffB) * (4.5 / 10924.0));
+            let cogEffG = select(select(cogEstuaryG, compositeSample.g, cogEffB > 0.5), tileSample.g, hasCogTileBathy);
+            let cogEffA = select(select(min(compositeSample.a, (10924.0 - 4.5) / 19772.0), tileSample.a, cogEffB > 0.01 || isInlandBasin), tileSample.a, hasCogTileBathy);
+            let cogSafeSample = vec4<f32>(tileSample.r, cogEffG, cogEffB, cogEffA);
+
+            let safeTileSample = select(terrariumSafeSample, cogSafeSample, isRegionalCogTile);
+            let effTileMask = select(tileCoastalMask, cogCoastalMask, isRegionalCogTile);
+            let tileBase = mix(globalSample, safeTileSample, effSlotWeight * effTileMask);
+            compositeSample = select(
+                mix(compositeSample, safeTileSample, effSlotWeight * effTileMask),
+                mix(tileBase, activeSafeRegSample, activeRegWeight),
+                activeRegWeight > 0.001 && p_cachedTileTs.y >= activeRegTsY * 0.85
+            );
+            break;
+        }
+    }
+    if (!hitTile && p_cachedTileSlot >= 64u) {
+        p_cachedTileMiss = 1u;
     }
 
     return compositeSample;
@@ -1006,16 +1193,72 @@ fn vs_main(input: VertexInput, @builtin(instance_index) instanceIdx: u32) -> Ver
     let patchLOD = clamp(log2(max(1.0, patchDist * 0.2)), 0.0, 4.0);
 
     let uv = inUv;
-    let demSample = textureSampleLevel(u_demTexture, u_demSampler, uv, min(patchLOD * 0.25, 1.0));
+    let dispScalePre = sim.u_displacementScale * 2.8;
+    let contLod = max(0.0, instLod - morphAlpha);
+    let meshFilterMip = clamp(2.4 - contLod * 0.45, 0.0, 1.35);
+    let exaggFilterMip = clamp(log2(max(1.0, dispScalePre * 9.5)), 0.0, 1.65);
+    let vertMip = max(min(patchLOD * 0.25, 0.95), max(meshFilterMip, exaggFilterMip));
+
+    let contVertSpacingUV = inst.sizeUV * ((0.65 * (1.0 + morphAlpha)) / 64.0);
+    let meshFilterUV = clamp(contVertSpacingUV, vec2<f32>(0.00005), vec2<f32>(0.00065));
+    let exaggFilterUV = vec2<f32>(
+        clamp(dispScalePre * 0.0022, 0.0, 0.00075),
+        clamp(dispScalePre * 0.0034, 0.0, 0.00115)
+    );
+    let vertStepUV = max(meshFilterUV, exaggFilterUV);
+
+    let demC0 = unpackGlobalDemRG(textureSampleLevel(u_demTexture, u_demSampler, uv, vertMip));
+    var demSample = demC0;
+    if (inSurfaceType < 0.5 || abs(sim.u_seaLevel) > 0.01) {
+        let demR0 = unpackGlobalDemRG(textureSampleLevel(u_demTexture, u_demSampler, vec2<f32>(fract(uv.x + vertStepUV.x), uv.y), vertMip));
+        let demL0 = unpackGlobalDemRG(textureSampleLevel(u_demTexture, u_demSampler, vec2<f32>(fract(uv.x - vertStepUV.x + 1.0), uv.y), vertMip));
+        let demU0 = unpackGlobalDemRG(textureSampleLevel(u_demTexture, u_demSampler, vec2<f32>(uv.x, clamp(uv.y + vertStepUV.y, 0.0, 1.0)), vertMip));
+        let demD0 = unpackGlobalDemRG(textureSampleLevel(u_demTexture, u_demSampler, vec2<f32>(uv.x, clamp(uv.y - vertStepUV.y, 0.0, 1.0)), vertMip));
+
+        // Pillar 4: Anisotropic 1-Texel Needle De-Spiking Without Flattening Steep Cliffs
+        // Only clamp isolated 1-texel excursions where demC0.a exceeds BOTH opposing pairs or falls below BOTH opposing pairs.
+        // Continuous submarine escarpments, shelf breaks, and mountain ridges remain untouched.
+        let pairMaxLR = max(demR0.a, demL0.a);
+        let pairMaxUD = max(demU0.a, demD0.a);
+        let pairMinLR = min(demR0.a, demL0.a);
+        let pairMinUD = min(demU0.a, demD0.a);
+        let maxPairCeiling = min(pairMaxLR, pairMaxUD);
+        let minPairFloor = max(pairMinLR, pairMinUD);
+
+        let posNeedle = max(0.0, demC0.a - maxPairCeiling);
+        let negNeedle = max(0.0, minPairFloor - demC0.a);
+        let isOceanSample = demC0.b < 0.45 && (demR0.b + demL0.b + demU0.b + demD0.b) * 0.25 < 0.45;
+        let maxPosExcursion = select(mix(0.14, 0.048, smoothstep(0.04, 0.18, dispScalePre)), 0.018, isOceanSample);
+        let maxNegExcursion = mix(0.14, 0.055, smoothstep(0.04, 0.18, dispScalePre));
+        let dampedPos = posNeedle / (1.0 + posNeedle / maxPosExcursion);
+        let dampedNeg = negNeedle / (1.0 + negNeedle / maxNegExcursion);
+        let clampedC0A = select(
+            select(demC0.a, minPairFloor - dampedNeg, negNeedle > 0.0),
+            maxPairCeiling + dampedPos,
+            posNeedle > 0.0
+        );
+        let clampedElevM = clampedC0A * 19772.0 - 10924.0;
+        demSample = vec4<f32>(
+            clamp(clampedElevM / 8848.0, 0.0, 1.0),
+            clamp(-clampedElevM / 10924.0, 0.0, 1.0),
+            demC0.b,
+            clampedC0A
+        );
+    }
+    let closeVertBlend = (1.0 - smoothstep(0.05, 0.16, dispScalePre)) * (1.0 - smoothstep(0.20, 0.65, patchDist));
+    p_skipComposite = closeVertBlend <= 0.001 || (inSurfaceType > 0.5 && abs(sim.u_seaLevel) <= 0.01);
     let demSampleComp = sampleRegionalComposite(uv, demSample, 0.0);
-    let elevMeters = decodeElevation(demSampleComp);
+    p_skipComposite = false;
+    let vertDem = mix(demSample, demSampleComp, closeVertBlend);
+    let elevMeters = decodeElevation(vertDem);
     output.elevation = elevMeters;
 
-    // Liquid Hydrosphere shell: conforms to dynamic lake datum or global sea level
+    // Liquid Hydrosphere shell (Option 3B): pure 0..1 lake water fraction in .g, lake elevation from 16-bit DEM (.a)
     let hydroSample = textureSampleLevel(u_hydroTexture, u_demSampler, inUv, 0.0);
-    let z_lake = hydroSample.g * 9000.0;
-    let isLake = demSampleComp.b > 0.45 && z_lake > 1.0;
-    let localWaterDatum = select(sim.u_seaLevel, z_lake, isLake);
+    let lakeFrac = hydroSample.g;
+    let isLake = demSampleComp.b > 0.45 && lakeFrac > 0.05;
+    let z_lake = select(0.0, elevMeters, isLake);
+    let localWaterDatum = select(sim.u_seaLevel, max(z_lake, elevMeters + 18.0 * lakeFrac), isLake);
 
     // Calculate sea level displacement
     let depth = max(0.0, localWaterDatum - elevMeters);
@@ -1038,9 +1281,12 @@ fn vs_main(input: VertexInput, @builtin(instance_index) instanceIdx: u32) -> Ver
             let expLogNormH = pow(clamp(logNormH, 0.0, 1.0), exponent);
             normalDisplacement = expLogNormH * dispScale * poleAtten;
         } else {
-            // Symmetrical logarithmic bathymetry: reveals continental shelf and slope without core blowout
+            // Symmetrical logarithmic bathymetry with homographic continental-shelf shaping:
+            // eliminates shoreline/shelf shear cliff while preserving sculpted hadal trench relief
             let logNormD = log(1.0 + (-elevMeters) / 1500.0) / log(1.0 + 10924.0 / 1500.0);
-            normalDisplacement = -logNormD * dispScale * poleAtten;
+            let clampedLogD = clamp(logNormD, 0.0, 1.0);
+            let shelfLogD = clampedLogD / (1.0 + 2.25 * (1.0 - clampedLogD));
+            normalDisplacement = -shelfLogD * (dispScale * 0.78) * poleAtten;
         }
     } else {
         if (elevMeters >= 0.0) {
@@ -1065,24 +1311,33 @@ fn vs_main(input: VertexInput, @builtin(instance_index) instanceIdx: u32) -> Ver
         normalDisplacement = normalDisplacement * limbAtten;
     }
     let isCrust = inSurfaceType < 0.5;
+    let waterLogNormH = log(1.0 + max(0.0, localWaterDatum) / 1200.0) / log(1.0 + 8848.0 / 1200.0);
+    let waterLinearNormH = max(0.0, localWaterDatum) / 8848.0;
+    let waterNormH = select(waterLinearNormH, waterLogNormH, sim.u_verticalScaleMode == 1u);
+    let waterDispPos = pow(clamp(waterNormH, 0.0, 1.0), exponent) * dispScale * poleAtten;
+    let waterDispNeg = (localWaterDatum / 8848.0) * dispScale * poleAtten;
+    let waterDisp = select(waterDispNeg, waterDispPos + 0.0012, localWaterDatum >= 0.0);
+    if (isCrust && isLake) {
+        normalDisplacement = min(normalDisplacement, waterDispPos - 0.0015);
+    }
     let abyssalDrop = max(0.02, dispScale * 1.05 + 0.015);
     let skirtDepth = select(0.0, max(abyssalDrop, inst.sizeUV.y * 0.35 * dispScale), isCrust && skirtFactor > 0.0);
     if (inSurfaceType > 0.5) {
-        let hideHydroShell = skirtFactor > 0.001 || (sim.u_renderStyle < 1u && abs(sim.u_seaLevel) <= 0.01 && !isLake) || depth <= 0.001;
-        let hydroSkirtDrop = select(0.0, max(abyssalDrop, inst.sizeUV.y * 0.35 * dispScale), skirtFactor > 0.0);
-        let waterDisp = (localWaterDatum / 8848.0) * dispScale * poleAtten;
+        let hideHydroShell = (sim.u_renderStyle < 1u && abs(sim.u_seaLevel) <= 0.01) || depth <= 0.001;
         let waterDispAtten = select(waterDisp, waterDisp * limbAtten, waterDisp < 0.0);
-        normalDisplacement = select(waterDispAtten, normalDisplacement - 0.025 - hydroSkirtDrop, hideHydroShell);
+        let hiddenDisp = select(normalDisplacement - 0.25, normalDisplacement - 0.0003, vertDem.b > 0.45 && elevMeters > 10.0);
+        normalDisplacement = select(waterDispAtten, hiddenDisp, hideHydroShell);
     }
 
     let worldP = basePos + baseNormal * (normalDisplacement - skirtDepth);
-    output.worldPos = worldP;
+    let undersideSkirtLift = select(0.0, skirtDepth, isCrust && skirtFactor > 0.0 && sim.u_unfurl > 0.5 && facing < -0.02);
+    let posWorld = worldP + baseNormal * undersideSkirtLift;
+    output.worldPos = posWorld;
     output.normal = baseNormal;
     output.skirtFactor = skirtFactor;
     let alpha = morphAlpha;
     output.lodInfo = vec2<f32>(f32(inst.lod), alpha);
 
-    let posWorld = worldP;
     let posRelative = (posWorld - sim.u_cameraPosHigh.xyz) - sim.u_cameraPosLow.xyz;
     output.position = sim.u_viewProjectionMatrix * vec4<f32>(posRelative, 1.0);
 
@@ -1116,12 +1371,311 @@ fn computeCloudShadowOffset(uv: vec2<f32>, sunAzimuthDeg: f32, sunAltitudeDeg: f
     return vec2<f32>(deltaU, deltaV);
 }
 
+// Shared 3D Spherical Value-Noise Billow Field (Exact 1:1 Lockstep with volumetric_cloud.wgsl)
+fn shadowValueNoise3D(p: vec3<f32>) -> f32 {
+    let i = floor(p);
+    let f = fract(p);
+    let u = f * f * (3.0 - 2.0 * f);
+    let n = dot(i, vec3<f32>(1.0, 57.0, 113.0));
+    let a = fract(sin(n + vec4<f32>(0.0, 1.0, 57.0, 58.0)) * 43758.5453);
+    let b = fract(sin(n + vec4<f32>(113.0, 114.0, 170.0, 171.0)) * 43758.5453);
+    let k1 = mix(a.xz, a.yw, u.x);
+    let k2 = mix(b.xz, b.yw, u.x);
+    let k3 = mix(vec2<f32>(k1.x, k2.x), vec2<f32>(k1.y, k2.y), u.y);
+    return mix(k3.x, k3.y, u.z);
+}
+
+fn evalShadowSphericalBillowOctaves(p: vec3<f32>) -> f32 {
+    let n1 = shadowValueNoise3D(p * 11.5);
+    let pRot = vec3<f32>(
+        (8.0 * p.x - 4.0 * p.y + 1.0 * p.z) * (1.0 / 9.0),
+        (4.0 * p.x + 7.0 * p.y - 4.0 * p.z) * (1.0 / 9.0),
+        (1.0 * p.x + 4.0 * p.y + 8.0 * p.z) * (1.0 / 9.0)
+    );
+    let n2 = shadowValueNoise3D(pRot * 23.0 + vec3<f32>(1.7, 3.1, 2.3));
+    return n1 * 0.66 + n2 * 0.34;
+}
+
+fn sampleShadowSphericalBillow3D(
+    uv: vec2<f32>,
+    wRaw: vec2<f32>,
+    freqScale: f32,
+    timeSec: f32,
+    driftScale: f32
+) -> f32 {
+    let lon = (uv.x - 0.5) * 6.283185307179586;
+    let lat = (0.5 - uv.y) * 3.141592653589793;
+    let sinLon = sin(lon);
+    let cosLon = cos(lon);
+    let sinLat = sin(lat);
+    let cosLat = max(0.001, cos(lat));
+    let nSphere = vec3<f32>(cosLat * sinLon, sinLat, cosLat * cosLon);
+    let eEast = vec3<f32>(cosLon, 0.0, -sinLon);
+    let eNorth = vec3<f32>(-sinLat * sinLon, cosLat, -sinLat * cosLon);
+
+    let rawSpd = length(wRaw);
+    let calmAtten = smoothstep(0.0, 3.5, rawSpd);
+    let wEff = (wRaw * calmAtten) * (10.0 * inverseSqrt(dot(wRaw, wRaw) + 9.0));
+    let omegaWind = 0.00068 * driftScale;
+    let vWind3D = (eEast * wEff.x + eNorth * wEff.y) * (omegaWind * freqScale);
+    let baseSphereCoord = nSphere * freqScale;
+
+    const NOISE_FLOW_PERIOD: f32 = 36.0;
+    let c = fract(timeSec / NOISE_FLOW_PERIOD);
+    let t0 = (c - 0.5) * NOISE_FLOW_PERIOD;
+    let b0 = evalShadowSphericalBillowOctaves(baseSphereCoord - vWind3D * t0);
+    if (driftScale <= 0.001) {
+        return b0;
+    }
+    let s = sin(c * 3.141592653589793);
+    let w0 = s * s;
+    let t1 = (fract(c + 0.5) - 0.5) * NOISE_FLOW_PERIOD;
+    let b1 = evalShadowSphericalBillowOctaves(baseSphereCoord - vWind3D * t1);
+    let w1 = 1.0 - w0;
+    let invNorm = inverseSqrt(max(0.25, w0 * w0 + w1 * w1));
+    return clamp(0.5 + ((b0 - 0.5) * w0 + (b1 - 0.5) * w1) * invNorm, 0.0, 1.0);
+}
+
+// 2-Step RK2 Geodesic Wind Back-Trajectory with Relative Vorticity Curl Swirling (Shadow Lockstep with volumetric_cloud.wgsl)
+fn blendShadowStratumWindVector(wSurf: vec2<f32>, wJet: vec2<f32>, stratumMix: f32) -> vec2<f32> {
+    let t = clamp(stratumMix, 0.0, 1.0);
+    if (t <= 0.01) { return wSurf; }
+    if (t >= 0.99) { return wJet; }
+    let spdSurf = length(wSurf);
+    let spdJet = length(wJet);
+    if (spdSurf < 0.05 || spdJet < 0.05) {
+        return mix(wSurf, wJet, t);
+    }
+    let dirSurf = wSurf / spdSurf;
+    let dirJet = wJet / spdJet;
+    let cosTheta = clamp(dot(dirSurf, dirJet), -1.0, 1.0);
+    let perpSurf = vec2<f32>(dirSurf.y, -dirSurf.x);
+    let antiParallelBias = 1.0 - smoothstep(-0.99, -0.65, cosTheta);
+    let blendedDirRaw = mix(dirSurf, dirJet, t) + perpSurf * (antiParallelBias * sin(t * 3.141592653589793) * 0.85);
+    let blendedDir = normalize(select(blendedDirRaw, perpSurf, dot(blendedDirRaw, blendedDirRaw) < 1e-4));
+    let blendedSpd = mix(spdSurf, spdJet, t);
+    return blendedDir * blendedSpd;
+}
+
+fn computeShadowWindSwirlAdvectedUV(
+    baseUV: vec2<f32>,
+    stratumMix: f32,
+    phaseSec: f32,
+    fallbackUV: vec2<f32>,
+    cosLat: f32
+) -> vec2<f32> {
+    let wSample = textureSampleLevel(u_windTexture, u_cloudSampler, baseUV, 0.0);
+    let wSurf0 = wSample.xy;
+    let hasInterleavedJet = (abs(wSample.w - 1.0) > 1e-3) || (abs(wSample.z) > 1e-3);
+    let wJetFallback = vec2<f32>(wSurf0.x * 1.85 + 6.5 * cosLat, wSurf0.y * 1.35);
+    let wJet0 = select(wJetFallback, wSample.zw, hasInterleavedJet);
+    let w0 = blendShadowStratumWindVector(wSurf0, wJet0, stratumMix);
+    if (dot(wSurf0, wSurf0) < 0.0025 && dot(w0, w0) < 0.0025) {
+        return fallbackUV;
+    }
+
+    // Exact 1:1 lockstep with volumetric_cloud.wgsl: sim.u_cloudDriftRate is normalized around 5.0 (or 0.002 in direct unit tests)
+    let rawDriftRate = abs(sim.u_cloudDriftRate);
+    let driftScale = clamp(select(rawDriftRate / 0.002, rawDriftRate / 5.0, rawDriftRate >= 0.05), 0.0, 4.0);
+    let omegaWind = 0.00030 * driftScale;
+    let safeCosLat = clamp(cosLat, 0.22, 1.0);
+    let rawSpd0 = length(w0);
+    let calmAtten0 = smoothstep(0.0, 3.5, rawSpd0);
+    let v0Eff = (w0 * calmAtten0) * (10.0 * inverseSqrt(dot(w0, w0) + 9.0));
+    let velUV0 = vec2<f32>(
+        (v0Eff.x * omegaWind) / (6.283185307179586 * safeCosLat),
+       -(v0Eff.y * omegaWind) / 3.141592653589793
+    );
+    let mesoHorizonSec = 5.5 * (phaseSec * inverseSqrt(30.25 + phaseSec * phaseSec));
+    let zonalSynopticVelU = (-0.00075 * driftScale * cos(2.8 * (0.5 - baseUV.y) * 3.141592653589793)) / (6.283185307179586 * safeCosLat);
+    let meridSynopticVelV = (0.00024 * driftScale * sin(baseUV.x * 6.283185307179586 + 0.85)) / 3.141592653589793;
+
+    return vec2<f32>(
+        fract(baseUV.x - velUV0.x * mesoHorizonSec - zonalSynopticVelU * phaseSec),
+        clamp(baseUV.y - velUV0.y * mesoHorizonSec - meridSynopticVelV * phaseSec, 0.001, 0.999)
+    );
+}
+
+var<private> p_cachedFragElevM: f32 = -99999.0;
+
+// Sigg-Hadwiger 4-tap C^2 cubic B-spline reconstruction for smooth close-zoom regional cloud & wind fields
+// Eliminates C^0 bilinear 10-28 km texel grid creases while preserving strict [0, 1] convex hull bounds
+fn sampleCloudBsplineR(tex: texture_2d<f32>, uv: vec2<f32>) -> f32 {
+    let dims = textureDimensions(tex, 0);
+    let safeUV = vec2<f32>(fract(uv.x + 1.0), clamp(uv.y, 0.001, 0.999));
+    if (dims.x <= 4u || dims.y <= 4u) {
+        return textureSampleLevel(tex, u_cloudSampler, safeUV, 0.0).r;
+    }
+    let res = vec2<f32>(f32(dims.x), f32(dims.y));
+    let invRes = 1.0 / res;
+    let coord = safeUV * res - 0.5;
+    let tc = floor(coord);
+    let f = coord - tc;
+    let f2 = f * f;
+    let f3 = f2 * f;
+    let omf = 1.0 - f;
+    let w0 = (omf * omf * omf) * (1.0 / 6.0);
+    let w1 = (4.0 - 6.0 * f2 + 3.0 * f3) * (1.0 / 6.0);
+    let w2 = (1.0 + 3.0 * f + 3.0 * f2 - 3.0 * f3) * (1.0 / 6.0);
+    let w3 = f3 * (1.0 / 6.0);
+    let s0 = w0 + w1;
+    let s1 = w2 + w3;
+    let p0 = (tc - 0.5 + w1 / max(s0, vec2<f32>(1e-5))) * invRes;
+    let p1 = (tc + 1.5 + w3 / max(s1, vec2<f32>(1e-5))) * invRes;
+    let u0 = fract(p0.x + 1.0);
+    let u1 = fract(p1.x + 1.0);
+    let v0 = clamp(p0.y, 0.5 * invRes.y, 1.0 - 0.5 * invRes.y);
+    let v1 = clamp(p1.y, 0.5 * invRes.y, 1.0 - 0.5 * invRes.y);
+    let a00 = textureSampleLevel(tex, u_cloudSampler, vec2<f32>(u0, v0), 0.0).r;
+    let a10 = textureSampleLevel(tex, u_cloudSampler, vec2<f32>(u1, v0), 0.0).r;
+    let a01 = textureSampleLevel(tex, u_cloudSampler, vec2<f32>(u0, v1), 0.0).r;
+    let a11 = textureSampleLevel(tex, u_cloudSampler, vec2<f32>(u1, v1), 0.0).r;
+    return (a00 * s0.x + a10 * s1.x) * s0.y + (a01 * s0.x + a11 * s1.x) * s1.y;
+}
+
+fn regShadowFastCosCycles(cycles: f32) -> f32 {
+    let q = abs(fract(cycles) * 2.0 - 1.0);
+    return (q * q * (3.0 - 2.0 * q)) * 2.0 - 1.0;
+}
+
+fn computeShadowWindSwirlAdvectedUVSmooth(
+    baseUV: vec2<f32>,
+    stratumMix: f32,
+    phaseSec: f32,
+    fallbackUV: vec2<f32>,
+    cosLat: f32,
+    wSample: vec4<f32>
+) -> vec2<f32> {
+    let wSurf0 = wSample.xy;
+    let hasInterleavedJet = (abs(wSample.w - 1.0) > 1e-3) || (abs(wSample.z) > 1e-3);
+    let wJetFallback = vec2<f32>(wSurf0.x * 1.85 + 6.5 * cosLat, wSurf0.y * 1.35);
+    let wJet0 = select(wJetFallback, wSample.zw, hasInterleavedJet);
+    let w0 = blendShadowStratumWindVector(wSurf0, wJet0, stratumMix);
+    if (dot(wSurf0, wSurf0) < 0.0025 && dot(w0, w0) < 0.0025) {
+        return fallbackUV;
+    }
+    let rawDriftRate = abs(sim.u_cloudDriftRate);
+    let driftScale = clamp(select(rawDriftRate / 0.002, rawDriftRate / 5.0, rawDriftRate >= 0.05), 0.0, 4.0);
+    let omegaWind = 0.00030 * driftScale;
+    let safeCosLat = clamp(cosLat, 0.22, 1.0);
+    let rawSpd0 = length(w0);
+    let calmAtten0 = smoothstep(0.0, 3.5, rawSpd0);
+    let v0Eff = (w0 * calmAtten0) * (10.0 * inverseSqrt(dot(w0, w0) + 9.0));
+    let velUV0 = vec2<f32>(
+        (v0Eff.x * omegaWind) / (6.283185307179586 * safeCosLat),
+       -(v0Eff.y * omegaWind) / 3.141592653589793
+    );
+    let mesoHorizonSec = 5.5 * (phaseSec * inverseSqrt(30.25 + phaseSec * phaseSec));
+    let zonalSynopticVelU = (-0.00075 * driftScale * regShadowFastCosCycles(1.4 * (0.5 - baseUV.y))) / (6.283185307179586 * safeCosLat);
+    let meridSynopticVelV = (0.00024 * driftScale * regShadowFastCosCycles(baseUV.x - 0.11471818)) / 3.141592653589793;
+    return vec2<f32>(
+        fract(baseUV.x - velUV0.x * mesoHorizonSec - zonalSynopticVelU * phaseSec + 1.0),
+        clamp(baseUV.y - velUV0.y * mesoHorizonSec - meridSynopticVelV * phaseSec, 0.001, 0.999)
+    );
+}
+
+fn elevMetersToShadowWorldZ(elevM: f32) -> f32 {
+    let posM = max(0.0, elevM);
+    let linNorm = clamp(posM / 8848.0, 0.0, 1.0);
+    let dualNorm = clamp(log(1.0 + posM / 1200.0) / 2.12425, 0.0, 1.0);
+    let isDualLog = sim.u_verticalScaleMode == 1u;
+    let baseNorm = select(linNorm, dualNorm, isDualLog);
+    let peakExp = clamp(select(1.0, sim.u_peakExponent, sim.u_peakExponent > 0.05), 0.5, 2.5);
+    let dispScale = clamp(select(0.08, sim.u_displacementScale, sim.u_displacementScale > 0.001), 0.02, 0.35);
+    let shaped = select(pow(baseNorm, peakExp), baseNorm, abs(peakExp - 1.0) < 0.01);
+    return shaped * dispScale;
+}
+
+// Single-slab 4-tap hardware-bilinear C^2 B-spline solar-projected lookup:
+// <= 5 textureSampleLevel(..., 0.0) taps total (1 wind + 4 B-spline cloud), 0 extra DEM taps, 0 3D lattice loops
+fn evalRegionalSoftCloudShadowTau(
+    uv: vec2<f32>,
+    cosLat: f32,
+    advT_macro: f32,
+    driftOffset: f32,
+    fragElevM: f32
+) -> f32 {
+    const TWO_PI_RE_KM: f32 = 40030.17;
+    const PI_RE_KM: f32 = 20015.09;
+    let safeCos = max(0.15, cosLat);
+
+    // Local compass-frame solar vector: (East = cosAlt*sinAz, Up = sinAlt, North = cosAlt*cosAz)
+    let azDeg = select(315.0, sim.u_sunAzimuth, abs(sim.u_sunAzimuth) > 0.001);
+    let altDeg = select(45.0, sim.u_sunAltitude, sim.u_sunAltitude > 0.001);
+    let radAz = radians(azDeg);
+    let radAlt = clamp(radians(altDeg), radians(9.0), radians(85.0));
+    let sunCompass = vec3<f32>(cos(radAlt) * sin(radAz), sin(radAlt), cos(radAlt) * cos(radAz));
+    let invSunUp = 1.0 / max(0.156, sunCompass.y);
+    let sunStepPerKm = vec2<f32>(
+        (sunCompass.x * invSunUp) / (TWO_PI_RE_KM * safeCos),
+       -(sunCompass.z * invSunUp) / PI_RE_KM
+    );
+
+    // Single effective regional cloud slab coupled to cached fragment elevation (0 extra DEM fetches)
+    let clampedElevM = max(0.0, fragElevM);
+    let zBodyMidM = mix(2200.0, 3480.0, smoothstep(550.0, 3100.0, clampedElevM));
+    let zFragWorld = elevMetersToShadowWorldZ(clampedElevM);
+    let zBodyWorld = elevMetersToShadowWorldZ(zBodyMidM);
+    let distBodyKm = clamp(max(0.90, (zBodyWorld - zFragWorld) * 1274.2), 0.90, 16.5);
+
+    let casterBodyUV = vec2<f32>(
+        fract(uv.x + sunStepPerKm.x * distBodyKm + 1.0),
+        clamp(uv.y + sunStepPerKm.y * distBodyKm, 0.001, 0.999)
+    );
+
+    // Tap 1: single hardware-bilinear wind lookup for geodesic swirl advection
+    let wSample = textureSampleLevel(u_windTexture, u_cloudSampler, casterBodyUV, 0.0);
+    let fallbackUV = vec2<f32>(fract(casterBodyUV.x + driftOffset + 1.0), casterBodyUV.y);
+    let advBodyUV = computeShadowWindSwirlAdvectedUVSmooth(casterBodyUV, 0.0, advT_macro, fallbackUV, safeCos, wSample);
+
+    // Taps 2..5: Sigg-Hadwiger 4-tap hardware-bilinear C^2 cubic B-spline on prognostic cloud field
+    let lowCovSmooth = sampleCloudBsplineR(u_cloudTexture, advBodyUV);
+
+    // Strict prognostic gate: exact 0.0 shadow where prognostic coverage is 0.0
+    if (lowCovSmooth < 0.015) {
+        return 0.0;
+    }
+
+    // Zero-loop, zero-SFU C^1 polynomial FM cumulus envelope (exact integer zonal modes across ±180°)
+    let h1 = regShadowFastCosCycles(66.0 * advBodyUV.x + 39.5 * advBodyUV.y);
+    let h2 = regShadowFastCosCycles(-49.0 * advBodyUV.x + 71.3 * advBodyUV.y + 0.27);
+    let h3 = regShadowFastCosCycles(83.0 * advBodyUV.x - 54.7 * advBodyUV.y + 0.49);
+    let h4 = regShadowFastCosCycles(112.0 * advBodyUV.x + 63.2 * advBodyUV.y + 0.14 * h1);
+    let puffEnv = smoothstep(0.16, 0.78, 0.50 + 0.22 * h1 + 0.16 * h2 + 0.12 * h3 + 0.10 * h4);
+
+    let crownPierceAtten = smoothstep(-950.0, 1450.0, (zBodyMidM + 600.0) - clampedElevM);
+    return clamp(smoothstep(0.05, 0.50, lowCovSmooth) * mix(0.28, 1.0, puffEnv) * 0.76 * crownPierceAtten, 0.0, 0.80);
+}
+
 fn sampleCloudShadowFactor(uv: vec2<f32>, shadowOffset: vec2<f32>, intensity: f32) -> f32 {
+    if (intensity <= 0.001) {
+        return 1.0;
+    }
     const EARTH_CIRCUMFERENCE_M: f32 = 40075000.0;
-    let physicalRate = sim.u_cloudDriftRate / EARTH_CIRCUMFERENCE_M;
+    const CLOUD_TIMELAPSE_SCALE: f32 = 120.0;
+    let physicalRate = (sim.u_cloudDriftRate * CLOUD_TIMELAPSE_SCALE) / EARTH_CIRCUMFERENCE_M;
     let driftOffset = sim.u_time * physicalRate;
-    let centerUV = vec2<f32>(fract(uv.x + driftOffset + shadowOffset.x), clamp(uv.y + shadowOffset.y, 0.001, 0.999));
     let cosLat = max(0.15, cos((uv.y - 0.5) * 3.141592653589793));
+
+    // Continuous full-rate non-ghosting geodesic trajectory (d/dt = 1.0, 1:1 lockstep with volumetric_cloud.wgsl advT_macro)
+    let advT_macro = sim.u_time;
+
+    // Fast close-zoom regional bypass (rEff <= 5.44 -> regShadowWeight == 1.0):
+    // Skips all 18 synoptic texture taps + 3D billow hashes and runs ONLY the 5-tap C^2 B-spline regional lookup (< +0.8 ms)
+    let unfurlSh = clamp(sim.u_unfurl, 0.0, 1.0);
+    let rawPlanZSh = abs(sim.u_cameraPos.z);
+    let planAltSh = select(rawPlanZSh, abs(sim.u_cameraPos.z - 5.0), rawPlanZSh >= 4.5);
+    let rEffSh = mix(length(sim.u_cameraPos.xyz), 5.0 + planAltSh, unfurlSh);
+    let regShadowWeight = select(0.0, 1.0 - smoothstep(5.44, 5.72, rEffSh), rEffSh > 4.5);
+    if (regShadowWeight >= 0.999) {
+        let fragElevFastM = select(0.0, p_cachedFragElevM, p_cachedFragElevM > -50000.0);
+        let regFastTau = evalRegionalSoftCloudShadowTau(uv, cosLat, advT_macro, driftOffset, fragElevFastM);
+        return clamp(1.0 - intensity * regFastTau, 0.0, 1.0);
+    }
+
+    let fallbackLowUV = vec2<f32>(fract(uv.x + driftOffset + shadowOffset.x), clamp(uv.y + shadowOffset.y, 0.001, 0.999));
+    let baseLowUV = vec2<f32>(fract(uv.x + shadowOffset.x), clamp(uv.y + shadowOffset.y, 0.001, 0.999));
+    let centerUV = computeShadowWindSwirlAdvectedUV(baseLowUV, 0.0, advT_macro, fallbackLowUV, cosLat);
 
     // 20 km penumbra filter radius in UV space
     const PENUMBRA_KM: f32 = 20.0;
@@ -1147,7 +1701,10 @@ fn sampleCloudShadowFactor(uv: vec2<f32>, shadowOffset: vec2<f32>, intensity: f3
     // Multi-stratum shadow ray projection & elevation decoupling (Milestone 4, Spec §8)
     let highShadowOffset = shadowOffset * 3.4;
     let highDriftOffset = driftOffset * 1.8;
-    let highCenterUV = vec2<f32>(fract(uv.x + highDriftOffset + highShadowOffset.x), clamp(uv.y + highShadowOffset.y, 0.001, 0.999));
+    let highSyncDrift = select(driftOffset, highDriftOffset, sim.u_cloudDriftRate < 0.0);
+    let fallbackHighUV = vec2<f32>(fract(uv.x + highSyncDrift + highShadowOffset.x), clamp(uv.y + highShadowOffset.y, 0.001, 0.999));
+    let baseHighUV = vec2<f32>(fract(uv.x + highShadowOffset.x), clamp(uv.y + highShadowOffset.y, 0.001, 0.999));
+    let highCenterUV = computeShadowWindSwirlAdvectedUV(baseHighUV, 1.0, advT_macro, fallbackHighUV, cosLat);
     const PENUMBRA_HIGH_KM: f32 = 35.0;
     let rU_high = (PENUMBRA_HIGH_KM / TWO_PI_RE) / cosLat;
     let rV_high = PENUMBRA_HIGH_KM / PI_RE;
@@ -1163,80 +1720,148 @@ fn sampleCloudShadowFactor(uv: vec2<f32>, shadowOffset: vec2<f32>, intensity: f3
     let h3 = textureSampleLevel(u_highCloudTexture, u_cloudSampler, tapHigh3, 0.0).r;
     let highCloudDens = (h0 + h1 + h2 + h3) * 0.25;
 
+    // Mid-stratum (altostratus / frontal deck, 2-6 km, 35% of volumetric shell) 4-tap Poisson sampling
+    let midShadowOffset = shadowOffset * 2.0;
+    let fallbackMidUV = vec2<f32>(fract(uv.x + driftOffset + midShadowOffset.x), clamp(uv.y + midShadowOffset.y, 0.001, 0.999));
+    let baseMidUV = vec2<f32>(fract(uv.x + midShadowOffset.x), clamp(uv.y + midShadowOffset.y, 0.001, 0.999));
+    let midCenterUV = computeShadowWindSwirlAdvectedUV(baseMidUV, 0.45, advT_macro, fallbackMidUV, cosLat);
+    const PENUMBRA_MID_KM: f32 = 26.0;
+    let rU_mid = (PENUMBRA_MID_KM / TWO_PI_RE) / cosLat;
+    let rV_mid = PENUMBRA_MID_KM / PI_RE;
+    let tapMid0 = vec2<f32>(fract(midCenterUV.x - 0.38 * rU_mid), clamp(midCenterUV.y - 0.92 * rV_mid, 0.0, 1.0));
+    let tapMid1 = vec2<f32>(fract(midCenterUV.x + 0.92 * rU_mid), clamp(midCenterUV.y - 0.38 * rV_mid, 0.0, 1.0));
+    let tapMid2 = vec2<f32>(fract(midCenterUV.x + 0.38 * rU_mid), clamp(midCenterUV.y + 0.92 * rV_mid, 0.0, 1.0));
+    let tapMid3 = vec2<f32>(fract(midCenterUV.x - 0.92 * rU_mid), clamp(midCenterUV.y + 0.38 * rV_mid, 0.0, 1.0));
+    let m0 = textureSampleLevel(u_midCloudTexture, u_cloudSampler, tapMid0, 0.0).r;
+    let m1 = textureSampleLevel(u_midCloudTexture, u_cloudSampler, tapMid1, 0.0).r;
+    let m2 = textureSampleLevel(u_midCloudTexture, u_cloudSampler, tapMid2, 0.0).r;
+    let m3 = textureSampleLevel(u_midCloudTexture, u_cloudSampler, tapMid3, 0.0).r;
+    let midCloudDens = (m0 + m1 + m2 + m3) * 0.25;
+
     // Elevation decoupling: mountain peaks above cloudAltKm pierce low stratus
-    let demSampleGlobal = textureSampleLevel(u_demTexture, u_demSampler, uv, 0.0);
+    let demSampleGlobal = unpackGlobalDemRG(textureSampleLevel(u_demTexture, u_demSampler, uv, 0.0));
     let demSample = demSampleGlobal;
     let terrainElevM = demSample.a * 19772.0 - 10924.0;
     let terrainH_km = max(0.0, terrainElevM) * 0.001;
     let cloudAltKm: f32 = select(2.5, sim.u_cloudAltitudeKm, sim.u_cloudAltitudeKm > 0.0);
 
     let deltaHLow = max(0.0, cloudAltKm - terrainH_km);
+    let deltaHMid = max(0.0, cloudAltKm * 2.0 - terrainH_km);
     let deltaHHigh = max(0.0, 8.5 - terrainH_km);
     let lowTerrainAtten = select(smoothstep(0.0, 0.5, deltaHLow), 0.0, deltaHLow <= 0.0);
+    let midTerrainAtten = select(smoothstep(0.0, 0.75, deltaHMid), 0.0, deltaHMid <= 0.0);
     let highTerrainAtten = select(smoothstep(0.0, 1.0, deltaHHigh), 0.0, deltaHHigh <= 0.0);
+
+    let strataMask = u32(round(clamp(sim.u_cursorHitPos.w, 0.0, 3.0)));
+    let midStratumGate = select(1.0, 0.0, (strataMask & 1u) != 0u);
+    let highStratumGate = select(1.0, 0.0, (strataMask & 2u) != 0u);
 
     let lowTau = smoothstep(0.10, 0.35, cloudDens) * 0.70 * lowTerrainAtten;
     let highTau = smoothstep(0.12, 0.45, highCloudDens) * 0.30 * highTerrainAtten;
     let totalTau = lowTau + highTau;
 
+    // Coupled 3D Spherical Billow Modulation & Orographic Ridge/Valley Shadow Parity (Exact 1:1 lockstep with volumetric_cloud.wgsl)
+    var billowModLow: f32 = 1.0;
+    var billowModMid: f32 = 1.0;
+    var effCloudDensLow: f32 = cloudDens;
+    if (cloudDens > 0.22 || midCloudDens > 0.32 || terrainElevM > 650.0) {
+        let wShadowSample = textureSampleLevel(u_windTexture, u_cloudSampler, baseLowUV, 0.0);
+        let wSurfShadow = wShadowSample.xy;
+        let rawDriftShadow = abs(sim.u_cloudDriftRate);
+        let driftScaleShadow = clamp(select(rawDriftShadow / 0.002, rawDriftShadow / 5.0, rawDriftShadow >= 0.05), 0.0, 4.0);
+        let hasActiveWind = (dot(wSurfShadow, wSurfShadow) >= 0.0025) && (driftScaleShadow > 0.001);
+        if (hasActiveWind) {
+            let billowLow = sampleShadowSphericalBillow3D(baseLowUV, wSurfShadow, 2.65, sim.u_time, driftScaleShadow);
+            var billowMid = billowLow;
+            if (midCloudDens > 0.36) {
+                let hasInterleavedJetS = (abs(wShadowSample.w - 1.0) > 1e-3) || (abs(wShadowSample.z) > 1e-3);
+                let wJetShadow = select(vec2<f32>(wSurfShadow.x * 1.85 + 6.5 * cosLat, wSurfShadow.y * 1.35), wShadowSample.zw, hasInterleavedJetS);
+                let wMidShadow = blendShadowStratumWindVector(wSurfShadow, wJetShadow, 0.45);
+                billowMid = sampleShadowSphericalBillow3D(baseMidUV, wMidShadow, 2.65, sim.u_time, driftScaleShadow);
+            }
+
+            // High-relief mountain windward slope shadow coupling (strictly above 750m ASL so lowland basins stay 100% artifact-free)
+            if (terrainElevM > 650.0) {
+                let casterDem = unpackGlobalDemRG(textureSampleLevel(u_demTexture, u_demSampler, baseLowUV, 0.0));
+                let casterElevM = casterDem.a * 19772.0 - 10924.0;
+                if (casterElevM > 750.0 && casterElevM < 3500.0) {
+                    let wDirS = wSurfShadow * inverseSqrt(max(0.01, dot(wSurfShadow, wSurfShadow)));
+                    let downUvS = vec2<f32>(fract(baseLowUV.x + wDirS.x * 0.0028 / cosLat), clamp(baseLowUV.y - wDirS.y * 0.0028, 0.001, 0.999));
+                    let elevDownM = unpackGlobalDemRG(textureSampleLevel(u_demTexture, u_demSampler, downUvS, 0.0)).a * 19772.0 - 10924.0;
+                    let dH_up = max(0.0, elevDownM - casterElevM);
+                    let orographicGate = smoothstep(140.0, 580.0, dH_up) * smoothstep(750.0, 1350.0, casterElevM) * (1.0 - smoothstep(2650.0, 3450.0, casterElevM));
+                    let moistureGateS = smoothstep(0.08, 0.28, cloudDens + midCloudDens * 0.50);
+                    let puffMaskS = smoothstep(0.42, 0.72, billowLow);
+                    effCloudDensLow = clamp(cloudDens + orographicGate * moistureGateS * puffMaskS * 0.44, 0.0, 1.0);
+                }
+            }
+
+            // Carve clear sunlit corridors between cloud puffs (0.0 shadow in gaps, crisp moving shadows under puffs)
+            let erodeEdgeLow = mix(0.46, 0.36, smoothstep(0.18, 0.82, effCloudDensLow));
+            billowModLow = smoothstep(erodeEdgeLow, min(0.92, erodeEdgeLow + 0.32), billowLow);
+            let erodeEdgeMid = mix(0.46, 0.36, smoothstep(0.20, 0.82, midCloudDens));
+            billowModMid = smoothstep(erodeEdgeMid, min(0.92, erodeEdgeMid + 0.32), billowMid);
+        }
+    }
+
+    // 3-Stratum Beer-Lambert radiative transfer aligned with volumetric_cloud.wgsl Pass 2 clear-sky thresholds:
+    // - Raised lower smoothstep floor (0.28 / 0.24) prevents low-density clear-sky corridors from darkening the ocean surface
+    let effLowTau = clamp(smoothstep(0.28, 0.68, effCloudDensLow) * 0.58 * lowTerrainAtten * billowModLow, 0.0, 0.85);
+    let midTau = clamp(smoothstep(0.38, 0.76, midCloudDens) * 0.36 * midTerrainAtten * midStratumGate * billowModMid, 0.0, 0.85);
+    let effHighTau = smoothstep(0.32, 0.68, highCloudDens) * 0.18 * highTerrainAtten * highStratumGate;
+    var multiStratumTau = 1.0 - (1.0 - effLowTau) * (1.0 - midTau) * (1.0 - effHighTau);
+
+    if (regShadowWeight > 0.001) {
+        let fragElevM = select(terrainElevM, p_cachedFragElevM, p_cachedFragElevM > -50000.0);
+        let regSoftTau = evalRegionalSoftCloudShadowTau(uv, cosLat, advT_macro, driftOffset, fragElevM);
+        multiStratumTau = mix(multiStratumTau, regSoftTau, regShadowWeight);
+    }
+
     // Soft ground shadow attenuation per Spec §2.1 & Spec §8
     let shadowFactor = 1.0 - intensity * totalTau;
-    return clamp(shadowFactor, 0.0, 1.0);
+    return clamp(shadowFactor - intensity * (multiStratumTau - totalTau), 0.0, 1.0);
 }
 
 // ----------------------------------------------------------------------------
-// apply_weather_pigmentation: Stage 3 Archival Ink Weather Overlays
-//  (Explicit 3-Medium Branching)
+// sample_spectral_doppler: 10 km WeatherNext 3 Spectral Doppler Echoes
+// Enforces strictly cold actinic cyan-to-chalk echoes on Theme 2 (Cyanotype)
 // ----------------------------------------------------------------------------
-fn apply_weather_pigmentation(
-    precipRate: f32,
-    theme: u32,
-    mediumProps: vec4<f32>,
-    baseColor: vec4<f32>
-) -> vec4<f32> {
-    let intensity = clamp(precipRate / 50.0, 0.0, 1.0);
-    if (intensity <= 0.001) {
-        return vec4<f32>(0.0, 0.0, 0.0, 0.0);
-    }
-
-    if (theme == 0u) {
-        // Theme 0: Marie Tharp 1977 — Lithographic stipple density modulated by precipRate
-        let stippleProb = clamp(intensity * 0.85 * max(0.1, mediumProps.w), 0.05, 0.95);
-        let hashSeed = vec2<f32>(
-            baseColor.r * 1337.1 + baseColor.b * 3141.5,
-            baseColor.g * 2718.2 + precipRate * 42.0
-        );
-        let rng = hashPaper2D(hashSeed);
-        let hasDot = select(0.0, 1.0, rng < stippleProb);
-        let alpha = clamp(hasDot * intensity * 0.65 + intensity * 0.15, 0.0, 0.85);
-        let cTharpIndigo = vec3<f32>(0.118, 0.161, 0.231); // #1E293B Marine Indigo
-        return vec4<f32>(cTharpIndigo, alpha);
-    } else if (theme == 1u) {
-        // Theme 1: Cream Rag — Warm sepia-charcoal wash modulated by paper tooth (mediumProps.y)
-        let paperTooth = mediumProps.y;
-        let toothSeed = vec2<f32>(baseColor.g * 1920.0, baseColor.r * 1080.0) * max(0.1, paperTooth);
-        let toothNoise = (hashPaper2D(toothSeed) - 0.5) * 0.35;
-        let toothFactor = clamp(paperTooth * (1.0 + toothNoise), 0.5, 1.5);
-        let alpha = clamp(intensity * 0.6 * toothFactor, 0.0, 0.90);
-        return vec4<f32>(0.220, 0.188, 0.165, alpha);
-    } else if (theme == 2u) {
-        // Theme 2: Prussian Cyanotype 1842 — Actinic solarization to deep Prussian blue
-        let gamma = max(0.1, mediumProps.z);
-        let solarizedIntensity = pow(intensity, 1.0 / gamma);
-        let alpha = clamp(solarizedIntensity * 0.8, 0.0, 0.95);
-        return vec4<f32>(0.039, 0.098, 0.184, alpha);
-    } else {
-        // Defensive fallback for non-standard theme
-        return vec4<f32>(0.220, 0.188, 0.165, intensity * 0.6);
-    }
-}
-
-// ----------------------------------------------------------------------------
-// sample_spectral_doppler: Standard Meteorological Radar Color Ramp
-// ----------------------------------------------------------------------------
-fn sample_spectral_doppler(precipRate: f32) -> vec4<f32> {
+fn sample_spectral_doppler(precipRate: f32, theme: u32) -> vec4<f32> {
     if (precipRate < 0.1) {
         return vec4<f32>(0.0, 0.0, 0.0, 0.0);
+    }
+
+    if (theme == 2u) {
+        let cCobalt   = vec3<f32>(0.110, 0.306, 0.502); // #1C4E80
+        let cCerulean = vec3<f32>(0.220, 0.510, 0.769); // #3882C4
+        let cCyan     = vec3<f32>(0.416, 0.769, 0.941); // #6AC4F0
+        let cBleached = vec3<f32>(0.737, 0.910, 1.000); // #BCE8FF
+        let cChalk    = vec3<f32>(0.961, 0.980, 1.000); // #F5FAFF
+
+        var cOut: vec3<f32>;
+        var aOut: f32 = 0.72;
+        if (precipRate < 1.0) {
+            let t = (precipRate - 0.1) / 0.9;
+            cOut = mix(cCobalt, cCerulean, t);
+            aOut = mix(0.36, 0.58, t);
+        } else if (precipRate < 2.5) {
+            let t = (precipRate - 1.0) / 1.5;
+            cOut = mix(cCerulean, cCyan, t);
+            aOut = mix(0.58, 0.72, t);
+        } else if (precipRate < 7.5) {
+            let t = (precipRate - 2.5) / 5.0;
+            cOut = mix(cCyan, cBleached, t);
+            aOut = mix(0.72, 0.82, t);
+        } else if (precipRate < 15.0) {
+            let t = (precipRate - 7.5) / 7.5;
+            cOut = mix(cBleached, cChalk, t * 0.65);
+            aOut = mix(0.82, 0.88, t);
+        } else {
+            let t = clamp((precipRate - 15.0) / 35.0, 0.0, 1.0);
+            cOut = mix(mix(cBleached, cChalk, 0.65), cChalk, t);
+            aOut = mix(0.88, 0.94, t);
+        }
+        return vec4<f32>(cOut, aOut);
     }
 
     let cLightBlue = vec3<f32>(0.25, 0.60, 1.00);
@@ -1460,6 +2085,233 @@ fn getLODColor(lod: u32) -> vec3<f32> {
     }
 }
 
+fn sampleHydroMask0(uv: vec2<f32>) -> vec4<f32> {
+    return textureSampleLevel(u_hydroTexture, u_demSampler, uv, 0.0);
+}
+
+fn sampleDriftedPrecipitationField(uv: vec2<f32>) -> f32 {
+    let precipDriftOffset = sim.u_time * ((sim.u_cloudDriftRate * 16030.0) / 40075000.0);
+    let precipDriftUV = vec2<f32>(fract(uv.x + precipDriftOffset), uv.y);
+    return textureSampleLevel(u_precipTexture, u_precipSampler, precipDriftUV, 0.0).r;
+}
+
+// Analytical first-order Igehy (1999) ray-differential UV Jacobian (duv/dx, duv/dy)
+// Matches anisotropic foreshortened hardware dpdx/dpdy(input.uv) across sphere & planar sheet
+// with zero quad-derivative instructions, allowing immediate top-of-shader land discard.
+fn computeHydroAnalyticalUVDiff(worldPos: vec3<f32>, rawNormal: vec3<f32>, uv: vec2<f32>) -> vec4<f32> {
+    let pEye = sim.u_viewMatrix * vec4<f32>(worldPos, 1.0);
+    let zEye = max(abs(pEye.z), 0.05);
+    let dsX = (2.0 * zEye) / max(sim.u_viewport.x * abs(sim.u_projectionMatrix[0][0]), 1.0);
+    let dsY = (2.0 * zEye) / max(sim.u_viewport.y * abs(sim.u_projectionMatrix[1][1]), 1.0);
+
+    let camRight = vec3<f32>(sim.u_viewMatrix[0][0], sim.u_viewMatrix[1][0], sim.u_viewMatrix[2][0]);
+    let camUp    = vec3<f32>(sim.u_viewMatrix[0][1], sim.u_viewMatrix[1][1], sim.u_viewMatrix[2][1]);
+    let rayDir   = normalize(worldPos - sim.u_cameraPos.xyz);
+    let surfN    = select(vec3<f32>(0.0, 0.0, 1.0), normalize(rawNormal), length(rawNormal) > 1e-5);
+    let rawVN    = dot(rayDir, surfN);
+    let safeVN   = select(min(rawVN, -0.08), max(rawVN, 0.08), rawVN >= 0.0);
+
+    let dPx = dsX * (camRight - rayDir * (dot(camRight, surfN) / safeVN));
+    let dPy = dsY * (camUp    - rayDir * (dot(camUp,    surfN) / safeVN));
+
+    let lonRadH = (uv.x - 0.5) * 2.0 * PI;
+    let latRadH = (0.5 - uv.y) * PI;
+    let cosLatH = cos(latRadH);
+    let aClamp  = clamp(sim.u_unfurl, 0.0, 1.0);
+    let aEased  = aClamp * aClamp * (3.0 - 2.0 * aClamp);
+    let tPar0   = smoothstep(0.05, 0.85, aEased);
+    let tCyl1   = smoothstep(0.0, 0.20, aClamp);
+    let tRoll1  = sin(PI * smoothstep(0.15, 0.40, aClamp));
+    let tUnroll = select(
+        select(aClamp, smoothstep(0.15, 1.0, aClamp), sim.u_mode == 2u),
+        smoothstep(0.20, 1.0, aClamp),
+        sim.u_mode == 1u
+    );
+    let rParBase = select(
+        mix(cosLatH, 1.0, tUnroll),
+        mix(cosLatH, 1.0, tCyl1) * (1.0 - 0.20 * tRoll1),
+        sim.u_mode == 1u
+    );
+    let rPar    = 5.0 * select(rParBase, mix(cosLatH, 1.0, tPar0), sim.u_mode == 0u);
+    let sUnroll = select(1.0 - tUnroll, max(0.0, 1.0 - aEased), sim.u_mode == 0u);
+    let uAng    = sUnroll * lonRadH;
+    let eLon    = vec3<f32>(cos(uAng), 0.0, -sin(uAng));
+    let rawELat = cross(surfN, eLon);
+    let eLat    = select(vec3<f32>(0.0, 1.0, 0.0), normalize(rawELat), length(rawELat) > 1e-5);
+    let mercatorSec = 1.0 / cos(clamp(latRadH, -1.4835, 1.4835));
+    let scaleU  = max(2.0 * PI * rPar, 0.5);
+    let scaleV  = PI * 5.0 * select(mix(1.0, mercatorSec, tUnroll), 1.0, sim.u_mode == 0u);
+
+    let du_dx = dot(dPx, eLon) / scaleU;
+    let dv_dx = -dot(dPx, eLat) / scaleV;
+    let du_dy = dot(dPy, eLon) / scaleU;
+    let dv_dy = -dot(dPy, eLat) / scaleV;
+    return vec4<f32>(du_dx, dv_dx, du_dy, dv_dy);
+}
+
+@fragment
+fn fs_hydro_main(input: VertexOutput) -> @location(0) vec4<f32> {
+    if (input.skirtFactor > 0.0 || (sim.u_renderStyle == 0u && abs(sim.u_seaLevel) <= 0.01)) {
+        discard;
+    }
+
+    let uvDiff = computeHydroAnalyticalUVDiff(input.worldPos, input.normal, input.uv);
+    let duv_dx = uvDiff.xy;
+    let duv_dy = uvDiff.zw;
+    let dUV = abs(duv_dx) + abs(duv_dy);
+    p_cachedDuv = dUV;
+
+    let demDims = textureDimensions(u_demTexture);
+    let texSize = vec2<f32>(f32(demDims.x), f32(demDims.y));
+    let deltaMax2 = max(dot(duv_dx * texSize, duv_dx * texSize), dot(duv_dy * texSize, duv_dy * texSize));
+    let mipLOD = clamp(0.5 * log2(max(deltaMax2, 1e-4)) * 0.08, 0.0, 0.5);
+    let mipStep = exp2(floor(mipLOD));
+    let tsGlobal = (vec2<f32>(1.0, 1.0) / max(texSize, vec2<f32>(1.0, 1.0))) * max(1.0, mipStep);
+
+    let demC = unpackGlobalDemRG(textureSampleLevel(u_demTexture, u_demSampler, input.uv, mipLOD));
+    let finalDemC = sampleRegionalComposite(input.uv, demC, 0.0);
+    let hydroSample = sampleHydroMask0(input.uv);
+    let lakeFrac = hydroSample.g;
+    let elevMeters = finalDemC.a * 19772.0 - 10924.0;
+    let z_lake = select(0.0, elevMeters, lakeFrac > 0.05);
+    let isLake = finalDemC.b > 0.45 && lakeFrac > 0.05;
+    let localWaterDatum = select(sim.u_seaLevel, max(z_lake, elevMeters + 18.0 * lakeFrac), isLake);
+    let hydroIsLandBase = finalDemC.b;
+    let safeElevation = select(elevMeters, min(elevMeters, -3.5 * (1.0 - hydroIsLandBase)), hydroIsLandBase < 0.45 && !isLake);
+    let depthMeters = max(0.0, localWaterDatum - safeElevation);
+    if (depthMeters <= 0.001) {
+        discard;
+    }
+
+    let compDemPre = finalDemC;
+    let tileBathyWeightC = p_cachedTileBathyWeight;
+    let regDims = textureDimensions(u_regionalDEMTexture);
+    let rawRegWeightC = getRegionalBlendWeight(input.uv);
+    let singleRegWeightC = evaluateSingleRegionalBoundsWeight(input.uv.x * 360.0 - 180.0, 90.0 - input.uv.y * 180.0);
+    let ptDistC = select(p_cachedPtDist, length(sim.u_cameraPos.xyz - evaluateGridManifold(input.uv, sim.u_unfurl, sim.u_mode).pos), p_cachedPtDist < 0.0);
+    let regZoomGateC = (1.0 - smoothstep(1.05, 1.85, ptDistC)) * (1.0 - smoothstep(0.48, 0.68, sim.u_displacementScale * 2.8));
+    let regBathyWeightC = max(select(0.0, singleRegWeightC * regZoomGateC, u_regionalOverlay.u_regionalActive == 1u && p_cachedHasRegBathy), tileBathyWeightC);
+    let regWeightC = rawRegWeightC * smoothstep(0.35, 0.65, max(demC.b, compDemPre.b));
+    let effRegWeightC = max(max(regWeightC, rawRegWeightC * smoothstep(-140.0, -5.0, demC.a * 19772.0 - 10924.0)), regBathyWeightC);
+    let hiResWaterExcursionM = max(0.0, (finalDemC.r - demC.r) * 8848.0) * clamp(effRegWeightC, 0.0, 1.0);
+    if (isLake && hiResWaterExcursionM > 45.0) {
+        discard;
+    }
+
+    let regSpanLon = max(0.001, u_regionalOverlay.u_regionalBounds.z - u_regionalOverlay.u_regionalBounds.x);
+    let regSpanLat = max(0.001, u_regionalOverlay.u_regionalBounds.w - u_regionalOverlay.u_regionalBounds.y);
+    let rawTsRegBase = max(
+        vec2<f32>(
+            (regSpanLon / 360.0) / max(f32(regDims.x), 1.0),
+            (regSpanLat / 180.0) / max(f32(regDims.y), 1.0)
+        ) * max(1.0, mipStep),
+        tsGlobal / 64.0
+    );
+    let tsRegionalBase = select(
+        rawTsRegBase,
+        mix(p_cachedTileTs, rawTsRegBase, singleRegWeightC),
+        p_cachedTileMiss == 0u && p_cachedTileTs.y >= rawTsRegBase.y * 0.85
+    );
+    let tsRegionalValid = select(tsGlobal, tsRegionalBase, u_regionalOverlay.u_regionalActive == 1u && singleRegWeightC > 0.001);
+    let tsRegionalRaw = select(tsRegionalValid, getRegionalTexelSpacing(input.uv, tsRegionalValid), max(demC.b, compDemPre.b) > 0.02 || (demC.a * 19772.0 - 10924.0) > -15.0 || regBathyWeightC > 0.001);
+    let tsRegional = min(tsGlobal, max(tsRegionalRaw, dUV * 1.65));
+    let ts = mix(tsGlobal, tsRegional * 1.15, smoothstep(0.15, 0.85, effRegWeightC));
+
+    let shadowOffset = computeCloudShadowOffset(input.uv, sim.u_sunAzimuth, sim.u_sunAltitude);
+    p_cachedFragElevM = finalDemC.a * 19772.0 - 10924.0;
+    let shadowIntensity = sim.u_shadowIntensity;
+    let shadowFactor = sampleCloudShadowFactor(input.uv, shadowOffset, shadowIntensity);
+
+    let terrainShadowRaw = textureSampleLevel(u_terrainShadowTexture, u_terrainShadowSampler, input.uv, 0.0).r;
+    let terrainShadowGlobal = select(1.0, terrainShadowRaw, u_terrainShadow.u_shadowMapDimensions.x > 0u && u_terrainShadow.u_sunAltitude > 0.0);
+    var terrainShadow = terrainShadowGlobal;
+    let closeZoomShadowWeight = regWeightC * smoothstep(5.0, 50.0, 72.0 - sim.u_sunAltitude) * 0.22;
+    if (closeZoomShadowWeight > 0.0001) {
+        let sunAzRad = radians(sim.u_sunAzimuth);
+        let sunAltRad = radians(max(1.0, sim.u_sunAltitude));
+        let tanSunAlt = tan(sunAltRad);
+        let rayLatRad = (0.5 - input.uv.y) * PI;
+        let rayCosLat = max(0.15, cos(rayLatRad));
+        let sunStepDir = vec2<f32>(sin(sunAzRad) / rayCosLat, -cos(sunAzRad));
+        let h0Ray = decodeElevation(finalDemC);
+        let uvRay1 = vec2<f32>(fract(input.uv.x + sunStepDir.x * ts.y * 3.0 + 1.0), clamp(input.uv.y + sunStepDir.y * ts.y * 3.0, 0.0, 1.0));
+        let uvRay2 = vec2<f32>(fract(input.uv.x + sunStepDir.x * ts.y * 9.0 + 1.0), clamp(input.uv.y + sunStepDir.y * ts.y * 9.0, 0.0, 1.0));
+        let hRay1 = decodeElevation(sampleRegionalComposite(uvRay1, demC, 0.0));
+        let hRay2 = decodeElevation(sampleRegionalComposite(uvRay2, demC, 0.0));
+        let baseStepM = max(12.0, ts.y * PI * EARTH_RADIUS_M);
+        let slopeRay1 = (hRay1 - h0Ray) / (baseStepM * 3.0);
+        let slopeRay2 = (hRay2 - h0Ray) / (baseStepM * 9.0);
+        let microHorizonShadow = clamp((tanSunAlt - max(slopeRay1, slopeRay2)) / 0.14, 0.0, 1.0);
+        terrainShadow = terrainShadowGlobal * mix(1.0, microHorizonShadow, closeZoomShadowWeight);
+    }
+
+    let V = normalize(sim.u_cameraPos.xyz - input.worldPos);
+    let N = normalize(input.normal);
+
+    var hydroUniforms: HydrosphereUniforms;
+    let clarityIdx = clamp(u32(floor((1.0 - clamp(sim.u_waterClarity, 0.0, 1.0)) * 4.0 + 0.5)), 0u, 4u);
+    hydroUniforms.u_waterType = clarityIdx;
+    hydroUniforms.u_time = sim.u_time;
+    hydroUniforms.u_seaLevelOffset = localWaterDatum;
+    hydroUniforms.u_causticIntensity = 1.0;
+    hydroUniforms.u_sunAzimuth = sim.u_sunAzimuth;
+    hydroUniforms.u_sunAltitude = sim.u_sunAltitude;
+    hydroUniforms.u_roughness = sim.u_roughness;
+    hydroUniforms.u_fresnelPower = 4.0;
+
+    let sunPrimary = computeWorldSunLightDir(sim.u_sunAzimuth, sim.u_sunAltitude);
+    let effectiveShadow = shadowFactor * terrainShadow;
+    let hydroColor = computeHydrosphereShading(
+        input.worldPos,
+        N,
+        V,
+        sunPrimary,
+        input.uv,
+        safeElevation,
+        hydroUniforms,
+        effectiveShadow
+    );
+
+    if (hydroColor.a <= 0.001) {
+        discard;
+    }
+
+    var hydroRgb = hydroColor.rgb;
+    if (sim._padScrub1 <= 3.5) {
+        let precipUV = input.uv;
+        let hydroTempC = textureSampleLevel(u_tempTexture, u_precipSampler, precipUV, 0.0).r;
+        let hydroDewpointC = textureSampleLevel(u_dewpointTexture, u_precipSampler, precipUV, 0.0).r;
+        var hydroOverlay = vec4<f32>(0.0, 0.0, 0.0, 0.0);
+        if (sim._padScrub1 > 1.5) {
+            let tempStepUV = vec2<f32>(1.0 / 3600.0, 1.0 / 1801.0);
+            let tempR = textureSampleLevel(u_tempTexture, u_precipSampler, vec2<f32>(fract(input.uv.x + tempStepUV.x), input.uv.y), 0.0).r;
+            let tempU = textureSampleLevel(u_tempTexture, u_precipSampler, vec2<f32>(input.uv.x, clamp(input.uv.y + tempStepUV.y, 0.0, 1.0)), 0.0).r;
+            let dTempGrad = vec2<f32>((tempR - hydroTempC) / tempStepUV.x, (tempU - hydroTempC) / tempStepUV.y);
+            let dTempPx = length(dTempGrad * dUV);
+            if (sim._padScrub1 > 2.5) {
+                let hydroWind = textureSampleLevel(u_windTexture, u_precipSampler, input.uv, 0.0);
+                hydroOverlay = sample_z500_overlay(hydroTempC, hydroDewpointC, dTempPx, hydroWind.xy, input.uv, dUV, sim.u_theme);
+            } else {
+                hydroOverlay = sample_temperature_overlay(hydroTempC, dTempPx, sim.u_theme);
+            }
+        } else {
+            var hydroPrecipAdv = 0.0;
+            if (sim.u_advectionActive > 0.5) {
+                let hydroWind = textureSampleLevel(u_windTexture, u_precipSampler, input.uv, 0.0);
+                hydroPrecipAdv = sampleAdvectedPrecipitationField(input.uv, hydroWind.xy, sim.u_scrubTau);
+            } else {
+                hydroPrecipAdv = sampleDriftedPrecipitationField(input.uv);
+            }
+            let lclMeters = 125.0 * max(hydroTempC - hydroDewpointC, 0.0);
+            let lclGate = select(smoothstep(lclMeters - 200.0, lclMeters, elevMeters), 1.0, sim.u_lclBypass > 0.5);
+            hydroOverlay = sample_spectral_doppler(hydroPrecipAdv * max(lclGate, 0.72) * 1.6, sim.u_theme);
+        }
+        hydroRgb = mix(hydroRgb, hydroOverlay.rgb, hydroOverlay.a);
+    }
+
+    return vec4<f32>(hydroRgb, hydroColor.a);
+}
+
 @fragment
 fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
     // 1. Unconditional derivative evaluation for WGSL uniform control flow conformance
@@ -1468,6 +2320,7 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
     let dv_dx = dpdx(input.uv.y);
     let dv_dy = dpdy(input.uv.y);
     let dUV = fwidth(input.uv);
+    p_cachedDuv = dUV;
 
     // 2. Unconditional DEM 5-tap sampling with screen-space derivative LOD strictly before any branching/discard
     let duv_dx = vec2<f32>(du_dx, dv_dx);
@@ -1482,24 +2335,45 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
     let mipStep = exp2(floor(mipLOD));
     let tsGlobal = (vec2<f32>(1.0, 1.0) / max(texSize, vec2<f32>(1.0, 1.0))) * max(1.0, mipStep);
 
-    let demC = textureSampleLevel(u_demTexture, u_demSampler, input.uv, mipLOD);
+    let demC = unpackGlobalDemRG(textureSampleLevel(u_demTexture, u_demSampler, input.uv, mipLOD));
+    let finalDemC = sampleRegionalComposite(input.uv, demC, 0.0);
+    let compDemPre = finalDemC;
+    let tileBathyWeightC = p_cachedTileBathyWeight;
     let regDims = textureDimensions(u_regionalDEMTexture);
     let rawRegWeightC = getRegionalBlendWeight(input.uv);
     let singleRegWeightC = evaluateSingleRegionalBoundsWeight(input.uv.x * 360.0 - 180.0, 90.0 - input.uv.y * 180.0);
-    let regWeightC = rawRegWeightC * smoothstep(0.35, 0.65, demC.b);
+    let ptDistC = select(p_cachedPtDist, length(sim.u_cameraPos.xyz - evaluateGridManifold(input.uv, sim.u_unfurl, sim.u_mode).pos), p_cachedPtDist < 0.0);
+    let regZoomGateC = (1.0 - smoothstep(1.05, 1.85, ptDistC)) * (1.0 - smoothstep(0.48, 0.68, sim.u_displacementScale * 2.8));
+    let regBathyWeightC = max(select(0.0, singleRegWeightC * regZoomGateC, u_regionalOverlay.u_regionalActive == 1u && p_cachedHasRegBathy), tileBathyWeightC);
+    let regWeightC = rawRegWeightC * smoothstep(0.35, 0.65, max(demC.b, compDemPre.b));
+    let effRegWeightC = max(max(regWeightC, rawRegWeightC * smoothstep(-140.0, -5.0, demC.a * 19772.0 - 10924.0)), regBathyWeightC);
     let regSpanLon = max(0.001, u_regionalOverlay.u_regionalBounds.z - u_regionalOverlay.u_regionalBounds.x);
     let regSpanLat = max(0.001, u_regionalOverlay.u_regionalBounds.w - u_regionalOverlay.u_regionalBounds.y);
-    let tsRegionalBase = vec2<f32>(
-        (regSpanLon / 360.0) / max(f32(regDims.x), 1.0),
-        (regSpanLat / 180.0) / max(f32(regDims.y), 1.0)
-    ) * max(1.0, mipStep);
+    let rawTsRegBase = max(
+        vec2<f32>(
+            (regSpanLon / 360.0) / max(f32(regDims.x), 1.0),
+            (regSpanLat / 180.0) / max(f32(regDims.y), 1.0)
+        ) * max(1.0, mipStep),
+        tsGlobal / 64.0
+    );
+    let tsRegionalBase = select(
+        rawTsRegBase,
+        mix(p_cachedTileTs, rawTsRegBase, singleRegWeightC),
+        p_cachedTileMiss == 0u && p_cachedTileTs.y >= rawTsRegBase.y * 0.85
+    );
     let tsRegionalValid = select(tsGlobal, tsRegionalBase, u_regionalOverlay.u_regionalActive == 1u && singleRegWeightC > 0.001);
-    let tsRegional = getRegionalTexelSpacing(input.uv, tsRegionalValid);
+    let tsRegionalRaw = select(tsRegionalValid, getRegionalTexelSpacing(input.uv, tsRegionalValid), max(demC.b, compDemPre.b) > 0.02 || (demC.a * 19772.0 - 10924.0) > -15.0 || regBathyWeightC > 0.001);
+    // Screen-space Nyquist lower bound: finite-difference step never shrinks below ~1.65 screen pixels (dUV * 1.65),
+    // matching the hardware trilinear mip level (regMipLod) of u_regionalDEMTexture and slippy tiles so slopes
+    // evaluate at the exact resolved screen scale and smoothly unlock native 10m-30m sharpness on zoom-in.
+    let tsRegional = min(tsGlobal, max(tsRegionalRaw, dUV * 1.65));
 
-    let ts = mix(tsGlobal, tsRegional * 1.15, regWeightC);
-    let regStepRatio = clamp(tsGlobal.y / max(ts.y, 1e-6), 1.0, 12.0);
-    let zoomNormBoost = clamp(0.08 / max(sim.u_displacementScale, 0.008), 1.0, 1.6);
-    let slopeScale = clamp(mix(1.0, sqrt(regStepRatio) * 0.18, regWeightC) * zoomNormBoost, 1.0, 2.0);
+    let ts = mix(tsGlobal, tsRegional * 1.15, smoothstep(0.15, 0.85, effRegWeightC));
+    let regStepRatio = clamp(tsGlobal.y / max(ts.y, 1e-6), 1.0, 64.0);
+    let zoomNormBoost = clamp(0.08 / max(sim.u_displacementScale, 0.008), 1.0, 1.8);
+    let lowReliefRatio = select(clamp(sqrt(regStepRatio) * 0.35, 1.0, 2.0), mix(sqrt(regStepRatio) * 0.45, regStepRatio * 0.32, 1.0 - smoothstep(0.015, 0.08, demC.r)), demC.b > 0.35);
+    let hillslopeNormFactor = mix(1.0, 1.35, smoothstep(16.0, 64.0, regStepRatio));
+    let slopeScale = pow(regStepRatio, 0.48) * hillslopeNormFactor;
 
     // Antimeridian seamless horizontal wrapping (fract on U) and polar clamp (clamp on V) to eliminate tile/seam artifacts
     let uvR = vec2<f32>(fract(input.uv.x + ts.x), clamp(input.uv.y, 0.0, 1.0));
@@ -1507,13 +2381,12 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
     let uvU = vec2<f32>(input.uv.x, clamp(input.uv.y + ts.y, 0.0, 1.0));
     let uvD = vec2<f32>(input.uv.x, clamp(input.uv.y - ts.y, 0.0, 1.0));
 
-    let demR = textureSampleLevel(u_demTexture, u_demSampler, uvR, mipLOD);
-    let demL = textureSampleLevel(u_demTexture, u_demSampler, uvL, mipLOD);
-    let demU = textureSampleLevel(u_demTexture, u_demSampler, uvU, mipLOD);
-    let demD = textureSampleLevel(u_demTexture, u_demSampler, uvD, mipLOD);
+    let demR = unpackGlobalDemRG(textureSampleLevel(u_demTexture, u_demSampler, uvR, mipLOD));
+    let demL = unpackGlobalDemRG(textureSampleLevel(u_demTexture, u_demSampler, uvL, mipLOD));
+    let demU = unpackGlobalDemRG(textureSampleLevel(u_demTexture, u_demSampler, uvU, mipLOD));
+    let demD = unpackGlobalDemRG(textureSampleLevel(u_demTexture, u_demSampler, uvD, mipLOD));
 
     // Seamless Regional High-Resolution DEM Compositing (NOAA CUDEM ~10m)
-    let finalDemC = sampleRegionalComposite(input.uv, demC, 0.0);
     let finalDemR = sampleRegionalComposite(uvR, demR, 0.0);
     let finalDemL = sampleRegionalComposite(uvL, demL, 0.0);
     let finalDemU = sampleRegionalComposite(uvU, demU, 0.0);
@@ -1521,9 +2394,8 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
 
     // 3. Unconditional Cloud Ground Shadow 4-tap sampling strictly before dynamic branching/discard
     let shadowOffset = computeCloudShadowOffset(input.uv, sim.u_sunAzimuth, sim.u_sunAltitude);
-    let camAltShadowKm = mix(max(0.05, (length(sim.u_cameraPos.xyz) - 5.0) * 1274.2), max(0.05, abs(sim.u_cameraPos.z) * 1274.2), clamp(sim.u_unfurl, 0.0, 1.0));
-    let closeShadowFade = smoothstep(180.0, 520.0, camAltShadowKm);
-    let shadowIntensity = sim.u_shadowIntensity * closeShadowFade;
+    p_cachedFragElevM = finalDemC.a * 19772.0 - 10924.0;
+    let shadowIntensity = sim.u_shadowIntensity;
     let shadowFactor = sampleCloudShadowFactor(input.uv, shadowOffset, shadowIntensity);
 
     // Unconditional Directional Terrain Horizon Self-Shadow sampling strictly before dynamic branching/discard (Section 2)
@@ -1554,33 +2426,48 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
     let drainageSample = textureSampleLevel(u_drainageTexture, u_demSampler, input.uv, 0.0);
 
     // 4. Unconditional Precipitation, Next Precipitation, Wind, Temperature & Dewpoint Texture Sampling strictly before dynamic branching/discard
-    let precipUV = input.uv;
-    let precipRateRaw = textureSampleLevel(u_precipTexture, u_precipSampler, precipUV, 0.0).r;
+    let precipDriftOffset = sim.u_time * ((sim.u_cloudDriftRate * 16030.0) / 40075000.0);
+    var precipUV = vec2<f32>(fract(input.uv.x + precipDriftOffset), input.uv.y);
+    let precipRateDrifted = textureSampleLevel(u_precipTexture, u_precipSampler, precipUV, 0.0).r;
     let windForAdvection = textureSampleLevel(u_windTexture, u_precipSampler, input.uv, 0.0);
     // The full bidirectional advection activates when two temporal frames are available
     // For now, store the scrub tau for downstream use
     let scrubTau = sim.u_scrubTau;
+    precipUV = input.uv;
     let tempC = textureSampleLevel(u_tempTexture, u_precipSampler, precipUV, 0.0).r;
-    let tempStepUV = vec2<f32>(1.0 / 3600.0, 1.0 / 1801.0);
-    let tempR = textureSampleLevel(u_tempTexture, u_precipSampler, vec2<f32>(fract(precipUV.x + tempStepUV.x), precipUV.y), 0.0).r;
-    let tempU = textureSampleLevel(u_tempTexture, u_precipSampler, vec2<f32>(precipUV.x, clamp(precipUV.y + tempStepUV.y, 0.0, 1.0)), 0.0).r;
-    let dTempGrad = vec2<f32>((tempR - tempC) / tempStepUV.x, (tempU - tempC) / tempStepUV.y);
-    let dTempPx = length(dTempGrad * dUV);
+    var dTempPx = 0.0;
+    if (sim._padScrub1 <= 3.5) {
+        let tempStepUV = vec2<f32>(1.0 / 3600.0, 1.0 / 1801.0);
+        let tempR = textureSampleLevel(u_tempTexture, u_precipSampler, vec2<f32>(fract(precipUV.x + tempStepUV.x), precipUV.y), 0.0).r;
+        let tempU = textureSampleLevel(u_tempTexture, u_precipSampler, vec2<f32>(precipUV.x, clamp(precipUV.y + tempStepUV.y, 0.0, 1.0)), 0.0).r;
+        let dTempGrad = vec2<f32>((tempR - tempC) / tempStepUV.x, (tempU - tempC) / tempStepUV.y);
+        dTempPx = length(dTempGrad * dUV);
+    }
     let dewpointC = textureSampleLevel(u_dewpointTexture, u_precipSampler, precipUV, 0.0).r;
-    let hydroSample = textureSampleLevel(u_hydroTexture, u_demSampler, input.uv, 0.0);
-    let z_lake = hydroSample.g * 9000.0;
+    let hydroSample = sampleHydroMask0(input.uv);
+    let lakeFrac = hydroSample.g;
     let normSample0 = textureSampleLevel(u_normalTexture, u_demSampler, input.uv, 0.0);
     let lclMeters = 125.0 * max(tempC - dewpointC, 0.0);
     let demSample = finalDemC;
     let elevMeters = demSample.a * 19772.0 - 10924.0; // Standard DEM decode
+    let z_lake = select(0.0, elevMeters, lakeFrac > 0.05);
     let lclGateRaw = smoothstep(lclMeters - 200.0, lclMeters, elevMeters);
     let lclGate = select(lclGateRaw, 1.0, sim.u_lclBypass > 0.5);
-    // Unconditional semi-Lagrangian advection evaluation for WGSL uniform control flow conformance
-    let precipAdvectedField = sampleAdvectedPrecipitationField(input.uv, windForAdvection.xy, scrubTau);
-    let precipAdvected = select(precipRateRaw, precipAdvectedField, sim.u_advectionActive > 0.5);
+    var precipAdvected = precipRateDrifted;
+    if (sim.u_advectionActive > 0.5) {
+        let precipAdvectedField = sampleAdvectedPrecipitationField(input.uv, windForAdvection.xy, scrubTau);
+        precipAdvected = precipAdvectedField;
+    }
     // Modulate precipitation by LCL gate while retaining synoptic marine/lowland precipitation floor
     let precipModulated = precipAdvected * max(lclGate, 0.72);
     let precipRate = precipModulated;
+    let activePrecipMmHr = precipRate;
+    let cloudDriftOff = select(sim.u_time * sim.u_cloudDriftRate, -sim.u_cloudDriftRate, sim.u_cloudDriftRate < 0.0);
+    let cloudSampleUV = vec2<f32>(fract(input.uv.x + cloudDriftOff), clamp(input.uv.y, 0.001, 0.999));
+    let lowCov = textureSampleLevel(u_cloudTexture, u_cloudSampler, cloudSampleUV, 0.0).r;
+    let midCov = textureSampleLevel(u_midCloudTexture, u_cloudSampler, cloudSampleUV, 0.0).r;
+    let highCov = textureSampleLevel(u_highCloudTexture, u_cloudSampler, cloudSampleUV, 0.0).r;
+    let cloudPrecipProxy = clamp((lowCov * midCov + midCov * highCov) * 1.35, 0.0, 1.0);
 
     let V = normalize(sim.u_cameraPos.xyz - input.worldPos);
     let N = normalize(input.normal);
@@ -1589,23 +2476,32 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
     if (input.surfaceType > 0.5 && isSkirt) {
         discard;
     }
-    if (input.surfaceType > 0.5 && input.skirtFactor > 0.001) {
-        return vec4<f32>(0.0, 0.0, 0.0, 0.0);
+    if (input.surfaceType > 0.5 && input.skirtFactor > 0.0) {
+        discard;
     }
 
     if (input.surfaceType > 0.5) {
         if (sim.u_purityMode > 0.5) {
             discard;
         }
-        let isLake = finalDemC.b > 0.45 && z_lake > 1.0;
+        let isLake = finalDemC.b > 0.45 && lakeFrac > 0.05;
         if (sim.u_renderStyle == 0u && abs(sim.u_seaLevel) <= 0.01 && !isLake) {
-            return vec4<f32>(0.0, 0.0, 0.0, 0.0);
+            discard;
         }
-        // Dynamic lake datum evaluation: preserve water shell for inland lakes (e.g. Lake Titicaca at +3812m)
-        let localWaterDatum = select(sim.u_seaLevel, z_lake, isLake);
-        let depthMeters = max(0.0, localWaterDatum - elevMeters);
+        if (sim.u_renderStyle == 0u && abs(sim.u_seaLevel) <= 0.01 && isLake) {
+            discard;
+        }
+        let hiResWaterExcursionM = max(0.0, (finalDemC.r - demC.r) * 8848.0) * clamp(effRegWeightC, 0.0, 1.0);
+        if (isLake && hiResWaterExcursionM > 45.0) {
+            discard;
+        }
+        // Dynamic lake datum evaluation (Option 3B): preserve water shell for inland lakes (e.g. Lake Titicaca at +3812m, Dead Sea at -415m)
+        let localWaterDatum = select(sim.u_seaLevel, max(z_lake, elevMeters + 18.0 * lakeFrac), isLake);
+        let hydroIsLandBase = finalDemC.b;
+        let safeElevation = select(elevMeters, min(elevMeters, -3.5 * (1.0 - hydroIsLandBase)), hydroIsLandBase < 0.45 && !isLake);
+        let depthMeters = max(0.0, localWaterDatum - safeElevation);
         if (depthMeters <= 0.001) {
-            return vec4<f32>(0.0, 0.0, 0.0, 0.0);
+            discard;
         }
 
         var hydroUniforms: HydrosphereUniforms;
@@ -1619,8 +2515,7 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
         hydroUniforms.u_roughness = sim.u_roughness;
         hydroUniforms.u_fresnelPower = 4.0;
 
-        let sunPrimary = computeSunLightDir(sim.u_sunAzimuth, sim.u_sunAltitude);
-        let safeElevation = elevMeters;
+        let sunPrimary = computeWorldSunLightDir(sim.u_sunAzimuth, sim.u_sunAltitude);
         let effectiveShadow = shadowFactor * terrainShadow;
         let hydroColor = computeHydrosphereShading(
             input.worldPos,
@@ -1634,28 +2529,20 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
         );
 
         if (hydroColor.a <= 0.001) {
-            return vec4<f32>(0.0, 0.0, 0.0, 0.0);
+            discard;
         }
 
         var hydroRgb = hydroColor.rgb;
-        let hydroPrecipScaled = precipRate * select(4.5, 1.6, sim.u_weatherOpticalMode == 1u);
-        var hydroOverlay: vec4<f32>;
-        if (sim.u_weatherOpticalMode == 1u) {
-            hydroOverlay = sample_spectral_doppler(hydroPrecipScaled);
-        } else {
-            hydroOverlay = apply_weather_pigmentation(
-                hydroPrecipScaled,
-                sim.u_theme,
-                sim.u_mediumProperties,
-                vec4<f32>(hydroRgb, 1.0)
-            );
-        }
+        let hydroPrecipScaled = activePrecipMmHr * 1.6;
+        var hydroOverlay = vec4<f32>(0.0, 0.0, 0.0, 0.0);
         if (sim._padScrub1 > 3.5) {
             hydroOverlay = vec4<f32>(0.0, 0.0, 0.0, 0.0);
         } else if (sim._padScrub1 > 2.5) {
             hydroOverlay = sample_z500_overlay(tempC, dewpointC, dTempPx, windForAdvection.xy, input.uv, dUV, sim.u_theme);
         } else if (sim._padScrub1 > 1.5) {
             hydroOverlay = sample_temperature_overlay(tempC, dTempPx, sim.u_theme);
+        } else {
+            hydroOverlay = sample_spectral_doppler(hydroPrecipScaled, sim.u_theme);
         }
         hydroRgb = mix(hydroRgb, hydroOverlay.rgb, hydroOverlay.a);
 
@@ -1675,14 +2562,28 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
     let rawTangentY = cross(n0, tangentX);
     let tangentY = select(vec3<f32>(0.0, 1.0, 0.0), normalize(rawTangentY), length(rawTangentY) > 1e-5);
 
-    let isLandBase = finalDemC.b;
+    let minCardB = min(finalDemC.b, min(min(finalDemR.b, finalDemL.b), min(finalDemU.b, finalDemD.b)));
+    let rawAaLandB = mix(finalDemC.b, (4.0 * finalDemC.b + finalDemR.b + finalDemL.b + finalDemU.b + finalDemD.b) / 8.0, clamp(p_cachedTileWeight, 0.0, 1.0));
+    let aaLandB = mix(rawAaLandB, 1.0, smoothstep(0.42, 0.48, minCardB));
+    let lakeCov = smoothstep(0.35, 0.65, lakeFrac) * smoothstep(0.35, 0.55, finalDemC.b);
+    let maxGlobalLakeElevR = max(demC.r, max(max(demR.r, demL.r), max(demU.r, demD.r)));
+    let hiResElevExcursionM = max(0.0, (finalDemC.r - maxGlobalLakeElevR) * 8848.0);
+    let hiResLocalSlopeM = max(abs(finalDemR.r - finalDemL.r), abs(finalDemD.r - finalDemU.r)) * 8848.0;
+    let hiResLakeGate = mix(1.0, (1.0 - smoothstep(65.0, 140.0, hiResElevExcursionM)) * (1.0 - smoothstep(95.0, 220.0, hiResLocalSlopeM)), clamp(effRegWeightC, 0.0, 1.0));
+    let activeLakeCov = lakeCov * hiResLakeGate;
+    let isLandBase = aaLandB * (1.0 - lakeCov);
     let landElevBase = finalDemC.r;
-    let oceanDepthBase = finalDemC.g;
+    let shoalDepthFloor = (1.0 - isLandBase) * (3.5 / 10924.0);
+    let lakeDepthFloor = smoothstep(0.35, 0.85, lakeFrac * hiResLakeGate) * (32.0 / 10924.0);
+    let oceanDepthBase = max(max(finalDemC.g, shoalDepthFloor), lakeDepthFloor);
 
     // Dynamic coastal inundation & shelf exposure coupled to u_seaLevel
-    let isLand = select(isLandBase, smoothstep(sim.u_seaLevel - 4.0, sim.u_seaLevel + 4.0, elevMeters), abs(sim.u_seaLevel) > 0.01);
-    let landElev = select(landElevBase, max(0.0, (elevMeters - sim.u_seaLevel) / 8848.0), abs(sim.u_seaLevel) > 0.01);
-    let oceanDepth = select(oceanDepthBase, max(0.0, (sim.u_seaLevel - elevMeters) / 10924.0), abs(sim.u_seaLevel) > 0.01);
+    let safeCrustElev = select(elevMeters, min(elevMeters, -3.5 * (1.0 - isLandBase)), isLandBase < 0.45 && activeLakeCov < 0.05);
+    let seaLevelLandRaw = smoothstep(sim.u_seaLevel - 4.0, sim.u_seaLevel + 4.0, safeCrustElev);
+    let seaLevelLand = select(max(isLandBase, seaLevelLandRaw), min(isLandBase, seaLevelLandRaw), sim.u_seaLevel >= 0.0);
+    let isLand = select(aaLandB * (1.0 - activeLakeCov), seaLevelLand, abs(sim.u_seaLevel) > 0.01);
+    let landElev = select(landElevBase, max(0.0, (safeCrustElev - sim.u_seaLevel) / 8848.0), abs(sim.u_seaLevel) > 0.01);
+    let oceanDepth = select(oceanDepthBase, max(0.0, (sim.u_seaLevel - safeCrustElev) / 10924.0), abs(sim.u_seaLevel) > 0.01);
 
     let onLand = isLand > 0.45;
     // True physical bathymetric elevation scale matching land elevation:
@@ -1751,7 +2652,9 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
     let multiScaleBlend = clamp((pixelFootprintM - 450.0) / (7200.0 - 450.0), 0.0, 1.0);
 
     // Micro-structural normal reconstructed from BC5 normal map: Z = sqrt(1.0 - X^2 - Y^2)
-    let regNormalFade = 1.0 - regWeightC;
+    // Hard Offshore Bathymetry Protection Gate: over open ocean (!onLand), only true bathymetric regional COGs
+    // (u_regionalOverlay.u_regionalActive == 1u && p_cachedHasRegBathy) may fade out the global 8K BC5 bathymetric normal map.
+    let regNormalFade = select(1.0 - regBathyWeightC, 1.0 - max(effRegWeightC, regWeightC), onLand);
     let normX = (normSample0.r * 2.0 - 1.0) * regNormalFade;
     let normY = (normSample0.g * 2.0 - 1.0) * regNormalFade;
     let normZ = sqrt(max(0.0, 1.0 - normX * normX - normY * normY));
@@ -1803,7 +2706,8 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
     // Slope-Dependent Rock Cliff Exposure (theta > 35 degrees) (Track A.1)
     // Multi-scale slope evaluation: combines macro relief gradient with micro normal detail
     let landSlopeMag = length(vec2<f32>(effDHx, effDHy)) / planarReliefBoost;
-    let macroSlopeGrad = landSlopeMag * 4.25;
+    let rockGradScale = mix(4.25, 0.85, smoothstep(1.0, 12.0, regStepRatio));
+    let macroSlopeGrad = landSlopeMag * rockGradScale;
     let microSlopeGrad = length(vec2<f32>(normX, normY)) / max(0.12, normZ);
     let totalSlopeGrad = max(macroSlopeGrad, microSlopeGrad);
     let cosSlope = clamp(1.0 / sqrt(1.0 + totalSlopeGrad * totalSlopeGrad), 0.0, 1.0);
@@ -1812,24 +2716,25 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
     let rockWeight = smoothstep(rockThreshold - 0.08, rockThreshold + 0.15, slopeAngle) * 0.95;
 
     // Eduard Imhof Directional Rock Strata & Couloir Fluting Hachures
-    // Scaled with bounded C^inf local manifold coordinates + 3D erosion warp to prevent concentric elevation bullseye banding
+    // Bandwidth-limited local metric coordinates + 3D erosion warp (strictly Nyquist-clamped to prevent stationary-phase stripes)
     let effCamDistMetric = mix(length(sim.u_cameraPos.xyz), 5.0 + abs(sim.u_cameraPos.z), clamp(sim.u_unfurl, 0.0, 1.0));
-    let closeMetricScale = mix(3.2, 1.0, smoothstep(5.12, 6.20, effCamDistMetric));
-    let erosionWarp = vec2<f32>(accumGrad.x, accumGrad.y) * 0.35;
+    let closeMetricScale = mix(1.6, 0.6, smoothstep(5.08, 5.80, effCamDistMetric));
+    let nyquistMetricFreq = min(900.0 * closeMetricScale, 0.18 / max(dUV.y, 1e-6));
+    let erosionWarp = vec2<f32>(accumGrad.x, accumGrad.y) * 0.45;
     let pMetric = vec3<f32>(
-        sin(input.uv.x * 2400.0) * 16.0 + sin(input.uv.x * 18000.0) * (5.0 * closeMetricScale) + erosionWarp.x,
-        sin(input.uv.y * 1200.0) * 16.0 + sin(input.uv.y * 9000.0) * (5.0 * closeMetricScale) + erosionWarp.y,
-        landElev * 28.0 + (accumGrad.x - accumGrad.y) * 0.8
+        (input.uv.x - 0.5) * safeCosLat * nyquistMetricFreq + erosionWarp.x,
+        (input.uv.y - 0.5) * (nyquistMetricFreq * 0.5) + erosionWarp.y,
+        landElev * 14.0 + (accumGrad.x - accumGrad.y) * 0.6
     );
     let gradDir = normalize(vec2<f32>(effDHx, effDHy) + vec2<f32>(1e-6, 1e-6));
     let strikeDir = vec2<f32>(-gradDir.y, gradDir.x);
     let uFall = dot(pMetric.xy, gradDir) + pMetric.z * 0.45;
     let uStrike = dot(pMetric.xy, strikeDir) + pMetric.z * 0.25;
 
-    // Multi-octave geological bedding strata along strike direction
+    // Multi-octave geological bedding strata along strike direction (zero-mean odd symmetry prevents DC pillow bleach)
     let strata1 = sin(uStrike * 1.35);
-    let strata2 = sin(uStrike * 3.40 + 0.9);
-    let strata3 = sin(uStrike * 8.80 + 2.1) * 0.5;
+    let strata2 = sin(uStrike * 3.40);
+    let strata3 = sin(uStrike * 8.80) * 0.5;
     let strataTotal = strata1 * 0.50 + strata2 * 0.35 + strata3 * 0.15;
 
     // Couloir fluting gullies and joint fractures down the fall line
@@ -1837,16 +2742,17 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
     let joint2 = sin(uFall * 4.80 + strataTotal * 2.4);
     let couloirTotal = joint1 * 0.65 + joint2 * 0.35;
 
-    // Screen-space derivative dampening: preserves crisp intaglio fluting at regional survey altitude (3000-8000m footprint),
-    // smoothly attenuating towards orbit (>24000m footprint) to prevent Moiré shimmering
-    let detailFade = (1.0 - smoothstep(4500.0, 24000.0, pixelFootprintM)) * u_geomorphicMicro.u_microDetailStrength;
+    // Screen-space derivative dampening: preserves crisp intaglio fluting at close inspection,
+    // smoothly attenuating when 1 pixel exceeds 350m-1400m to prevent Moiré shimmering
+    let detailFade = (1.0 - smoothstep(320.0, 1400.0, pixelFootprintM)) * u_geomorphicMicro.u_microDetailStrength;
+    let fineFluteGate = 1.0 - smoothstep(70.0, 220.0, pixelFootprintM);
     let hachureModulation = clamp(0.55 + 0.45 * (couloirTotal * 0.60 + strataTotal * 0.40), 0.15, 1.35);
-    let hachurePattern = mix(1.0, hachureModulation, detailFade * rockWeight);
+    let hachurePattern = mix(1.0, hachureModulation, detailFade * rockWeight * 0.55);
 
     // High-frequency intaglio copperplate ruling-pen fluting & sharp V-notch couloir incisions
-    let fluteFine = sin(uFall * 11.5 + strataTotal * 2.4);
-    let fluteMicro = sin(uFall * 28.0 + strata2 * 3.0);
-    let strataFine = sin(uStrike * 16.0 + 1.2);
+    let fluteFine = sin(uFall * 11.5 + strataTotal * 2.4) * fineFluteGate;
+    let fluteMicro = sin(uFall * 28.0 + strata2 * 3.0) * fineFluteGate;
+    let strataFine = sin(uStrike * 16.0) * fineFluteGate;
 
     // V-notch profile for couloir crevices (deep incised troughs, razor-sharp arête crests)
     let couloirMacro = 0.5 + 0.5 * couloirTotal;
@@ -1907,7 +2813,7 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
     // 2. Couloir incision: narrow V-notch troughs cut into the rock face with archival ink (preserving sunlit crags)
     let cCreviceInk = cRockDark;
     let incisionDepth = (1.0 - smoothstep(0.02, 0.18, vNotchFluting)) * detailFade;
-    let rockIncised = mix(rockDiffuse, cCreviceInk, incisionDepth * 0.85);
+    let rockIncised = mix(rockDiffuse, cCreviceInk, incisionDepth * 0.32);
 
     // 3. Geological bedding strata steps: horizontal ledges cross-cutting the couloirs
     let strataDisplacement = (stepProfile - 0.5) * 0.55 * detailFade;
@@ -1915,7 +2821,7 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
 
     // 4. Knife-edge arêtes and rib highlights: sun-catching ridge crests
     let areteHighlight = smoothstep(0.32, 0.72, vNotchFluting) * (0.48 + 0.52 * rockSun) * detailFade;
-    let cArete = select(cSummit, vec3<f32>(0.92, 0.95, 0.98), sim.u_theme == 2u);
+    let cArete = select(mix(cRockLit, cSummit, smoothstep(3200.0, 5200.0, clamp(landElev * 8848.0, 0.0, 8848.0))), vec3<f32>(0.92, 0.95, 0.98), sim.u_theme == 2u);
     let cRockShaded = mix(rockWithStrata, cArete, areteHighlight * 0.80);
 
     // Natural Illumination Split: Warm Sun Direct + Cool Cerulean Sky Fill
@@ -1953,6 +2859,9 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
         let shadowComponent = cCoolShadow * (skyIndirect * creviceAO);
         let lowlandLift = lowlandWeight * 0.12 * (1.0 + lowlandMicroShade) * terrainShadow;
         landIllum = mix(shadowComponent, directComponent, sunWeight) + cWarmDirect * lowlandLift;
+        let cBistreCastShadow = vec3<f32>(0.353, 0.302, 0.255); // Warm bistre wash #5A4D41
+        let alphaShLand = clamp((1.0 - shadowFactor) * 0.85, 0.0, 0.48);
+        landIllum = mix(landIllum, max(landIllum * 0.52, cBistreCastShadow), alphaShLand * 0.35);
     } else if (sim.u_theme == 2u) {
         // Prussian Cyanotype: Actinic Monochromatic Photochemical Illumination
         // STRICTLY MONOCHROMATIC — pure cool actinic blueprint lighting, zero warm/yellow sun component
@@ -1974,6 +2883,14 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
         cSkyAmbient = cSkyAmbientSave;
     }
     landIllum = landIllum * (1.0 + lowlandMicroShade * 0.30);
+    // Step 5.2 Eduard Imhof Chromatic Slope-Aspect Relief Modulation:
+    // Warm sunlit gold-ochre glaze on NW slopes vs cool cerulean-violet aerial shadow glaze on SE slopes (Themes 0/1);
+    // strictly cold photochemical actinic blueprint modulation (R <= G <= B) on Theme 2 (Prussian Cyanotype).
+    let imhofSlopeGate = smoothstep(0.05, 0.42, slopeAngle) * smoothstep(60.0, 1100.0, hMeters);
+    let imhofSunBalance = clamp(NdotL1 * shadowFactor * 1.45 - 0.32, -1.0, 1.0) * 0.5 + 0.5;
+    let cImhofCool = select(vec3<f32>(0.930, 0.958, 1.040), vec3<f32>(0.915, 0.955, 1.000), sim.u_theme == 2u);
+    let cImhofWarm = select(vec3<f32>(1.050, 1.014, 0.950), vec3<f32>(0.965, 0.985, 1.015), sim.u_theme == 2u);
+    landIllum = landIllum * mix(vec3<f32>(1.0), mix(cImhofCool, cImhofWarm, imhofSunBalance), imhofSlopeGate * 0.62);
     let rawPlanZStage1 = abs(sim.u_cameraPos.z);
     let planAltStage1 = select(rawPlanZStage1, rawPlanZStage1 - 5.0, rawPlanZStage1 >= 5.0);
     let fragDistStage1 = length(sim.u_cameraPos.xyz - input.worldPos);
@@ -1986,7 +2903,7 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
     let tintedLand = cEffectiveRamp * closeIllumLift;
     let steepWall = smoothstep(0.65, 0.85, slopeAngle);
     let alpineElevWeight = max(steepWall, smoothstep(300.0, 1500.0, hMeters));
-    let effectiveRockWeight = rockWeight * select(1.0, alpineElevWeight, sim.u_theme == 1u) * (1.0 - closeTopoPaperGate * 0.55);
+    let effectiveRockWeight = rockWeight * select(1.0, alpineElevWeight, sim.u_theme == 1u) * (1.0 - closeTopoPaperGate * 0.65) * 0.60;
     var finalLand = mix(tintedLand, cRockShaded, effectiveRockWeight);
 
     // ========================================================================
@@ -2017,12 +2934,12 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
 
         // Couloir crevices: etch deep fall-line incisions with archival bone-sepia drafting ink
         let couloirInkDepth = incisionDepth * effectiveRockWeight;
-        finalLand = mix(finalLand, cInkTharp, couloirInkDepth * 0.95 * sim.u_mediumProperties.w);
+        finalLand = mix(finalLand, cInkTharp, couloirInkDepth * 0.35 * sim.u_mediumProperties.w);
 
         // Heinrich Berann Canyon & Escarpment Couloir Incision (active on canyon sidewalls & alpine flanks)
         let berannSlopeFlank = smoothstep(0.08, 0.36, landSlope);
         let canyonCouloirDepth = (1.0 - smoothstep(0.08, 0.44, vNotchFluting)) * berannSlopeFlank * detailFade;
-        finalLand = mix(finalLand, cInkTharp, canyonCouloirDepth * 0.85 * sim.u_mediumProperties.w);
+        finalLand = mix(finalLand, cInkTharp, canyonCouloirDepth * 0.25 * sim.u_mediumProperties.w);
 
         // Heinrich Berann stepped geological strata terraces and benches on canyon walls and plateau scarps
         let strataBench = (stepProfile - 0.5) * 0.45 * smoothstep(0.05, 0.35, landSlope) * detailFade;
@@ -2131,7 +3048,8 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
     } else if (sim.u_theme == 1u) {
         // --- THEME 1: CREAM RAG (Copperplate Intaglio on Cotton Rag) ---
         // 1. Dual-scale anisotropic cellulose fibers modulated by fiberDensity & u_roughness
-        let fiberFreq = 1800.0 * max(0.1, sim.u_mediumProperties.y);
+        let fiberZoomScale = clamp(3600.0 / max(pixelFootprintM, 60.0), 1.0, 48.0);
+        let fiberFreq = 1800.0 * max(0.1, sim.u_mediumProperties.y) * fiberZoomScale;
         let fiberCoord = input.uv * fiberFreq;
         var fiberTooth = 0.0;
         var fiberFleck = 0.5;
@@ -2307,6 +3225,46 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
         finalLand = clamp(finalLand - vec3<f32>(warmBleed, warmBleed * 0.5, 0.0), vec3<f32>(0.0), vec3<f32>(1.0));
     }
 
+    // Medium-Specific Chromatic Cloud Cast Glaze:
+    // Strictly gated on cloudCastWeight > 0.0001 so Clouds = OFF executes 0 changed ALU ops (MAD === 0.0000).
+    // Purely subtractive above each medium's archival ink floor so contour lines (#38302A / #2E241C / #0A1428)
+    // never fog or lift, while sunlit slopes shift cleanly to warm sepia-taupe (Themes 0/1) or cold Prussian blue (Theme 2).
+    let cloudCastWeight = clamp(1.0 - shadowFactor, 0.0, 1.0);
+    if (cloudCastWeight > 0.0001) {
+        let sunlitCatch = smoothstep(-0.02, 0.44, NdotL1) * (0.22 + 0.78 * terrainShadow);
+        if (sim.u_theme == 1u) {
+            let tauCast = cloudCastWeight * (0.30 + 0.70 * sunlitCatch);
+            let cInkFloor1 = vec3<f32>(0.22, 0.19, 0.16);
+            let headroom1 = max(vec3<f32>(0.0), finalLand - cInkFloor1);
+            let x1 = vec3<f32>(0.46, 0.66, 0.98) * (tauCast * 0.78);
+            let attenSepiaTaupe = 1.0 / (vec3<f32>(1.0) + x1 + 0.5 * x1 * x1);
+            var ragCast = cInkFloor1 + headroom1 * attenSepiaTaupe;
+            let coolExcess1 = max(0.0, ragCast.b - ragCast.g * 0.88) * tauCast;
+            ragCast = vec3<f32>(ragCast.r, ragCast.g - coolExcess1 * 0.12, ragCast.b - coolExcess1 * 0.72);
+            finalLand = clamp(min(finalLand, ragCast), vec3<f32>(0.0), vec3<f32>(1.0));
+        } else if (sim.u_theme == 2u) {
+            let tauCast = cloudCastWeight * (0.34 + 0.66 * sunlitCatch);
+            let cInkFloor2 = vec3<f32>(0.04, 0.08, 0.16);
+            let headroom2 = max(vec3<f32>(0.0), finalLand - cInkFloor2);
+            let x2 = vec3<f32>(1.12, 0.72, 0.38) * (tauCast * 0.82);
+            let attenPrussian = 1.0 / (vec3<f32>(1.0) + x2 + 0.5 * x2 * x2);
+            var cyanoCast = min(finalLand, cInkFloor2 + headroom2 * attenPrussian);
+            cyanoCast.g = max(cyanoCast.g, cyanoCast.r);
+            cyanoCast.b = max(cyanoCast.b, cyanoCast.g);
+            finalLand = clamp(cyanoCast, vec3<f32>(0.0), vec3<f32>(1.0));
+        } else {
+            let tauCast = cloudCastWeight * (0.30 + 0.70 * sunlitCatch);
+            let cInkFloor0 = vec3<f32>(0.18, 0.14, 0.11);
+            let headroom0 = max(vec3<f32>(0.0), finalLand - cInkFloor0);
+            let x0 = vec3<f32>(0.50, 0.70, 1.02) * (tauCast * 0.80);
+            let attenTharpTaupe = 1.0 / (vec3<f32>(1.0) + x0 + 0.5 * x0 * x0);
+            var tharpCast = cInkFloor0 + headroom0 * attenTharpTaupe;
+            let coolExcess0 = max(0.0, tharpCast.b - tharpCast.g * 0.86) * tauCast;
+            tharpCast = vec3<f32>(tharpCast.r, tharpCast.g - coolExcess0 * 0.12, tharpCast.b - coolExcess0 * 0.72);
+            finalLand = clamp(min(finalLand, tharpCast), vec3<f32>(0.0), vec3<f32>(1.0));
+        }
+    }
+
     // Multi-octave geomorphic micro-erosion relief pigmentation across volcanic shields, plateaus, and abyssal ridges
     let microErosionWave = clamp((accumGrad.x * L1_view.x + accumGrad.y * L1_view.y) * 1.40 + (couloirTotal * 0.35 + strataTotal * 0.25) * 0.28, -0.45, 0.45);
     let microPigmentShift = microErosionWave * zoomMicroGate * 0.56;
@@ -2314,6 +3272,18 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
     finalLand = clamp(finalLand * (1.0 + microPigmentShift) + microTint * (microPigmentShift * 0.32), vec3<f32>(0.0), vec3<f32>(1.0));
 
     // Continental crust uses archival matte paper ink absorption — zero computer-game specular glare
+    // Step 5.3 Grazing Vellum Fiber Sheen (uniform-gated to active Mode 0 harmonic unfurling: 0.00 ms at rest):
+    if (sim.u_mode == 0u && unfurlClamped > 0.002 && unfurlClamped < 0.998 && sim.u_cursorVel.w > 0.001) {
+        let motionSheenAmp = clamp(sim.u_cursorVel.w, 0.0, 1.0);
+        let vDirUnfurl = normalize(sim.u_cameraPos.xyz - input.worldPos);
+        let grazingTerm = clamp(1.0 - abs(dot(effectiveNormal, vDirUnfurl)), 0.0, 1.0);
+        let grazingPow = grazingTerm * grazingTerm * sqrt(grazingTerm);
+        let unfurlSheenBell = sin(unfurlClamped * 3.14159265);
+        let ragMachineGrain = 0.84 + 0.16 * cos(input.uv.x * 960.0 * max(0.25, cosLat));
+        let vellumSheenWeight = clamp(grazingPow * unfurlSheenBell * ragMachineGrain * motionSheenAmp * 0.26, 0.0, 0.22);
+        let cVellumSheen = select(vec3<f32>(0.992, 0.974, 0.934), vec3<f32>(0.880, 0.948, 1.000), sim.u_theme == 2u);
+        finalLand = mix(finalLand, max(finalLand, cVellumSheen), vellumSheenWeight);
+    }
 
     // ------------------------------------------------------------------------
     // STAGE 1 In-Shader Geomorphic Hydrology Drainage (Frontiers 3 & 4)
@@ -2327,7 +3297,7 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
         // 1. Upstream Drainage Catchment Area A & Leopold-Maddock Downstream Hydraulic Geometry
         // Purging Laplacian heuristic (kValley) and elevation proxy (1 - normElev)^1.6
         // Ingest 15 arc-sec MERIT Hydro upstream drainage area (UPA in km²) packed into log-scaled 16-bit texture
-        let normArea = textureSampleLevel(u_hydroTexture, u_demSampler, input.uv, 0.0).r;
+        let normArea = hydroSample.r;
         let A_max = 7000000.0;
         let A = exp(normArea * log(A_max + 1.0)) - 1.0; // km²
         let V_packed = normArea;
@@ -2350,11 +3320,14 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
         let deltaY = select(0.0, -clamp(gy / max(d2y, 1e-4), -0.75, 0.75), d2y > 1e-4);
 
         // Sub-texel offset from cell center [-0.5, +0.5]
+        // Evaluate static 8192x4096 hydrology raster (u_hydroTexture) and global drainage grid on tsGlobal so regional ts never subdivides 1 texel into a 32x32 dot grid
+        let tsHydro = tsGlobal;
         let uvGrid = input.uv / ts;
-        let fCell  = fract(uvGrid) - vec2<f32>(0.5);
+        let fCell  = fract(input.uv / tsHydro) - vec2<f32>(0.5);
 
         // Metric coordinate offset on globe manifold (accounting for spherical latitude convergence)
         var metricDistVec = (fCell - vec2<f32>(deltaX, deltaY)) * ts;
+        metricDistVec = (fCell - vec2<f32>(deltaX, deltaY)) * tsHydro;
         metricDistVec.x = metricDistVec.x * cosLat;
 
         let distUv = length(metricDistVec);
@@ -2393,8 +3366,13 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
         let dynamicWidthPx = mix(0.40, 1.98, dynamicDescentAccum) * leopoldWidthScale;
         riverWidthPx = select(riverWidthPx, clamp(dynamicWidthPx, 0.40, 1.98), activeQ > u_drainageBasin.u_minDischargeThreshold && drainageSample.g > 0.0001);
 
+        // Step 5.2 Strahler Upstream Headwater Tapering:
+        // Taper Order 1-2 alpine headwaters (A ~ 15..240 km²) to crisp ~0.30px hairlines while preserving 1.98px lowland mainstems
+        let strahlerHeadwaterRamp = smoothstep(15.0, 240.0, activeArea);
+        riverWidthPx = riverWidthPx * mix(0.74, 1.0, strahlerHeadwaterRamp);
+
         let riverHalfWidth = riverWidthPx * 0.5;
-        let riverFeather = 0.45;
+        let riverFeather = mix(0.32, 0.45, strahlerHeadwaterRamp);
 
         // Sub-pixel screen-space box feathering for resolution-invariant linework
         let channelCoverage = 1.0 - smoothstep(riverHalfWidth - riverFeather, riverHalfWidth + riverFeather, distPx);
@@ -2406,7 +3384,9 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
         let camDistHydro = mix(length(sim.u_cameraPos.xyz), 5.0 + abs(sim.u_cameraPos.z), clamp(sim.u_unfurl, 0.0, 1.0));
         let minAreaThreshold = select(15.0, select(250.0, 10000.0, camDistHydro > 16.0), camDistHydro > 8.0);
         let riverPresence = select(0.0, smoothstep(minAreaThreshold, minAreaThreshold * 3.0, activeArea), activeArea > minAreaThreshold);
-        let valleyGate = riverPresence;
+        // Smoothly hand off coarse 4.9km raster cell-center dots to continuous vector river ribbons at regional/close zoom
+        let rasterToVectorHandoff = smoothstep(5.8, 10.5, camDistHydro);
+        let valleyGate = riverPresence * rasterToVectorHandoff;
 
         // Cliff attenuation: in sheer vertical rock cliffs (>35°), water forms narrow chutes
         let cliffDampen = 1.0 - rockWeight * 0.35;
@@ -2474,7 +3454,8 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
         // with mid-ocean ridges, seamounts, and trenches in sculpted mineral slate.
         // ====================================================================
 
-            let normDepth = clamp(oceanDepth, 0.0, 1.0);
+            let geomOceanDepth = clamp((sim.u_seaLevel - input.elevation) / 10924.0, 0.0, 1.0);
+            let normDepth = clamp(max(oceanDepth, geomOceanDepth * 1.15), 0.0, 1.0);
             let bathyDepthM = normDepth * 10924.0;
             var cBathyShelf: vec3<f32>;
             var cBathySlope: vec3<f32>;
@@ -2492,11 +3473,12 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
             } else if (sim.u_theme == 1u) {
                 // Cream Cotton Rag: Eduard Imhof tiered watercolor shelves (inner celadon, outer shelf break, pelagic slope, marine indigo, hadal trench)
                 let cShorelineWash = vec3<f32>(0.68, 0.76, 0.72); // Delicate coastal estuarine wash
-                let cInnerBase = vec3<f32>(0.56, 0.68, 0.62); // Luminous shelf celadon #77998B
+                let cInnerBase = vec3<f32>(0.42, 0.60, 0.67); // Luminous shelf celadon-teal
                 let cInnerShelf = mix(cShorelineWash, cInnerBase, smoothstep(0.0002, 0.004, normDepth));
-                let cOuterShelf = vec3<f32>(0.42, 0.55, 0.56); // Mineral celadon-lapis wash
+                let cOuterShelf = vec3<f32>(0.35, 0.51, 0.59); // Mineral celadon-lapis wash
                 let shelfTier = smoothstep(0.004, 0.018, normDepth);
                 cBathyShelf  = mix(cInnerShelf, cOuterShelf, shelfTier);
+                cBathyShelf  = cBathyShelf * vec3<f32>(0.76, 0.90, 1.04);
                 cBathySlope  = vec3<f32>(0.32, 0.44, 0.52); // Continental slope mineral lapis wash
                 cBathyAbyss  = vec3<f32>(0.22, 0.32, 0.44); // Soft marine indigo #263B52
                 cBathyTrench = vec3<f32>(0.12, 0.17, 0.24); // Trench umber-indigo
@@ -2520,13 +3502,31 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
                 b1
             );
 
+            // 4-Zone Geomorphic Bathymetric Articulation:
+            // Zone 1-2 transition: Outer continental shelf break rim (110m - 260m)
+            let shelfBreakRim = smoothstep(85.0, 185.0, bathyDepthM) * (1.0 - smoothstep(185.0, 340.0, bathyDepthM));
+            let cShelfBreakRim = mix(cBathyShelf, cBathyRidge, 0.16);
+            cBathy = mix(cBathy, cShelfBreakRim, shelfBreakRim * 0.32);
+
+            // Zone 4 continuous hadal trench gradation (-5,200m to -10,924m) preventing abyssal-to-hadal plateau
+            let bHadal = smoothstep(0.476, 0.985, normDepth);
+            var cHadalDeep: vec3<f32>;
+            if (sim.u_theme == 2u) {
+                cHadalDeep = vec3<f32>(0.008, 0.022, 0.052);
+            } else if (sim.u_theme == 1u) {
+                cHadalDeep = vec3<f32>(0.045, 0.070, 0.115);
+            } else {
+                cHadalDeep = vec3<f32>(0.004, 0.008, 0.020);
+            }
+            cBathy = mix(cBathy, cHadalDeep, bHadal * 0.72);
+
             // Carbonate reef shelf glow (0 - 50m) in exposed bathymetric relief
             let reefShelfGlow = 1.0 - smoothstep(1.0, 50.0, bathyDepthM);
             var cReefTint: vec3<f32>;
             if (sim.u_theme == 2u) {
                 cReefTint = vec3<f32>(0.32, 0.52, 0.70); // Photochemical shoal glow
             } else if (sim.u_theme == 1u) {
-                cReefTint = vec3<f32>(0.72, 0.80, 0.74); // Aragonite shelf celadon
+                cReefTint = vec3<f32>(0.48, 0.69, 0.75); // Aragonite marine shoal celadon
             } else {
                 cReefTint = vec3<f32>(0.22, 0.62, 0.68); // Luminous atoll turquoise
             }
@@ -2655,7 +3655,8 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
                 cBathy = mix(cBathy, cTrenchInk, oceanRiftChasm * 0.70 * sim.u_mediumProperties.w);
             } else if (sim.u_theme == 1u) {
                 // Cream Rag: Subtractive paper tooth and ink absorption into cotton rag ground
-                let fiberFreq = 1800.0 * max(0.1, sim.u_mediumProperties.y);
+                let bFiberZoomScale = clamp(3600.0 / max(pixelFootprintM, 60.0), 1.0, 48.0);
+                let fiberFreq = 1800.0 * max(0.1, sim.u_mediumProperties.y) * bFiberZoomScale;
                 var bFiberTooth = 0.0;
                 if (sim.u_roughness > 0.0) {
                     bFiberTooth = (hashPaper2D(input.uv * fiberFreq) - 0.5) * (sim.u_roughness * 0.40);
@@ -2726,41 +3727,47 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
                 let directComp = cWarmDirect * max(0.0, sunDirect * 0.85 + ridgeEnhance * 0.8 * shadowFactor);
                 let shadowComp = bathyCoolShadow * (skyIndirect * creviceAO);
                 bathyIllum = mix(shadowComp, directComp, sunWeight);
+                let cBistreBathyShadow = vec3<f32>(0.353, 0.302, 0.255); // Warm bistre wash #5A4D41
+                let alphaShBathy = clamp((1.0 - shadowFactor) * 0.85, 0.0, 0.48);
+                bathyIllum = mix(bathyIllum, max(bathyIllum * 0.52, cBistreBathyShadow), alphaShBathy * 0.35);
             } else {
                 let cUmberBathy = vec3<f32>(0.22, 0.16, 0.12); // Berann hand-painted rich umber wash #2E241C
                 let bathyEffectiveAmbient = mix(cSkyAmbient, cUmberBathy, (1.0 - terrainShadow) * 0.75);
                 bathyIllum = cSunLight * max(0.0, sunDirect * 0.80 + ridgeEnhance * 0.8 * shadowFactor) + bathyEffectiveAmbient * (skyIndirect * creviceAO);
             }
-        bathyIllum = bathyIllum * (1.0 + microPigmentShift * 1.15);
         let shelfDepthMeters = normDepth * 10924.0;
+        let subaqueousShelfSoften = smoothstep(25.0, 240.0, shelfDepthMeters);
+        let bathyMicroGate = smoothstep(80.0, 600.0, shelfDepthMeters);
+        bathyIllum = mix(vec3<f32>(0.80, 0.87, 0.90), bathyIllum, mix(0.32, 1.0, subaqueousShelfSoften));
+        bathyIllum = bathyIllum * (1.0 + microPigmentShift * 1.15 * bathyMicroGate);
         let bathyRockGate = smoothstep(200.0, 1000.0, shelfDepthMeters);
         let cBathyComposite = mix(cBathy * bathyIllum, cRockShaded, rockWeight * 0.4 * bathyRockGate);
 
         let shoreCoverage = smoothstep(0.35, 0.65, isLand);
         finalCrust = mix(cBathyComposite, finalLand, shoreCoverage);
-    } else if (sim.u_renderStyle == 2u) {
-        // ====================================================================
-        // OPTION C: NASA BLUE MARBLE ORBITAL PHOTOREALISM & CELESTIAL TERMINATOR
-        // True-color orbital photography with dynamic celestial day/night blending,
-        // nocturnal anthropogenic city lights, and golden Rayleigh twilight rim.
-        // ====================================================================
-        let dayColor = textureSampleLevel(u_orbitalTextures, u_orbitalSampler, input.uv, 0, 0.0).rgb;
-        let nightColor = textureSampleLevel(u_orbitalTextures, u_orbitalSampler, input.uv, 1, 0.0).rgb;
+        let pelagicSlateTarget = mix(cBathy * bathyIllum * 1.12, finalLand, shoreCoverage);
+        finalCrust = mix(finalCrust, pelagicSlateTarget, (1.0 - shoreCoverage) * rockWeight * bathyRockGate * select(0.65, 0.0, sim.u_theme == 2u));
 
-        let sunDirWorld = computeSunLightDir(sim.u_sunAzimuth, sim.u_sunAltitude);
-        let cosSun = dot(normalize(input.worldPos), sunDirWorld);
-
-        let dayWeight = smoothstep(-0.08, 0.08, cosSun);
-        let nightWeight = 1.0 - dayWeight;
-
-        let directIllum = 0.10 + 0.90 * max(0.0, cosSun) * shadowFactor;
-        let dayLit = dayColor * (directIllum * mix(0.20, 1.0, terrainShadow));
-        let nightLit = nightColor * (nightWeight * 1.25);
-
-        let twilightBand = pow(1.0 - abs(cosSun) / 0.08, 2.0) * select(0.0, 1.0, abs(cosSun) < 0.08);
-        let twilightColor = vec3<f32>(1.0, 0.60, 0.28) * (twilightBand * 0.12);
-
-        finalCrust = dayLit * dayWeight + nightLit + twilightColor;
+        // Architectural XDR Solar Glint Luster (active strictly when [BETA] XDR Solar Glint is enabled; 0.0000 MAD in SDR)
+        if (sim.u_cameraPosLow.w > 0.5) {
+            let archWaterMask = clamp(max(1.0 - shoreCoverage, lakeFrac), 0.0, 1.0);
+            if (archWaterMask > 0.005) {
+                let L_world_arch = computeWorldSunLightDir(sim.u_sunAzimuth, sim.u_sunAltitude);
+                let H_arch = normalize(L_world_arch + V);
+                let N_arch_water = normalize(mix(n0, effectiveNormal, 0.24));
+                let fresnelArch = 0.0204 + 0.9796 * pow(1.0 - clamp(dot(N_arch_water, V), 0.0, 1.0), 4.5);
+                let archSparkle = 0.52 + 0.72 * hashPaper2D(vec2<f32>(input.uv.x * safeCosLat, input.uv.y) * 960.0);
+                let archSpecLobe = pow(max(0.0, dot(N_arch_water, H_arch)), 136.0) * archSparkle * (0.14 + 0.86 * fresnelArch) * 2.10;
+                let archGrazingSheen = fresnelArch * max(0.0, dot(N_arch_water, L_world_arch)) * 0.20;
+                let xdrArchScalar = (archSpecLobe + archGrazingSheen) * archWaterMask * mix(1.0, 0.35, unfurlClamped) * shadowFactor * terrainShadow * (1.0 - sim.u_roughness * 0.45);
+                let cArchXdrTint = select(
+                    select(vec3<f32>(1.05, 1.01, 0.94), vec3<f32>(1.04, 1.00, 0.92), sim.u_theme == 1u),
+                    vec3<f32>(0.86, 0.94, 1.04),
+                    sim.u_theme == 2u
+                );
+                finalCrust = finalCrust + cArchXdrTint * xdrArchScalar;
+            }
+        }
     } else {
         // ====================================================================
         // OPTION B: HYDROSPHERE & BATHYMETRIC DEPTH
@@ -2863,8 +3870,7 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
     // ========================================================================
     // MEDIUM-SPECIFIC ANALYTICAL CONTOURS & OCEANOGRAPHIC ISOBATHS
     // ========================================================================
-    if (sim.u_renderStyle != 2u && u_geomorphicMicro.u_contourActive > 0.01) {
-        let elevMeters = select(-oceanDepth * 10924.0, landElev * 8848.0, isLand > 0.45);
+    if (u_geomorphicMicro.u_contourActive > 0.01) {
         let camAltSphKm = max(0.05, (length(sim.u_cameraPos.xyz) - 5.0) * 1274.2);
         let camAltPlanKm = max(0.05, abs(sim.u_cameraPos.z) * 1274.2);
         let camAltKm = mix(camAltSphKm, camAltPlanKm, clamp(sim.u_unfurl, 0.0, 1.0));
@@ -2875,6 +3881,20 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
         let fragAltKm = max(0.05, select(rawFragDist, rawFragDist - 5.0, rawFragDist >= 5.0) * 1274.2);
         let tiltSafePlanKm = select(fragAltKm, min(planAltOffsetKm, fragAltKm), rawPlanZ >= rawFragDist * 0.5);
         let effCamAltKm = mix(camAltKm, tiltSafePlanKm, unfurlClamped);
+
+        // Screen-space footprint generalization: contours lock onto the hardware-mipmapped composite DEM
+        // (finalDemC/R/L/U/D) at all regional and close-inspection zooms (dUV.y <= 0.000035, i.e. < 700m/px)
+        // while smoothly matching synoptic isoline curvature when 1 screen pixel exceeds ~1.4 km (r >= 5.65).
+        let subPixelRatio = clamp(dUV.y / max(tsRegionalRaw.y, 1e-6), 0.35, 1.0);
+        let slippyNyquistBlend = (1.0 - singleRegWeightC) * max(smoothstep(0.62, 1.45, dUV.y / max(tsRegionalRaw.y, 1e-6)), smoothstep(140.0, 320.0, effCamAltKm));
+        let synopticContourBlend = max(smoothstep(0.000030, 0.000065, dUV.y), slippyNyquistBlend);
+        let fineSmoothC = 0.28 * finalDemC + 0.18 * (finalDemR + finalDemL + finalDemU + finalDemD);
+        let cDemC = mix(mix(finalDemC, fineSmoothC, subPixelRatio * 0.85), demC, synopticContourBlend);
+        let cDemR = mix(finalDemR, demR, synopticContourBlend);
+        let cDemL = mix(finalDemL, demL, synopticContourBlend);
+        let cDemU = mix(finalDemU, demU, synopticContourBlend);
+        let cDemD = mix(finalDemD, demD, synopticContourBlend);
+        let elevMeters = select(-cDemC.g * 10924.0, cDemC.r * 8848.0, isLand > 0.45);
 
         // 1-2-5 Decimal Series: 500m -> 200m -> 100m -> 50m -> 20m
         let deltaH = select(500.0,
@@ -2897,6 +3917,9 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
         // True screen-space DEM gradient derivatives via precomputed dUV
         // Eliminates the ~42x displacement normal blowout so anti-Moiré and hairlines render correctly
         let pxPerTexel = dUV / max(ts, vec2<f32>(1e-6));
+        // Both demR/L/U/D and finalDemR/L/U/D are sampled at uv +/- ts (lines 1928-1942),
+        // so cDem central/one-sided differences already span +/-ts regardless of synopticContourBlend.
+        let contourPxPerTexel = pxPerTexel;
         let dDemLandX = (finalDemR.r - finalDemL.r) * 0.5;
         let dDemLandY = (finalDemD.r - finalDemU.r) * 0.5;
         let dDemDepthX = (finalDemR.g - finalDemL.g) * 0.5;
@@ -2904,28 +3927,44 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
         let dDemGlobalX = (finalDemR.a - finalDemL.a) * 0.5;
         let dDemGlobalY = (finalDemD.a - finalDemU.a) * 0.5;
 
+        let cLandGradX = (cDemR.r - cDemL.r) * 0.5;
+        let cLandGradY = (cDemD.r - cDemU.r) * 0.5;
+        let cDepthGradX = (cDemR.g - cDemL.g) * 0.5;
+        let cDepthGradY = (cDemD.g - cDemU.g) * 0.5;
+        let cGlobalGradX = (cDemR.a - cDemL.a) * 0.5;
+        let cGlobalGradY = (cDemD.a - cDemU.a) * 0.5;
+
         // One-sided step floor prevents central-difference cancellation on ridge crests and canyon rims
-        let dLandStepX = max(abs(dDemLandX), max(abs(finalDemR.r - finalDemC.r), abs(finalDemC.r - finalDemL.r)));
-        let dLandStepY = max(abs(dDemLandY), max(abs(finalDemD.r - finalDemC.r), abs(finalDemC.r - finalDemU.r)));
-        let dDepthStepX = max(abs(dDemDepthX), max(abs(finalDemR.g - finalDemC.g), abs(finalDemC.g - finalDemL.g)));
-        let dDepthStepY = max(abs(dDemDepthY), max(abs(finalDemD.g - finalDemC.g), abs(finalDemC.g - finalDemU.g)));
-        let dGlobalStepX = max(abs(dDemGlobalX), max(abs(finalDemR.a - finalDemC.a), abs(finalDemC.a - finalDemL.a)));
-        let dGlobalStepY = max(abs(dDemGlobalY), max(abs(finalDemD.a - finalDemC.a), abs(finalDemC.a - finalDemU.a)));
+        let dLandStepX = max(abs(cLandGradX), max(abs(cDemR.r - cDemC.r), abs(cDemC.r - cDemL.r)));
+        let dLandStepY = max(abs(cLandGradY), max(abs(cDemD.r - cDemC.r), abs(cDemC.r - cDemU.r)));
+        let dDepthStepX = max(abs(cDepthGradX), max(abs(cDemR.g - cDemC.g), abs(cDemC.g - cDemL.g)));
+        let dDepthStepY = max(abs(cDepthGradY), max(abs(cDemD.g - cDemC.g), abs(cDemC.g - cDemU.g)));
+        let dGlobalStepX = max(abs(cGlobalGradX), max(abs(cDemR.a - cDemC.a), abs(cDemC.a - cDemL.a)));
+        let dGlobalStepY = max(abs(cGlobalGradY), max(abs(cDemD.a - cDemC.a), abs(cDemC.a - cDemU.a)));
 
         // Suppress the 0m sea-level datum contour (which duplicates vector coastlines and traces 0m SRTM estuary pixels)
         // while keeping all >=20m topographic contours and <=-20m bathymetric isobaths at 100% strength.
         let zeroDatumFade = smoothstep(3.0, 14.0, abs(elevMeters));
+        let lakeContourSuppress = 1.0 - smoothstep(0.15, 0.45, activeLakeCov);
+        let maxCloseMajorHalfW = mix(0.36, 0.44, smoothstep(900.0, 2800.0, effCamAltKm));
+
+        // Eduard Imhof supplementary lowland contours (Zwischenkurven: 1/5th interval = 10m at 50m base, 4m at 20m base)
+        let lowlandSubGate = (1.0 - smoothstep(90.0, 145.0, elevMeters)) * (1.0 - smoothstep(140.0, 260.0, effCamAltKm)) * smoothstep(3.0, 7.5, elevMeters);
+        let activeLowlandSubGate = max(lowlandSubGate, (1.0 - smoothstep(350.0, 750.0, elevMeters)) * (1.0 - smoothstep(600.0, 1400.0, effCamAltKm)) * smoothstep(2.5, 6.5, elevMeters));
+        let shallowSubBathyGate = (1.0 - smoothstep(140.0, 260.0, oceanDepth * 10924.0)) * (1.0 - smoothstep(600.0, 1400.0, effCamAltKm)) * smoothstep(4.5, 8.5, oceanDepth * 10924.0);
 
         if (sim.u_theme == 1u) {
             // --- THEME 1 (Cream Rag): Eduard Imhof Swiss Topographic Analytical Contours ---
             // Generates copperplate sepia contours on land, coordinating with Imhof rock hachures on vertical cliffs
             let shoreContourFade = smoothstep(0.35, 0.65, isLand);
+            let effShoreContourFade = shoreContourFade * lakeContourSuppress;
             if (shoreContourFade > 0.001 && landElev >= 0.0) {
                 let elevIndex = elevMeters / deltaH;
 
                 let dElevMetersPx = length(vec2<f32>(dDemLandX * pxPerTexel.x, dDemLandY * pxPerTexel.y)) * 8848.0;
-                let dElevMetersSafe = max(dElevMetersPx, length(vec2<f32>(dLandStepX * pxPerTexel.x, dLandStepY * pxPerTexel.y)) * 8848.0);
+                let dElevMetersSafe = length(vec2<f32>(dLandStepX * contourPxPerTexel.x, dLandStepY * contourPxPerTexel.y)) * 8848.0;
                 let dElevPx = dElevMetersSafe / deltaH;
+                let dElevGradPx = dElevMetersPx / deltaH;
                 let halfW = clamp(dElevPx * 1.35, 0.0006, 0.25);
                 let flatSlopeGate = smoothstep(0.00015, 0.00075, dElevPx);
 
@@ -2939,30 +3978,43 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
                 let distMinor = min(minorVal, 1.0 - minorVal);
                 let isMinor = (1.0 - smoothstep(0.0, effectiveHalfW, distMinor)) * flatSlopeGate;
 
+                // Supplementary lowland contours (every 1/5th interval on coastal moraines, dunes & river terraces)
+                let subIndex = elevIndex * 5.0;
+                let dSubElevPx = dElevPx * 5.0;
+                let subHalfW = clamp(dSubElevPx * 1.15 * (1.0 + contourToothWick * 0.6), 0.0006, 0.20);
+                let distSub = min(fract(subIndex), 1.0 - fract(subIndex));
+                let isSubContour = (1.0 - smoothstep(0.0, subHalfW, distSub)) * smoothstep(0.0008, 0.0045, dSubElevPx) * (1.0 - smoothstep(0.32, 0.72, dSubElevPx)) * activeLowlandSubGate;
+
                 // Major index contours (every 5th interval)
                 let majorIndex = elevIndex * 0.20;
                 let majorVal = fract(majorIndex);
                 let distMajor = min(majorVal, 1.0 - majorVal) * 5.0;
                 let majorHalfW = clamp(max(effectiveHalfW * 1.8, dElevPx * 1.55), 0.001, 1.25);
+                let activeMajorHalfW = min(majorHalfW, maxCloseMajorHalfW);
                 let isMajor = (1.0 - smoothstep(0.0, majorHalfW, distMajor)) * flatSlopeGate;
+                let closeMajorShape = (1.0 - smoothstep(0.0, activeMajorHalfW, distMajor)) / max(1.0 - smoothstep(0.0, majorHalfW, distMajor), 1e-4);
 
                 // Slope coordination: contours remain crisp across hills, mountains, and canyon walls,
                 // softening slightly as near-vertical cliffs (>55°) transition to Imhof rock hachures
                 let hachureFade = 1.0 - smoothstep(0.70, 0.98, slopeAngle);
                 let slopeContourWeight = mix(0.78, 1.0, hachureFade);
 
-                // Anti-Moiré suppression at orbital distance when lines crowd into sub-pixel clusters
+                // Anti-Moiré suppression at orbital distance and steep sub-pixel dune/ridge slopes
                 let moireGuard = 1.0 - smoothstep(0.38, 0.88, dElevPx);
                 let moireGuardMajor = 1.0 - smoothstep(0.38, 0.88, dElevPx * 0.20);
+                let effMoireGuard = moireGuard;
+                let effMoireGuardMajor = moireGuardMajor * closeMajorShape;
 
                 let cCopperplateSepia = vec3<f32>(0.22, 0.19, 0.16); // Archival sepia-charcoal ink #38302A
-                let contourAlpha = (isMinor * 0.55 * moireGuard + isMajor * 0.82 * moireGuardMajor) * slopeContourWeight * shoreContourFade * zeroDatumFade * orbitalContourFade;
-                let macroAlpha = (isMinor * 0.48 * moireGuard * regionalContourFade + isMajor * 0.86 * moireGuardMajor * macroContourFade) * slopeContourWeight * shoreContourFade * zeroDatumFade;
-                let activeContourAlpha = max(contourAlpha, macroAlpha);
+                let contourFloor = cCopperplateSepia * clamp(finalCrust / vec3<f32>(0.85, 0.82, 0.76), vec3<f32>(0.55), vec3<f32>(1.0));
+                let contourAlpha = (isMinor * 0.55 * effMoireGuard + isMajor * 0.82 * effMoireGuardMajor) * slopeContourWeight * effShoreContourFade * zeroDatumFade * orbitalContourFade;
+                let macroAlpha = (isMinor * 0.52 * effMoireGuard * regionalContourFade + isMajor * 0.82 * effMoireGuardMajor * macroContourFade) * slopeContourWeight * effShoreContourFade * zeroDatumFade;
+                let subAlpha = isSubContour * 0.36 * slopeContourWeight * effShoreContourFade;
+                let activeContourAlpha = max(max(contourAlpha, macroAlpha), subAlpha);
                 let kContourSepia = vec3<f32>(1.45, 1.72, 2.15);
                 let contourAbsorbed = finalCrust * exp(-kContourSepia * (activeContourAlpha * (1.8 + contourToothWick * 0.5)));
                 finalCrust = mix(finalCrust, contourAbsorbed, clamp(activeContourAlpha * 1.15, 0.0, 0.86));
-                finalCrust = mix(finalCrust, min(finalCrust * 0.64, cCopperplateSepia), clamp(activeContourAlpha * 0.72, 0.0, 0.84));
+                finalCrust = max(finalCrust, contourFloor);
             }
             if (isLand <= 0.45) {
                 let shoreIsobathFade = 1.0 - smoothstep(0.35, 0.65, isLand);
@@ -2975,14 +4027,19 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
                 let dynIsobathFreq = depthMeters / deltaH;
                 let distDynIsobath = min(fract(dynIsobathFreq), 1.0 - fract(dynIsobathFreq));
                 let isDynIsobath = (1.0 - smoothstep(0.0, dynHalfW, distDynIsobath)) * flatDepthGate;
+                let subBathyFreq = dynIsobathFreq * 5.0;
+                let dSubDepthPx = dDynDepthPx * 5.0;
+                let subBathyHalfW = clamp(dSubDepthPx * 1.10, 0.0005, 0.18);
+                let distSubIsobath = min(fract(subBathyFreq), 1.0 - fract(subBathyFreq));
+                let isSubIsobath = (1.0 - smoothstep(0.0, subBathyHalfW, distSubIsobath)) * smoothstep(0.0008, 0.0045, dSubDepthPx) * (1.0 - smoothstep(0.32, 0.72, dSubDepthPx)) * shallowSubBathyGate;
                 let majorIsobathIndex = dynIsobathFreq * 0.20;
                 let distMajorIsobath = min(fract(majorIsobathIndex), 1.0 - fract(majorIsobathIndex)) * 5.0;
                 let majorBathyHalfW = clamp(max(dynHalfW * 1.8, dDynDepthPx * 1.50), 0.001, 1.25);
-                let isMajorIsobath = (1.0 - smoothstep(0.0, majorBathyHalfW, distMajorIsobath)) * flatDepthGate;
+                let isMajorIsobath = (1.0 - smoothstep(0.0, min(majorBathyHalfW, maxCloseMajorHalfW), distMajorIsobath)) * flatDepthGate;
                 let moireGuardOcean = 1.0 - smoothstep(0.38, 0.88, dDynDepthPx);
                 let moireGuardOceanMajor = 1.0 - smoothstep(0.45, 1.15, dDynDepthPx * 0.20);
                 let cCopperplateSepiaBathy = vec3<f32>(0.22, 0.19, 0.16);
-                let bathyAlpha = (isDynIsobath * 0.44 * moireGuardOcean * regionalContourFade + isMajorIsobath * 0.74 * moireGuardOceanMajor * macroContourFade) * shoreIsobathFade * zeroDatumFade;
+                let bathyAlpha = max((isDynIsobath * 0.48 * moireGuardOcean * regionalContourFade + isMajorIsobath * 0.76 * moireGuardOceanMajor * macroContourFade) * zeroDatumFade, isSubIsobath * 0.32) * shoreIsobathFade;
                 finalCrust = mix(finalCrust, cCopperplateSepiaBathy, clamp(bathyAlpha, 0.0, 0.78));
             }
         } else if (sim.u_theme == 2u) {
@@ -2991,46 +4048,63 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
             let cyanoIndex = elevMeters / deltaH;
             let dCyanoMetersPx = select(
                 length(vec2<f32>(dDepthStepX * pxPerTexel.x, dDepthStepY * pxPerTexel.y)) * 10924.0,
-                length(vec2<f32>(dLandStepX * pxPerTexel.x, dLandStepY * pxPerTexel.y)) * 8848.0,
+                length(vec2<f32>(dLandStepX * contourPxPerTexel.x, dLandStepY * contourPxPerTexel.y)) * 8848.0,
                 isLand > 0.45
             );
+            let dCyanoGradPx = select(
+                length(vec2<f32>(cDepthGradX * pxPerTexel.x, cDepthGradY * pxPerTexel.y)) * 10924.0,
+                length(vec2<f32>(cLandGradX * contourPxPerTexel.x, cLandGradY * contourPxPerTexel.y)) * 8848.0,
+                isLand > 0.45
+            ) / deltaH;
             let dElevPx = dCyanoMetersPx / deltaH;
-            let halfW = clamp(dElevPx * 1.05, 0.0005, 0.20);
+            let halfW = clamp(dElevPx * 1.15, 0.0005, 0.22);
             let flatSlopeGate = smoothstep(0.00015, 0.00075, dElevPx);
 
             let contourVal = fract(cyanoIndex);
             let distToLine = min(contourVal, 1.0 - contourVal);
             let isContour = (1.0 - smoothstep(0.0, halfW, distToLine)) * flatSlopeGate;
 
+            let subCyanoIndex = cyanoIndex * 5.0;
+            let dSubCyanoPx = dElevPx * 5.0;
+            let subCyanoHalfW = clamp(dSubCyanoPx * 1.05, 0.0005, 0.18);
+            let distSubCyano = min(fract(subCyanoIndex), 1.0 - fract(subCyanoIndex));
+            let isSubCyano = (1.0 - smoothstep(0.0, subCyanoHalfW, distSubCyano)) * smoothstep(0.0008, 0.0045, dSubCyanoPx) * (1.0 - smoothstep(0.32, 0.72, dSubCyanoPx)) * select(shallowSubBathyGate, activeLowlandSubGate, isLand > 0.45);
+
             let majorIndex = cyanoIndex * 0.20;
             let distMajor = min(fract(majorIndex), 1.0 - fract(majorIndex)) * 5.0;
             let majorHalfW = clamp(max(halfW * 1.75, dElevPx * 1.50), 0.001, 1.25);
+            let activeMajorHalfW = min(majorHalfW, maxCloseMajorHalfW);
             let isMajor = (1.0 - smoothstep(0.0, majorHalfW, distMajor)) * flatSlopeGate;
+            let closeMajorShape = (1.0 - smoothstep(0.0, activeMajorHalfW, distMajor)) / max(1.0 - smoothstep(0.0, majorHalfW, distMajor), 1e-4);
 
             let moireGuard = 1.0 - smoothstep(0.38, 0.88, dElevPx);
-            let moireGuardMajor = 1.0 - smoothstep(0.45, 1.15, dElevPx * 0.20);
+            let moireGuardMajor = 1.0 - smoothstep(0.38, 0.88, dElevPx * 0.20);
+            let effMoireGuardMajor = moireGuardMajor * closeMajorShape;
             let cyanoHachureFade = 1.0 - smoothstep(0.70, 0.98, slopeAngle);
-            let cyanoShoreFade = smoothstep(0.04, 0.16, abs(isLand - 0.50)) * zeroDatumFade;
+            let cyanoShoreFade = smoothstep(0.04, 0.16, abs(isLand - 0.50)) * zeroDatumFade * select(1.0, lakeContourSuppress, isLand > 0.45);
             let cyanoSlopeWeight = mix(0.78, 1.0, cyanoHachureFade) * cyanoShoreFade;
 
             // Two-tone ferroprussiate blueprint hierarchy:
             // Minor contours sit quietly as intermediate cerulean exposure lines (#5285B8);
             // Major 5th index contours use crisp chalk ruling-pen (#E8EDF2), inverting to Prussian indigo on bleached ridges
             let cyanoSubstrateLuma = dot(finalCrust, vec3<f32>(0.299, 0.587, 0.114));
-            let ridgeBleachGate = smoothstep(0.52, 0.80, cyanoSubstrateLuma);
-            let cCyanoMinor = mix(vec3<f32>(0.30, 0.50, 0.70), vec3<f32>(0.08, 0.16, 0.28), ridgeBleachGate);
+            let ridgeBleachGate = smoothstep(0.62, 0.86, cyanoSubstrateLuma) * 0.65;
+            let cCyanoMinor = mix(vec3<f32>(0.30, 0.50, 0.70), vec3<f32>(0.10, 0.22, 0.38), ridgeBleachGate);
             let cChalkContour = vec3<f32>(0.91, 0.93, 0.96); // Chalk Ruling Pen Linework #E8EDF2
-            let cMajorAdaptive = mix(cChalkContour, vec3<f32>(0.06, 0.12, 0.22), ridgeBleachGate);
-            let cActiveCyanoStroke = mix(cCyanoMinor, cMajorAdaptive, clamp(isMajor * 1.25, 0.0, 1.0));
-            let cyanoAlpha = (isContour * 0.34 * moireGuard + isMajor * 0.68 * moireGuardMajor) * cyanoSlopeWeight * orbitalContourFade;
-            let cyanoMacro = (isContour * 0.34 * moireGuard * regionalContourFade + isMajor * 0.72 * moireGuardMajor * macroContourFade) * cyanoSlopeWeight;
-            finalCrust = mix(finalCrust, cActiveCyanoStroke, clamp(max(cyanoAlpha, cyanoMacro), 0.0, 0.82));
+            let cMajorAdaptive = mix(cChalkContour, vec3<f32>(0.09, 0.20, 0.35), ridgeBleachGate);
+            let cActiveCyanoStroke = mix(cCyanoMinor, cMajorAdaptive, clamp(isMajor * closeMajorShape * 1.25, 0.0, 1.0));
+            let cyanoAlpha = (isContour * 0.38 * moireGuard + isMajor * 0.72 * effMoireGuardMajor) * cyanoSlopeWeight * orbitalContourFade;
+            let cyanoMacro = (isContour * 0.38 * moireGuard * regionalContourFade + isMajor * 0.74 * effMoireGuardMajor * macroContourFade) * cyanoSlopeWeight;
+            let cyanoSubAlpha = isSubCyano * 0.30 * mix(0.78, 1.0, cyanoHachureFade) * cyanoShoreFade;
+            finalCrust = mix(finalCrust, cActiveCyanoStroke, clamp(max(max(cyanoAlpha, cyanoMacro), cyanoSubAlpha), 0.0, 0.82));
         } else if (sim.u_theme == 0u) {
             // --- THEME 0 (Marie Tharp): Physiographic Land Contours & Oceanographic Isobaths ---
             let shoreContourFade = smoothstep(0.35, 0.65, isLand);
+            let effShoreContourFade = shoreContourFade * lakeContourSuppress;
             if (shoreContourFade > 0.001 && landElev >= 0.0) {
                 let elevIndex = elevMeters / deltaH;
-                let dElevMetersSafe = length(vec2<f32>(dLandStepX * pxPerTexel.x, dLandStepY * pxPerTexel.y)) * 8848.0;
+                let dElevMetersSafe = length(vec2<f32>(dLandStepX * contourPxPerTexel.x, dLandStepY * contourPxPerTexel.y)) * 8848.0;
+                let dElevGradPx = (length(vec2<f32>(cLandGradX * contourPxPerTexel.x, cLandGradY * contourPxPerTexel.y)) * 8848.0) / deltaH;
                 let dElevPx = dElevMetersSafe / deltaH;
                 let halfW = clamp(dElevPx * 1.35, 0.0006, 0.25);
                 let flatSlopeGate = smoothstep(0.00015, 0.00075, dElevPx);
@@ -3039,23 +4113,30 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
                 let distMinor = min(minorVal, 1.0 - minorVal);
                 let isMinor = (1.0 - smoothstep(0.0, halfW, distMinor)) * flatSlopeGate;
 
+                let subTharpIndex = elevIndex * 5.0;
+                let dSubTharpPx = dElevPx * 5.0;
+                let subTharpHalfW = clamp(dSubTharpPx * 1.10, 0.0006, 0.18);
+                let distSubTharp = min(fract(subTharpIndex), 1.0 - fract(subTharpIndex));
+                let isSubTharp = (1.0 - smoothstep(0.0, subTharpHalfW, distSubTharp)) * smoothstep(0.0008, 0.0045, dSubTharpPx) * (1.0 - smoothstep(0.32, 0.72, dSubTharpPx)) * activeLowlandSubGate;
+
                 let majorIndex = elevIndex * 0.20;
                 let distMajor = min(fract(majorIndex), 1.0 - fract(majorIndex)) * 5.0;
                 let majorHalfW = clamp(max(halfW * 1.8, dElevPx * 1.55), 0.001, 1.25);
+                let activeMajorHalfW = min(majorHalfW, maxCloseMajorHalfW);
                 let isMajor = (1.0 - smoothstep(0.0, majorHalfW, distMajor)) * flatSlopeGate;
+                let closeMajorShape = (1.0 - smoothstep(0.0, activeMajorHalfW, distMajor)) / max(1.0 - smoothstep(0.0, majorHalfW, distMajor), 1e-4);
 
                 let moireGuard = 1.0 - smoothstep(0.38, 0.88, dElevPx);
-                let moireGuardMajor = 1.0 - smoothstep(0.45, 1.15, dElevPx * 0.20);
+                let moireGuardMajor = 1.0 - smoothstep(0.38, 0.88, dElevPx * 0.20);
+                let effMoireGuardMajor = moireGuardMajor * closeMajorShape;
                 let tharpHachureFade = 1.0 - smoothstep(0.70, 0.98, slopeAngle);
                 let tharpSlopeWeight = mix(0.78, 1.0, tharpHachureFade);
 
                 // Subtractive Kubelka-Munk bone-sepia ink absorbed into cold-press illustration board
-                let cTharpLandContour = vec3<f32>(0.16, 0.11, 0.08);
-                let tharpLandAlpha = (isMinor * 0.50 * moireGuard * regionalContourFade + isMajor * 0.82 * moireGuardMajor * macroContourFade) * tharpSlopeWeight * shoreContourFade * zeroDatumFade;
-                let kTharpContour = vec3<f32>(1.55, 1.75, 2.10);
-                let tharpContourAbsorbed = finalCrust * exp(-kTharpContour * (tharpLandAlpha * 1.70));
-                finalCrust = mix(finalCrust, tharpContourAbsorbed, clamp(tharpLandAlpha * 1.15, 0.0, 0.86));
-                finalCrust = mix(finalCrust, min(finalCrust * 0.64, cTharpLandContour), clamp(tharpLandAlpha * 0.72, 0.0, 0.84));
+                let cTharpLandContour = vec3<f32>(0.20, 0.15, 0.11);
+                let baseTharpLandAlpha = (isMinor * 0.50 * moireGuard * regionalContourFade + isMajor * 0.78 * effMoireGuardMajor * macroContourFade) * tharpSlopeWeight * effShoreContourFade * zeroDatumFade;
+                let tharpLandAlpha = max(baseTharpLandAlpha, isSubTharp * 0.34 * tharpSlopeWeight * effShoreContourFade);
+                finalCrust = mix(finalCrust, min(finalCrust * 0.65, cTharpLandContour), clamp(tharpLandAlpha * 0.78, 0.0, 0.85));
             }
             if (isLand <= 0.45) {
                 let shoreIsobathFade = 1.0 - smoothstep(0.35, 0.65, isLand);
@@ -3078,6 +4159,12 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
                 let distDynIsobath = min(fract(dynIsobathFreq), 1.0 - fract(dynIsobathFreq));
                 let isDynIsobath = (1.0 - smoothstep(0.0, dynHalfW, distDynIsobath)) * flatDepthGate;
 
+                let subTharpBathyFreq = depthMeters / (deltaH * 0.20);
+                let dSubTharpBathyPx = dDepthMetersPx / (deltaH * 0.20);
+                let subTharpBathyHalfW = clamp(dSubTharpBathyPx * 0.95, 0.0004, 0.18);
+                let distSubTharpBathy = min(fract(subTharpBathyFreq), 1.0 - fract(subTharpBathyFreq));
+                let isSubTharpBathy = (1.0 - smoothstep(0.0, subTharpBathyHalfW, distSubTharpBathy)) * smoothstep(0.00015, 0.00075, dSubTharpBathyPx) * (1.0 - smoothstep(0.28, 0.68, dSubTharpBathyPx)) * shallowSubBathyGate;
+
                 // Major 1000m oceanographic isobath (bolded 1.6x width, major index)
                 let dMajorDepthPx = dDepthMetersPx / 1000.0;
                 let majorHalfW = clamp(dMajorDepthPx * 0.95, 0.0004, 0.22) * 1.6;
@@ -3093,7 +4180,7 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
                 let flatShelfGate = smoothstep(0.00015, 0.00075, dShelfDepthPx);
                 let shelfIsobathVal = fract(depthMeters / 200.0);
                 let distToShelfIsobath = min(shelfIsobathVal, 1.0 - shelfIsobathVal);
-                let isShelfIsobath = (1.0 - smoothstep(0.0, shelfHalfW, distToShelfIsobath)) * smoothstep(600.0, 100.0, depthMeters) * flatShelfGate;
+                let isShelfIsobath = (1.0 - smoothstep(0.0, shelfHalfW, distToShelfIsobath)) * (1.0 - smoothstep(100.0, 600.0, depthMeters)) * flatShelfGate;
 
                 let moireGuard = 1.0 - smoothstep(0.35, 0.85, dDynDepthPx);
                 let moireGuardMajor = 1.0 - smoothstep(0.45, 1.15, dMajorDepthPx * 0.20);
@@ -3102,8 +4189,8 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
                 let cMarineTurquoise = vec3<f32>(0.22, 0.62, 0.70); // Marine turquoise drafting ink #389EB3
                 let netIsobath = (max(isDynIsobath * 0.42 * moireGuard + isIsobath * 0.62 * moireGuardMajor, isShelfIsobath * 0.75)) * bathySlopeWeight;
                 finalCrust = mix(finalCrust, cMarineTurquoise, netIsobath * 0.55 * shoreIsobathFade * zeroDatumFade * orbitalContourFade);
-                let netMacroIsobath = max(isDynIsobath * 0.38 * moireGuard * regionalContourFade + isIsobath * 0.68 * moireGuardMajor * macroContourFade, isShelfIsobath * 0.78 * macroContourFade) * bathySlopeWeight;
-                finalCrust = mix(finalCrust, cMarineTurquoise, netMacroIsobath * 0.58 * shoreIsobathFade * zeroDatumFade);
+                let netMacroIsobath = max(max(isDynIsobath * 0.38 * moireGuard * regionalContourFade + isIsobath * 0.68 * moireGuardMajor * macroContourFade, isShelfIsobath * 0.78 * macroContourFade) * zeroDatumFade, isSubTharpBathy * 0.45) * bathySlopeWeight;
+                finalCrust = mix(finalCrust, cMarineTurquoise, netMacroIsobath * 0.58 * shoreIsobathFade);
             }
         }
     }
@@ -3117,6 +4204,54 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
     }
 
     // ========================================================================
+    // HIGH-RESOLUTION COMPOSITE DEM SHORELINE INK HANDOFF
+    // Exact partition-of-unity handoff with vector_ribbon.wgsl across Regional COGs
+    // and AWS Terrarium slippy tiles, independent of u_contourActive and gated by
+    // u_regionalOverlay.u_pad4 (hideVectors / purity gate).
+    // ========================================================================
+    if (u_regionalOverlay.u_pad4 == 0u && rawRegWeightC > 0.02) {
+        let pxPerTexelShore = dUV / max(ts, vec2<f32>(1e-6));
+        let dShoreX = max(abs(finalDemR.b - finalDemL.b) * 0.5, max(abs(finalDemR.b - finalDemC.b), abs(finalDemC.b - finalDemL.b)));
+        let dShoreY = max(abs(finalDemD.b - finalDemU.b) * 0.5, max(abs(finalDemD.b - finalDemC.b), abs(finalDemC.b - finalDemU.b)));
+        let dShorePx = length(vec2<f32>(dShoreX * pxPerTexelShore.x, dShoreY * pxPerTexelShore.y));
+        let estDpr = clamp(sim.u_viewport.y / 960.0, 1.0, 2.0);
+        let camDistShore = mix(length(sim.u_cameraPos.xyz), 5.0 + abs(sim.u_cameraPos.z - 5.0), clamp(sim.u_unfurl, 0.0, 1.0));
+        let closeZoomShoreT = clamp((camDistShore - 5.2) / (8.0 - 5.2), 0.0, 1.0);
+        let geomHalfShorePhys = mix(0.375, 0.65, closeZoomShoreT) * estDpr;
+        let shoreStrokeHalfW = clamp(dShorePx * (geomHalfShorePhys + 1.05), 0.0005, 0.46);
+        let shoreDatumB = select(isLand, aaLandB, abs(sim.u_seaLevel) > 0.01);
+        let distShoreLine = abs(shoreDatumB - 0.50);
+        if (distShoreLine < shoreStrokeHalfW && dShorePx > 0.002) {
+            let shoreStepUv = vec2<f32>(0.085 / 360.0, 0.085 / 180.0);
+            let shoreDiagUv = vec2<f32>(0.060 / 360.0, 0.060 / 180.0);
+            let gB_E = textureSampleLevel(u_demTexture, u_demSampler, vec2<f32>(fract(input.uv.x + shoreStepUv.x), input.uv.y), 0.0).r;
+            let gB_W = textureSampleLevel(u_demTexture, u_demSampler, vec2<f32>(fract(input.uv.x - shoreStepUv.x + 1.0), input.uv.y), 0.0).r;
+            let gB_N = textureSampleLevel(u_demTexture, u_demSampler, vec2<f32>(input.uv.x, clamp(input.uv.y - shoreStepUv.y, 0.0, 1.0)), 0.0).r;
+            let gB_S = textureSampleLevel(u_demTexture, u_demSampler, vec2<f32>(input.uv.x, clamp(input.uv.y + shoreStepUv.y, 0.0, 1.0)), 0.0).r;
+            let gB_NE = textureSampleLevel(u_demTexture, u_demSampler, vec2<f32>(fract(input.uv.x + shoreDiagUv.x), clamp(input.uv.y - shoreDiagUv.y, 0.0, 1.0)), 0.0).r;
+            let gB_NW = textureSampleLevel(u_demTexture, u_demSampler, vec2<f32>(fract(input.uv.x - shoreDiagUv.x + 1.0), clamp(input.uv.y - shoreDiagUv.y, 0.0, 1.0)), 0.0).r;
+            let gB_SE = textureSampleLevel(u_demTexture, u_demSampler, vec2<f32>(fract(input.uv.x + shoreDiagUv.x), clamp(input.uv.y + shoreDiagUv.y, 0.0, 1.0)), 0.0).r;
+            let gB_SW = textureSampleLevel(u_demTexture, u_demSampler, vec2<f32>(fract(input.uv.x - shoreDiagUv.x + 1.0), clamp(input.uv.y + shoreDiagUv.y, 0.0, 1.0)), 0.0).r;
+            let minGlobalShoreB = min(demC.b, min(min(min(gB_E, gB_W), min(gB_N, gB_S)), min(min(gB_NE, gB_NW), min(gB_SE, gB_SW))));
+            let inlandLakeShoreMask = max(smoothstep(0.56, 0.64, minGlobalShoreB), smoothstep(0.08, 0.30, lakeFrac));
+            let shoreSphereFactor = 1.0 - smoothstep(0.0, 0.35, sim.u_unfurl);
+            let shoreFacing = mix(1.0, smoothstep(0.02, 0.20, clamp(dot(n0, V), 0.0, 1.0)), shoreSphereFactor);
+            let closeShoreGate = smoothstep(0.02, 0.25, rawRegWeightC) * (1.0 - inlandLakeShoreMask) * shoreFacing;
+            let isHighResShoreStroke = (1.0 - smoothstep(0.0, shoreStrokeHalfW, distShoreLine)) * smoothstep(0.002, 0.015, dShorePx) * closeShoreGate;
+            let shorePenCoverage = clamp((1.0 - smoothstep(0.0, shoreStrokeHalfW, distShoreLine)) * 1.45, 0.0, 1.0) * smoothstep(0.002, 0.015, dShorePx) * closeShoreGate;
+            if (isHighResShoreStroke > 0.001) {
+                let cShoreInk = select(
+                    select(vec3<f32>(0.15, 0.12, 0.10), vec3<f32>(0.91, 0.93, 0.95), sim.u_theme == 2u),
+                    vec3<f32>(0.94, 0.92, 0.88),
+                    sim.u_theme == 0u
+                );
+                let nominalShoreAlpha = select(select(0.88, 0.96, sim.u_theme == 2u), 0.80, sim.u_theme == 0u);
+                finalCrust = mix(finalCrust, cShoreInk, clamp(shorePenCoverage * nominalShoreAlpha, 0.0, 0.96));
+            }
+        }
+    }
+
+    // ========================================================================
     // STAGE 3: Archival Ink Pigmentation & Weather Overlays
     // ========================================================================
     let windHorizLen = length(windForAdvection.xy);
@@ -3124,7 +4259,15 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
     let terrainUpSlope2D = vec2<f32>((hR - hL) * 0.5, (hU - hD) * 0.5) / max(ts.y, 1e-6);
     let upslopeDot = dot(windDir2D, terrainUpSlope2D);
     let orographicMod = clamp(1.0 + upslopeDot * 0.35 * regWeightC, 0.45, 2.20);
-    let effectivePrecipRate = precipRate * orographicMod * select(4.5, 1.6, sim.u_weatherOpticalMode == 1u);
+    let coupledPrecipBase = activePrecipMmHr;
+    let effectivePrecipRate = coupledPrecipBase * orographicMod * 1.6;
+
+    if (sim.u_theme == 1u && elevMeters > 15.0) {
+        let windwardWet = clamp(upslopeDot * 0.25 + cloudPrecipProxy * 0.45, 0.0, 1.0) * smoothstep(50.0, 1200.0, elevMeters);
+        let leewardDry = clamp(-upslopeDot * 0.28 + (1.0 - lowCov) * 0.35, 0.0, 1.0) * smoothstep(200.0, 1800.0, elevMeters);
+        finalCrust = mix(finalCrust, finalCrust * vec3<f32>(0.93, 0.95, 0.90), windwardWet * 0.22);
+        finalCrust = mix(finalCrust, mix(finalCrust, vec3<f32>(0.91, 0.86, 0.78), 0.35), leewardDry * 0.18);
+    }
 
     var weatherOverlay = vec4<f32>(0.0);
     if (sim._padScrub1 > 3.5) {
@@ -3133,15 +4276,8 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
         weatherOverlay = sample_z500_overlay(tempC, dewpointC, dTempPx, windForAdvection.xy, input.uv, dUV, sim.u_theme);
     } else if (sim._padScrub1 > 1.5) {
         weatherOverlay = sample_temperature_overlay(tempC, dTempPx, sim.u_theme);
-    } else if (sim.u_weatherOpticalMode == 1u) {
-        weatherOverlay = sample_spectral_doppler(effectivePrecipRate);
     } else {
-        weatherOverlay = apply_weather_pigmentation(
-            effectivePrecipRate,
-            sim.u_theme,
-            sim.u_mediumProperties,
-            vec4<f32>(finalCrust, 1.0)
-        );
+        weatherOverlay = sample_spectral_doppler(effectivePrecipRate, sim.u_theme);
     }
 
     finalCrust = mix(finalCrust, weatherOverlay.rgb, weatherOverlay.a);

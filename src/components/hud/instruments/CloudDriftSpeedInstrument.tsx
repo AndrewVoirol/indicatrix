@@ -14,6 +14,7 @@ export interface CloudDriftSpeedInstrumentProps {
   isLight?: boolean;
   onChange?: (speed: number) => void;
   onCloudDriftSpeedChange?: (speed: number) => void;
+  isActive?: boolean;
   className?: string;
 }
 
@@ -23,6 +24,7 @@ export const CloudDriftSpeedInstrument: React.FC<CloudDriftSpeedInstrumentProps>
   isLight = false,
   onChange,
   onCloudDriftSpeedChange,
+  isActive = true,
   className = '',
 }) => {
   const [internalSpeed, setInternalSpeed] = useState<number>(500);
@@ -182,6 +184,7 @@ export const CloudDriftSpeedInstrument: React.FC<CloudDriftSpeedInstrumentProps>
         title="Drag chronometric reticle horizontally to adjust drift speed (0–2000×) • Double-click to reset (500×) • Arrow keys / Shift to step"
         className={`relative w-full h-20 rounded-[2px] overflow-hidden cursor-ew-resize select-none touch-none shadow-inner transition-all duration-200 hover:shadow-[0_0_12px_var(--theme-focus-ring)] hover:border-[var(--theme-card-border-hover)] focus-visible:ring-2 focus-visible:ring-[var(--theme-focus-ring)] focus-visible:outline-none bg-[var(--theme-instrument-viewport-bg)]`}
       >
+        {isActive && (
         <svg
           className="w-full h-full pointer-events-none"
           viewBox="0 0 240 60"
@@ -431,6 +434,7 @@ export const CloudDriftSpeedInstrument: React.FC<CloudDriftSpeedInstrumentProps>
             </text>
           </g>
         </svg>
+        )}
       </div>
 
       {/* Hidden input preserving DOM ID for test compatibility */}

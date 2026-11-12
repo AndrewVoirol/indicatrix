@@ -55,11 +55,24 @@ fn vs_main(@builtin(vertex_index) vertexIndex: u32) -> VertexOutput {
     return out;
 }
 
+fn evalPerimeterPlateElevation(uv: vec2<f32>, dims: vec2<f32>) -> f32 {
+    let margin = vec2<f32>(10.0 / max(1.0, dims.x), 10.0 / max(1.0, dims.y));
+    let minDist = min(min(uv.x - margin.x, (1.0 - margin.x) - uv.x), min(uv.y - margin.y, (1.0 - margin.y) - uv.y));
+    let bevelWidth = 4.0 / max(1.0, min(dims.x, dims.y));
+    let bNeatline = smoothstep(0.0, bevelWidth, minDist);
+    let neatlineBorderBand = smoothstep(0.0, 0.35, bNeatline) * (1.0 - smoothstep(0.35, 1.0, bNeatline));
+    let rawInkLum = select(0.996, 0.855, lighting.u_theme == 1u);
+    let inkRidge = smoothstep(0.2, 0.8, neatlineBorderBand * rawInkLum);
+    return -substrate.u_plateMarkDepthMeters * bNeatline + substrate.u_inkRidgeHeightMeters * inkRidge;
+}
+
 @fragment
 fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
     // 1. Unconditional texture sampling at top of fs_main for WGSL uniform control flow conformance
     let sceneColor = textureSample(u_sceneTexture, u_linearSampler, input.uv);
-    let normalSample = textureSample(u_normalTexture, u_linearSampler, input.uv);
+    let screenDims = max(vec2<f32>(512.0), lighting.u_screenDimensions);
+    let tileUV = input.uv * (screenDims / 512.0);
+    let normalSample = textureSampleLevel(u_normalTexture, u_linearSampler, tileUV, 0.0);
 
     // Bypassed path: pass through unmodulated scene color
     if (lighting.u_hapticsActive < 0.5) {
@@ -77,8 +90,14 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
     // Composite scene color over archival paper ground where transparent
     let baseColor = mix(paperGround, sceneColor.rgb, sceneColor.a);
 
-    // 3. Unpack Perturbed Normal and Micro-Elevation
-    let deltaN = normalSample.xy;
+    // 3. Unpack Perturbed Normal and Micro-Elevation (+ analytical perimeter neatline bevel)
+    let pxDelta = vec2<f32>(1.0 / screenDims.x, 1.0 / screenDims.y);
+    let dBevelDx = (evalPerimeterPlateElevation(vec2<f32>(min(1.0, input.uv.x + pxDelta.x), input.uv.y), screenDims) -
+                    evalPerimeterPlateElevation(vec2<f32>(max(0.0, input.uv.x - pxDelta.x), input.uv.y), screenDims)) / (2.0 * pxDelta.x);
+    let dBevelDy = (evalPerimeterPlateElevation(vec2<f32>(input.uv.x, max(0.0, input.uv.y - pxDelta.y)), screenDims) -
+                    evalPerimeterPlateElevation(vec2<f32>(input.uv.x, min(1.0, input.uv.y + pxDelta.y)), screenDims)) / (2.0 * pxDelta.y);
+    let bevelDeltaN = vec2<f32>(-dBevelDx * 0.16, -dBevelDy * 0.16);
+    let deltaN = clamp(normalSample.xy + bevelDeltaN, vec2<f32>(-1.0), vec2<f32>(1.0));
     let zSheet = normalSample.z;
     let nPerturbed = normalize(vec3<f32>(deltaN.x, deltaN.y, 1.0));
 
@@ -138,8 +157,10 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
     let sheenWeight = clamp(brdfSheen * 0.22, 0.0, 0.35);
     let diffuseLit = baseColor * rakingFactor * (1.0 - sheenWeight);
     let specularSheen = sheenColor * sheenWeight;
-    let litColor = clamp(diffuseLit + specularSheen, vec3<f32>(0.0), vec3<f32>(1.0));
+    let maxLuminance = select(1.0, 4.0, lighting._padComp > 0.5);
+    let litColor = clamp(diffuseLit + specularSheen, vec3<f32>(0.0), vec3<f32>(maxLuminance));
 
-    let finalRGB = mix(baseColor, litColor, lighting.u_hapticsActive);
+    let sheetExposure = lighting.u_hapticsActive * (1.0 - sceneColor.a * 0.90);
+    let finalRGB = mix(baseColor, litColor, sheetExposure);
     return vec4<f32>(finalRGB, 1.0);
 }

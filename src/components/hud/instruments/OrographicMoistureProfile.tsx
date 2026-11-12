@@ -16,6 +16,7 @@ export interface OrographicMoistureProfileProps {
   onRainShadowChange?: (val: number) => void;
   onPluvialGammaChange?: (val: number) => void;
   onThermodynamicGatingChange?: (enabled: boolean) => void;
+  isActive?: boolean;
   className?: string;
 }
 
@@ -27,6 +28,7 @@ export const OrographicMoistureProfile: React.FC<OrographicMoistureProfileProps>
   onRainShadowChange,
   onPluvialGammaChange,
   onThermodynamicGatingChange,
+  isActive = true,
   className = '',
 }) => {
   const viewportRef = useRef<HTMLDivElement>(null);
@@ -241,6 +243,7 @@ export const OrographicMoistureProfile: React.FC<OrographicMoistureProfileProps>
         title="Drag windward slope to adjust coupling (0–100%) • Drag rain shaft to adjust pluvial swelling (0–2.0x) • Click LCL to toggle gating • Double-click to reset"
         className={`relative w-full h-28 rounded-[2px] overflow-hidden cursor-crosshair select-none touch-none shadow-inner transition-all duration-200 hover:shadow-[0_0_12px_var(--theme-focus-ring)] hover:border-[var(--theme-card-border-hover)] focus-visible:ring-2 focus-visible:ring-[var(--theme-focus-ring)] focus-visible:outline-none bg-[var(--theme-instrument-viewport-bg)] border-[var(--theme-instrument-viewport-border)]`}
       >
+        {isActive && (
         <svg
           className="w-full h-full pointer-events-none"
           viewBox="0 0 280 130"
@@ -689,6 +692,7 @@ export const OrographicMoistureProfile: React.FC<OrographicMoistureProfileProps>
             </text>
           </g>
         </svg>
+        )}
       </div>
 
       {/* Hidden inputs preserving DOM IDs for test compatibility */}

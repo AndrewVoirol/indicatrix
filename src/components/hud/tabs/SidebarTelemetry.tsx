@@ -1,21 +1,29 @@
 import React, { useState, useEffect, useMemo } from 'react';
 import { ResolutionTier, SimulationMode } from '../../../types';
 import { unitDistToKm, getStratumName } from '../instruments/StratosphericTelemetryInstrument';
+import {
+  useTelemetryFps,
+  useTelemetryGpuReport,
+  useTelemetryGeodetic,
+  useTelemetryLiveUnfurl,
+} from '../../../core/TelemetryStore';
 
 export interface SidebarTelemetryProps {
   theme: 0 | 1 | 2;
   resolution: ResolutionTier;
   onResolutionChange: (r: ResolutionTier) => void;
-  latStr: string;
-  lonStr: string;
-  mapScaleStr: string;
-  fps: number;
+  latStr?: string;
+  lonStr?: string;
+  mapScaleStr?: string;
+  fps?: number;
   backend: 'webgl2' | 'webgpu';
   gpuReport?: any;
   mode?: SimulationMode;
   alpha?: number;
   purityMode?: boolean;
   isWindActive?: boolean;
+  prognosticModel?: string;
+  isActive?: boolean;
   cameraPosition?: [number, number, number];
 }
 
@@ -23,24 +31,37 @@ export const SidebarTelemetry: React.FC<SidebarTelemetryProps> = ({
   theme,
   resolution,
   onResolutionChange,
-  latStr,
-  lonStr,
-  mapScaleStr,
-  fps,
+  latStr: propLatStr,
+  lonStr: propLonStr,
+  mapScaleStr: propMapScaleStr,
+  fps: propFps,
   backend,
-  gpuReport,
+  gpuReport: propGpuReport,
   mode = 0,
-  alpha = 0,
+  alpha: propAlpha = 0,
   purityMode = false,
   isWindActive = false,
+  prognosticModel,
+  isActive = true,
   cameraPosition,
 }) => {
+  const storeFps = useTelemetryFps(isActive && propFps === undefined);
+  const storeGpuReport = useTelemetryGpuReport(isActive && propGpuReport === undefined);
+  const storeGeodetic = useTelemetryGeodetic(isActive);
+  const alpha = useTelemetryLiveUnfurl(propAlpha, isActive);
+
+  const fps = propFps !== undefined ? propFps : storeFps;
+  const gpuReport = propGpuReport !== undefined ? propGpuReport : storeGpuReport;
+  const latStr = propLatStr !== undefined ? propLatStr : storeGeodetic.latStr;
+  const lonStr = propLonStr !== undefined ? propLonStr : storeGeodetic.lonStr;
+  const mapScaleStr = propMapScaleStr !== undefined ? propMapScaleStr : storeGeodetic.mapScaleStr;
+
   const [liveVram, setLiveVram] = useState<{
     totalMb: number;
     subsystems: Record<string, { mb: number; bufferCount: number; textureCount: number }>;
   } | null>(null);
 
-  const [liveCamDist, setLiveCamDist] = useState<number>(() => {
+  const liveCamDist = useMemo(() => {
     if (typeof window !== 'undefined') {
       const cam = (window as any).__INDICATRIX_CAMERA__;
       if (cam) {
@@ -56,11 +77,14 @@ export const SidebarTelemetry: React.FC<SidebarTelemetryProps> = ({
         }
       }
     }
+    if (Number.isFinite(storeGeodetic.cameraAltitude) && storeGeodetic.cameraAltitude !== 15.0) {
+      return storeGeodetic.cameraAltitude;
+    }
     if (cameraPosition) {
       return Math.hypot(cameraPosition[0], cameraPosition[1], cameraPosition[2]);
     }
-    return 15.0;
-  });
+    return storeGeodetic.cameraAltitude;
+  }, [storeGeodetic.cameraAltitude, cameraPosition]);
 
   useEffect(() => {
     const pollVram = () => {
@@ -68,43 +92,19 @@ export const SidebarTelemetry: React.FC<SidebarTelemetryProps> = ({
         const engine = (window as any).__INDICATRIX_WEBGPU_ENGINE__;
         if (engine && typeof engine.getVramLedger === 'function') {
           const ledger = engine.getVramLedger();
-          setLiveVram({ totalMb: ledger.totalMb, subsystems: ledger.subsystems });
+          setLiveVram((prev) =>
+            prev && Math.abs(prev.totalMb - ledger.totalMb) < 0.05
+              ? prev
+              : { totalMb: ledger.totalMb, subsystems: ledger.subsystems }
+          );
         }
       }
     };
     pollVram();
+    if (!isActive) return;
     const timer = setInterval(pollVram, 1000);
     return () => clearInterval(timer);
-  }, []);
-
-  useEffect(() => {
-    let active = true;
-    const pollCam = () => {
-      if (!active || typeof window === 'undefined') return;
-      const cam = (window as any).__INDICATRIX_CAMERA__;
-      if (cam) {
-        if (typeof cam.getCamDist === 'function') {
-          const cd = cam.getCamDist();
-          if (Number.isFinite(cd)) setLiveCamDist(cd);
-        } else if (typeof cam.getAltitudeUnits === 'function') {
-          const alt = cam.getAltitudeUnits();
-          if (Number.isFinite(alt)) setLiveCamDist(5.0 + alt);
-        } else if (typeof cam.getSpherical === 'function') {
-          const s = cam.getSpherical();
-          if (s && Number.isFinite(s.radius)) setLiveCamDist(s.radius);
-        }
-      } else if (cameraPosition) {
-        const d = Math.hypot(cameraPosition[0], cameraPosition[1], cameraPosition[2]);
-        if (Number.isFinite(d)) setLiveCamDist(d);
-      }
-    };
-    pollCam();
-    const timer = setInterval(pollCam, 100);
-    return () => {
-      active = false;
-      clearInterval(timer);
-    };
-  }, [cameraPosition]);
+  }, [isActive]);
 
   const resolutionVramLabel = useMemo(() => {
     const tierConfig: Record<ResolutionTier, { verts: string; nodes: number }> = {
@@ -162,8 +162,9 @@ export const SidebarTelemetry: React.FC<SidebarTelemetryProps> = ({
     return getStratumName(km);
   }, [liveCamDist]);
 
-  const activeGrid = '3600 × 1801 (0.1°)';
-  const windStatusText = isWindActive ? 'rg16float (Active)' : 'Inactive';
+  const isGfsModel = prognosticModel === 'gfs' || prognosticModel === 'noaa-gfs';
+  const activeGrid = isGfsModel ? '1440 × 721 (0.25°)' : '3600 × 1801 (0.1°)';
+  const windStatusText = isWindActive ? 'rgba16float (Active)' : 'Inactive';
 
   return (
     <div
@@ -277,7 +278,7 @@ export const SidebarTelemetry: React.FC<SidebarTelemetryProps> = ({
           <span
             data-testid="telemetry-grid-resolution"
             className="font-bold text-[var(--theme-text-secondary)] truncate block tabular-nums"
-            title={`NOAA GFS / WeatherNext 3 Grid: ${activeGrid}`}
+            title={`Live Satellite / WeatherNext 3 / NOAA GFS Grid: ${activeGrid}`}
           >
             {activeGrid}
           </span>
@@ -289,7 +290,7 @@ export const SidebarTelemetry: React.FC<SidebarTelemetryProps> = ({
             className={`font-bold truncate block ${isWindActive ? 'text-[var(--theme-status-sage)]' : 'text-[var(--theme-text-muted)]'}`}
             title={`Wind Vector Field: ${windStatusText}`}
           >
-            {isWindActive ? 'rg16f (On)' : 'Off'}
+            {isWindActive ? 'rgba16f (On)' : 'Off'}
           </span>
         </div>
       </div>
@@ -325,11 +326,9 @@ export const SidebarTelemetry: React.FC<SidebarTelemetryProps> = ({
           )}
         </div>
         {backend === 'webgpu' && gpuReport && (
-          <div className="grid grid-cols-5 gap-1 font-mono text-[var(--theme-text-tertiary)] text-nano">
+          <div className="grid grid-cols-3 gap-1 font-mono text-[var(--theme-text-tertiary)] text-nano">
             <span>Sim: {(gpuReport.computeMs ?? 0).toFixed(1)}ms</span>
             <span>Crust: {(gpuReport.reliefMs ?? 0).toFixed(1)}ms</span>
-            <span>Lines: {(gpuReport.linesMs ?? 0).toFixed(1)}ms</span>
-            <span>Cont: {(gpuReport.contoursMs ?? 0).toFixed(1)}ms</span>
             <span>Vol: {(gpuReport.volumetricMs ?? 0).toFixed(1)}ms</span>
           </div>
         )}

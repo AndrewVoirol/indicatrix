@@ -31,6 +31,13 @@ const TWO_PI: f32 = 6.28318530717958647692;
 const EARTH_RADIUS_M: f32 = 6371000.0;
 const TAN_DELTA_SUN: f32 = 0.009250245; // tan(0.53 deg) ~ sun angular diameter
 
+fn unpackDemRG(s: vec4<f32>) -> vec4<f32> {
+    let bNorm = s.r;
+    let aNorm = s.g;
+    let elevM = aNorm * 19772.0 - 10924.0;
+    return vec4<f32>(clamp(elevM / 8848.0, 0.0, 1.0), clamp(-elevM / 10924.0, 0.0, 1.0), bNorm, aNorm);
+}
+
 fn decodeElevation(demSample: vec4<f32>) -> f32 {
     return demSample.a * 19772.0 - 10924.0;
 }
@@ -52,7 +59,7 @@ fn cs_main(@builtin(global_invocation_id) globalId: vec3<u32>) {
         return;
     }
 
-    let baseSample = textureSampleLevel(u_demTexture, u_demSampler, uv, 0.0);
+    let baseSample = unpackDemRG(textureSampleLevel(u_demTexture, u_demSampler, uv, 0.0));
     let h0 = decodeElevation(baseSample);
 
     // Spherical metric tensor arc-length evaluation
@@ -88,7 +95,7 @@ fn cs_main(@builtin(global_invocation_id) globalId: vec3<u32>) {
             clamp(uv.y + deltaV, 0.001, 0.999)
         );
 
-        let sSample = textureSampleLevel(u_demTexture, u_demSampler, sampleUV, 0.0);
+        let sSample = unpackDemRG(textureSampleLevel(u_demTexture, u_demSampler, sampleUV, 0.0));
         let hs = decodeElevation(sSample);
 
         let deltaH = hs - h0;

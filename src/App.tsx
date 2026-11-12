@@ -1,25 +1,22 @@
 import React, { useState, useRef, useEffect, useCallback, useMemo } from 'react';
 import { SimulationMode, LoadedDataInfo } from './types';
-import { DataLayerRenderStyle, getPresetById } from './core/data/DataLayerCatalog';
-import { TelemetryHUD, type PrognosticModelBackend, isWeatherNextModel } from './components/hud/TelemetryHUD';
+import { getPresetById } from './core/data/DataLayerCatalog';
+import { TelemetryHUD, type PrognosticModelBackend, isWeatherNextModel, isSatelliteModel } from './components/hud/TelemetryHUD';
 import { NavigationDock } from './components/hud/NavigationDock';
 import type { TimelineScrubberState } from './components/hud/TimelineScrubber';
 import { useEngineState } from './hooks/useEngineState';
 import { useCameraKinematics } from './hooks/useCameraKinematics';
 import { registerDevToolsAPI } from './core/DevToolsAPI';
 import { CursorProvider } from './core/CursorContext';
-import { useGlobeLayerManager } from './core/layers/useGlobeLayerManager';
+import { useGlobeLayerManager, getMediumCalibrationPreset } from './core/layers/useGlobeLayerManager';
 import { KinematicCameraController } from './components/canvas/KinematicCameraController';
 import WebGPUFallback from './components/canvas/WebGPUFallback';
 import { TactileButton } from './components/ui/TactileButton';
-
-declare module './components/hud/TelemetryHUD' {
-  interface TelemetryHUDProps {
-    cdlodDiagnosticMode?: number;
-    onCdlodDiagnosticModeChange?: (mode: number) => void;
-    setCdlodDiagnosticMode?: (mode: number) => void;
-  }
-}
+import {
+  telemetryStore,
+  useTelemetryGeodetic,
+  useTelemetryLiveUnfurl,
+} from './core/TelemetryStore';
 
 export { KinematicCameraController } from './components/canvas/KinematicCameraController';
 const WebGPUCanvas = React.lazy(() => import('./webgpu/WebGPUCanvas'));
@@ -41,6 +38,36 @@ export const CameraTelemetryUpdater: React.FC<{
   return null;
 };
 
+const CalibrationHeaderBar: React.FC<{
+  isCatalogOpen: boolean;
+  isSidebarActive: boolean;
+}> = React.memo(({ isCatalogOpen, isSidebarActive }) => {
+  const { latStr, lonStr, mapScaleStr } = useTelemetryGeodetic(true);
+  return (
+    <header className={`absolute top-5 left-5 right-5 ${isCatalogOpen ? 'xl:right-[51.75rem] md:right-[26.5rem]' : 'md:right-[26.5rem]'} ${isSidebarActive ? 'max-md:hidden' : ''} h-7 flex items-center justify-between gap-4 text-micro font-mono tracking-widest uppercase z-20 pointer-events-none px-3 rounded-[3px] border backdrop-blur-md shadow-sm transition-all duration-300 scroll-curl-lip bg-[var(--theme-panel-bg)] border-[var(--theme-panel-border)] text-[var(--theme-text-primary)]`}>
+      <div className="flex items-center gap-2 overflow-hidden whitespace-nowrap z-10 min-w-0 pr-3">
+        <span className="min-w-0 font-bold truncate">HYDROGRAPHIC SURVEY<span className="hidden xl:inline"> // CARTOGRAPHIC MATRIX</span></span>
+        <span className="hidden lg:inline opacity-40 shrink-0">|</span>
+        <span className="hidden lg:inline opacity-80 truncate shrink-0">SCALE {mapScaleStr}</span>
+      </div>
+      <div className="flex items-center gap-2.5 shrink-0 z-10 pl-3">
+        <span className="font-bold text-[var(--theme-text-accent)] tabular-nums">{latStr} · {lonStr}</span>
+        <span className="hidden sm:inline opacity-40 shrink-0">|</span>
+        <span className="hidden sm:inline opacity-80 font-bold shrink-0">WGS84 // EPSG:4326</span>
+      </div>
+    </header>
+  );
+});
+
+const ZenAlphaReadout: React.FC<{ alpha: number }> = React.memo(({ alpha }) => {
+  const liveAlpha = useTelemetryLiveUnfurl(alpha, true);
+  return (
+    <span className="opacity-80 font-bold tabular-nums">
+      α: {Math.round(liveAlpha * 100)}%
+    </span>
+  );
+});
+
 export default function App() {
   const engineState = useEngineState();
   const cameraKinematics = useCameraKinematics();
@@ -55,29 +82,19 @@ export default function App() {
     glideToMode,
     cancelGlide,
     layerMode, setLayerMode,
-    cursorPhysicsEnabled, setCursorPhysicsEnabled,
+    cursorPhysicsEnabled,
     resolution, setResolution,
     fps, setFps,
-    cdlodDiagnosticMode, setCdlodDiagnosticMode,
-    activeOverlay, setActiveOverlay,
-    showLandmarks, setShowLandmarks,
-    showTissot, setShowTissot,
+    cdlodDiagnosticMode,
     showVectors, setShowVectors,
     showToponymy, setShowToponymy,
-    showSoundings, setShowSoundings,
-    showTriangulation, setShowTriangulation,
     showCartouche, setShowCartouche,
-    setMediumId,
     isPlaying, setIsPlaying,
     playbackSpeed, setPlaybackSpeed,
     isZenMode, setIsZenMode,
-    fractureIntensity, setFractureIntensity,
-    fluidVortexStrength, setFluidVortexStrength,
     gpuReport, setGpuReport,
     dataInfo, setDataInfo,
-    isolatedStratum,
     showClouds, setShowClouds,
-    showAtmosphere, setShowAtmosphere,
     showCloudLow, setShowCloudLow,
     showCloudMid, setShowCloudMid,
     showCloudHigh, setShowCloudHigh,
@@ -116,21 +133,37 @@ export default function App() {
   const verticalScaleMode = 1;
   const [rainShadowFeedback, setRainShadowFeedback] = useState<number>(0.50);
   const [pluvialGamma, setPluvialGamma] = useState<number>(0.0);
-  const [weatherOpticalMode, setWeatherOpticalMode] = useState<number>(0);
   const [timelineMinutes, setTimelineMinutes] = useState<number>(0);
   const [scrubTau, setScrubTau] = useState<number>(0);
   const [thermodynamicGating, setThermodynamicGating] = useState<boolean>(true);
   const [prognosticModel, setPrognosticModel] = useState<PrognosticModelBackend>('weathernext3');
-  const [prognosticVariable, setPrognosticVariable] = useState<string>('total_precipitation_1hr_mean');
+  const [prognosticVariable, setPrognosticVariable] = useState<string>('none');
   const [purityMode, setPurityMode] = useState<boolean>(false);
+  const purityModeRef = useRef<boolean>(purityMode);
+  purityModeRef.current = purityMode;
+  const handleSetPurityMode = useCallback(
+    (valOrFn: boolean | ((prev: boolean) => boolean)) => {
+      const prev = purityModeRef.current;
+      const next = typeof valOrFn === 'function' ? valOrFn(prev) : Boolean(valOrFn);
+      purityModeRef.current = next;
+      setPurityMode(next);
+      if (next !== prev) {
+        setResolution(next ? '1M' : '100k');
+      }
+    },
+    [setResolution]
+  );
   const [contourActive, setContourActive] = useState<boolean>(true);
-  const [cdlodEnabled, setCdlodEnabled] = useState<boolean>(true);
+  const [cdlodEnabled] = useState<boolean>(true);
   const [terrainShadows, setTerrainShadows] = useState<boolean>(false);
   const [penumbraSoftness, setPenumbraSoftness] = useState<number>(1.5);
   const [geomorphicHydrology, setGeomorphicHydrology] = useState<boolean>(false);
   const [pluvialDischargeCoupling, setPluvialDischargeCoupling] = useState<number>(1.0);
   const [bedrockIncision, setBedrockIncision] = useState<number>(1.0);
   const lastWindHourRef = useRef<number>(-1);
+  const prognosticModelRef = useRef<PrognosticModelBackend>(prognosticModel);
+  prognosticModelRef.current = prognosticModel;
+  const modelSwitchSeqRef = useRef<number>(0);
 
   const handlePrognosticVariableChange = useCallback((variable: string) => {
     setPrognosticVariable((prev) => {
@@ -139,18 +172,22 @@ export default function App() {
       }
       return variable;
     });
+    const activeModel = prognosticModelRef.current;
+    const reqSeq = modelSwitchSeqRef.current;
     const weatherNextDS =
       window.__INDICATRIX_WEATHERNEXT_DATA_SOURCE__ ||
       window.__INDICATRIX_WEATHERNEXT_SOURCE__;
     if (
-      variable !== 'none' &&
-      variable !== 'geopotential_500hpa' &&
-      variable !== 'z500' &&
+      (variable === 'total_precipitation_1hr_mean' ||
+        variable === 'total_precipitation_6hr_mean' ||
+        variable === 'precipitation_6hr' ||
+        variable === 'precipitation' ||
+        variable === 'tcwv') &&
       weatherNextDS &&
       !weatherNextDS.disposed &&
       typeof weatherNextDS.setActiveVariable === 'function'
     ) {
-      weatherNextDS.setActiveVariable(variable).catch((err: any) => {
+      weatherNextDS.setActiveVariable('total_precipitation_1hr_mean').catch((err: any) => {
         console.warn('[WeatherNext] setActiveVariable error:', err);
       });
     }
@@ -159,20 +196,63 @@ export default function App() {
       const engine = window.__INDICATRIX_WEBGPU_ENGINE__ || window.__ENGINE;
       if (engine && typeof engine.loadWindTexture === 'function') {
         const currentHour = weatherNextDS?.getCurrentHour?.() ?? 0;
-        const clampedHour = Math.min(23, Math.max(0, currentHour));
-        lastWindHourRef.current = clampedHour;
-        if (variable === 'wind_10m_vector' || isWeatherNextModel(prognosticModel)) {
-          engine.loadWindTexture(`/data/weathernext/wind_10m_vector-${clampedHour}.bin`).catch(() => {
+        const clampedHour = Math.min(11, Math.max(0, currentHour));
+        const useWnWind = isWeatherNextModel(activeModel) || isSatelliteModel(activeModel);
+        if (variable === 'wind_10m_vector' || useWnWind) {
+          if (useWnWind) {
+            lastWindHourRef.current = clampedHour;
+            engine.loadWindTexture(`/data/weathernext/wind_10m_vector-${clampedHour}.bin`, 0).catch(() => {
+              if (modelSwitchSeqRef.current === reqSeq) {
+                engine.loadWindTexture('/data/gfs-wind-latest.bin').catch(() => {});
+              }
+            });
+            const nextWindHour = Math.min(11, clampedHour + 1);
+            engine.loadWindTexture(`/data/weathernext/wind_10m_vector-${nextWindHour}.bin`, 1).catch(() => {});
+          } else {
+            lastWindHourRef.current = -1;
             engine.loadWindTexture('/data/gfs-wind-latest.bin').catch(() => {});
-          });
+          }
         }
       }
     }
   }, [prognosticModel]);
 
   const handleTimelineChange = useCallback((state: TimelineScrubberState) => {
-    setTimelineMinutes(state.absoluteMinutes);
-    setScrubTau(state.tau);
+    const activeModel = prognosticModelRef.current;
+    const reqSeq = modelSwitchSeqRef.current;
+    const isWn = isWeatherNextModel(activeModel);
+    const isSat = isSatelliteModel(activeModel);
+    const isGfs = !isWn && !isSat;
+
+    if (isGfs) {
+      telemetryStore.setLiveTimeline(null);
+      setTimelineMinutes(0);
+      setScrubTau(0);
+      if (typeof window !== 'undefined') {
+        const engine = window.__INDICATRIX_WEBGPU_ENGINE__ || window.__ENGINE;
+        if (engine && typeof engine.updateAtmosphereUniforms === 'function') {
+          engine.updateAtmosphereUniforms({
+            weatherTimeMinutes: 0,
+            weatherTau: 0,
+            scrubTau: 0,
+            tau: 0,
+          });
+        }
+        if (engine && typeof engine.setTimelineMinutes === 'function') {
+          engine.setTimelineMinutes(0);
+        }
+        if (engine && engine.precipRingBuffer && typeof engine.setPrecipitationRingBuffer === 'function') {
+          engine.setPrecipitationRingBuffer(null);
+        }
+      }
+      return;
+    }
+
+    const isLiveScrub = Boolean(telemetryStore.getLiveTimeline()?.isScrubbing);
+    if (!isLiveScrub) {
+      setTimelineMinutes(state.absoluteMinutes);
+      setScrubTau(state.tau);
+    }
     if (typeof window !== 'undefined') {
       const engine = window.__INDICATRIX_WEBGPU_ENGINE__ || window.__ENGINE;
       if (engine && typeof engine.updateAtmosphereUniforms === 'function') {
@@ -187,161 +267,73 @@ export default function App() {
         engine.setTimelineMinutes(state.absoluteMinutes);
       }
 
-      // Live Doppler Radar nowcasting dispatch in radar zone (-60m to 0m)
-      if (state.isRadarZone || state.absoluteMinutes < 0) {
-        const radarDS = window.__INDICATRIX_LIVE_RADAR_DATA_SOURCE__;
-        if (radarDS && !radarDS.disposed) {
-          radarDS.setAbsoluteMinutes(state.absoluteMinutes);
-          const radarRing = window.__INDICATRIX_RADAR_RING_BUFFER__;
-          if (radarRing && !radarRing.disposed && engine && engine.precipRingBuffer !== radarRing) {
-            engine.setPrecipitationRingBuffer(radarRing);
-          }
-          radarDS.uploadToRingBuffer();
-        }
-      }
-
-      // Google DeepMind WeatherNext 3 prognostic forecast dispatch in forecast zone (0m to +48h)
+      // Google DeepMind WeatherNext 3 prognostic forecast dispatch (0m to +maxForecastHours)
       if (state.isForecastZone || state.absoluteMinutes >= 0) {
         const wnRing = window.__INDICATRIX_WEATHERNEXT_RING_BUFFER__;
-        if (wnRing && !wnRing.disposed && engine && engine.precipRingBuffer !== wnRing) {
+        const shouldBindWnPrecip = isWn || (isSat && state.absoluteMinutes > 0);
+        if (shouldBindWnPrecip && wnRing && !wnRing.disposed && engine && engine.precipRingBuffer !== wnRing) {
           engine.setPrecipitationRingBuffer(wnRing);
+        } else if (!shouldBindWnPrecip && engine && engine.precipRingBuffer && typeof engine.setPrecipitationRingBuffer === 'function') {
+          engine.setPrecipitationRingBuffer(null);
         }
+
         const weatherNextDS =
           window.__INDICATRIX_WEATHERNEXT_DATA_SOURCE__ ||
           window.__INDICATRIX_WEATHERNEXT_SOURCE__;
-        if (weatherNextDS && !weatherNextDS.disposed) {
+        if (shouldBindWnPrecip && weatherNextDS && !weatherNextDS.disposed) {
+          let timePromise: Promise<unknown> | void = undefined;
           if (typeof weatherNextDS.setTime === 'function') {
-            weatherNextDS.setTime(state.bracketHour, state.tau);
+            timePromise = weatherNextDS.setTime(state.bracketHour, state.tau);
           }
           if (typeof weatherNextDS.getProvenance === 'function') {
             const prov = weatherNextDS.getProvenance(state.tau);
-            if (prov) setProvenance(prov);
+            if (prov && modelSwitchSeqRef.current === reqSeq) {
+              (window as any).__INDICATRIX_PROVENANCE__ = prov;
+              if (!isLiveScrub) setProvenance(prov);
+            }
+            if (timePromise && typeof (timePromise as Promise<unknown>).then === 'function') {
+              (timePromise as Promise<unknown>)
+                .then(() => {
+                  if (!weatherNextDS.disposed && modelSwitchSeqRef.current === reqSeq) {
+                    const updatedProv = weatherNextDS.getProvenance(state.tau);
+                    if (updatedProv) {
+                      (window as any).__INDICATRIX_PROVENANCE__ = updatedProv;
+                      if (!Boolean(telemetryStore.getLiveTimeline()?.isScrubbing)) {
+                        setProvenance(updatedProv);
+                      }
+                    }
+                  }
+                })
+                .catch(() => {});
+            }
           }
         }
 
-        const isWn = isWeatherNextModel(prognosticModel);
-        if (engine && typeof engine.loadWindTexture === 'function' && (isWn || prognosticVariable === 'wind_10m_vector')) {
-          const windHour = Math.min(23, Math.max(0, state.bracketHour));
+        const windHour = Math.min(11, Math.max(0, state.bracketHour));
+        if (engine && isSat && typeof engine.loadSatelliteCloudLayers === 'function') {
+          engine.loadSatelliteCloudLayers(windHour).catch(() => {});
+        } else if (engine && isWn && typeof engine.loadWeatherNextCloudLayers === 'function') {
+          engine.loadWeatherNextCloudLayers(windHour).catch(() => {});
+        }
+        if (engine && typeof engine.loadWindTexture === 'function' && (isWn || isSat || prognosticVariable === 'wind_10m_vector')) {
           if (windHour !== lastWindHourRef.current) {
             lastWindHourRef.current = windHour;
             engine.loadWindTexture(`/data/weathernext/wind_10m_vector-${windHour}.bin`, 0).catch(() => {});
-            const nextWindHour = Math.min(23, windHour + 1);
+            const nextWindHour = Math.min(11, windHour + 1);
             engine.loadWindTexture(`/data/weathernext/wind_10m_vector-${nextWindHour}.bin`, 1).catch(() => {});
-            if (typeof engine.loadTemperatureTexture === 'function') {
-              engine.loadTemperatureTexture(`/data/weathernext/temperature_2m_mean-${windHour}.bin`).catch(() => {});
-            }
-            if (typeof engine.loadDewpointTexture === 'function') {
-              engine.loadDewpointTexture(`/data/weathernext/dewpoint_temperature_2m_mean-${windHour}.bin`).catch(() => {});
+            if (!showClouds) {
+              if (typeof engine.loadTemperatureTexture === 'function') {
+                engine.loadTemperatureTexture(`/data/weathernext/temperature_2m_mean-${windHour}.bin`).catch(() => {});
+              }
+              if (typeof engine.loadDewpointTexture === 'function') {
+                engine.loadDewpointTexture(`/data/weathernext/dewpoint_temperature_2m_mean-${windHour}.bin`).catch(() => {});
+              }
             }
           }
         }
       }
     }
-  }, [prognosticModel, prognosticVariable, setProvenance]);
-
-  useEffect(() => {
-    if (typeof window !== 'undefined') {
-      window.__INDICATRIX_SET_ATMOSPHERIC_SCALE__ = (valOrFn: any) => {
-        setAtmosphericScale((prev) => {
-          const v = typeof valOrFn === 'function' ? valOrFn(prev) : valOrFn;
-          if (typeof v !== 'number' || !Number.isFinite(v)) return prev;
-          return Math.max(1.0, Math.min(12.0, v));
-        });
-      };
-      window.__INDICATRIX_SET_SHADOW_INTENSITY__ = (valOrFn: any) => {
-        setShadowIntensity((prev) => {
-          const v = typeof valOrFn === 'function' ? valOrFn(prev) : valOrFn;
-          if (typeof v !== 'number' || !Number.isFinite(v)) return prev;
-          return Math.max(0.0, Math.min(0.60, v));
-        });
-      };
-      window.__INDICATRIX_SET_VERTICAL_SCALE_MODE__ = () => {};
-      window.__INDICATRIX_SET_RAIN_SHADOW_FEEDBACK__ = (valOrFn: any) => {
-        setRainShadowFeedback((prev) => {
-          const v = typeof valOrFn === 'function' ? valOrFn(prev) : valOrFn;
-          if (typeof v !== 'number' || !Number.isFinite(v)) return prev;
-          return Math.max(0.0, Math.min(1.0, v));
-        });
-      };
-      window.__INDICATRIX_SET_PLUVIAL_GAMMA__ = (valOrFn: any) => {
-        setPluvialGamma((prev) => {
-          const v = typeof valOrFn === 'function' ? valOrFn(prev) : valOrFn;
-          if (typeof v !== 'number' || !Number.isFinite(v)) return prev;
-          return Math.max(0.0, Math.min(2.0, v));
-        });
-      };
-      window.__INDICATRIX_SET_WEATHER_OPTICAL_MODE__ = (valOrFn: any) => {
-        setWeatherOpticalMode((prev) => {
-          const v = typeof valOrFn === 'function' ? valOrFn(prev) : valOrFn;
-          if (typeof v !== 'number' || !Number.isFinite(v)) return prev;
-          return Math.floor(v) === 1 ? 1 : 0;
-        });
-      };
-      window.__INDICATRIX_SET_TIMELINE_MINUTES__ = (valOrFn: any) => {
-        setTimelineMinutes((prev) => {
-          const v = typeof valOrFn === 'function' ? valOrFn(prev) : valOrFn;
-          if (typeof v !== 'number' || !Number.isFinite(v)) return prev;
-          const clamped = Math.max(-60, Math.min(2880, v));
-          const engine = window.__INDICATRIX_WEBGPU_ENGINE__ || window.__ENGINE;
-          if (engine && typeof engine.setTimelineMinutes === 'function') {
-            engine.setTimelineMinutes(clamped);
-          }
-          return clamped;
-        });
-      };
-      window.__INDICATRIX_SET_PROGNOSTIC_VARIABLE__ = (variable: string) => {
-        handlePrognosticVariableChange(variable);
-      };
-      window.__INDICATRIX_SET_PROGNOSTIC_MODEL__ = (model: PrognosticModelBackend) => {
-        handlePrognosticModelChange(model);
-      };
-      (window as any).__INDICATRIX_TOGGLE_PLANETARY_LAYER__ = (id: string, force?: boolean) => {
-        handleTogglePlanetaryLayer(id, force);
-      };
-      (window as any).__INDICATRIX_DATA_LAYERS__ = dataLayers;
-      (window as any).__INDICATRIX_PURITY_MODE__ = purityMode;
-      (window as any).setPurityMode = setPurityMode;
-      (window as any).__INDICATRIX_SET_PURITY_MODE__ = setPurityMode;
-
-      Object.defineProperty(window, '__INDICATRIX_WEATHER_DIAGNOSTICS__', {
-        configurable: true,
-        get: () => {
-          const ds =
-            window.__INDICATRIX_WEATHERNEXT_DATA_SOURCE__ ||
-            window.__INDICATRIX_WEATHERNEXT_SOURCE__;
-          const ring = window.__INDICATRIX_WEATHERNEXT_RING_BUFFER__;
-          const radarDS = window.__INDICATRIX_LIVE_RADAR_DATA_SOURCE__;
-          const radarRing = window.__INDICATRIX_RADAR_RING_BUFFER__;
-          const engine = window.__INDICATRIX_WEBGPU_ENGINE__ || window.__ENGINE;
-          return {
-            prognosticModel,
-            prognosticVariable,
-            timelineMinutes,
-            weatherNext: {
-              active: !!ds && !ds.disposed,
-              currentHour: ds?.getCurrentHour?.() ?? 0,
-              activeVariable: ds?.getActiveVariable?.() ?? prognosticVariable,
-              vramBytes: ds?.getVRAMFootprintBytes?.() ?? 0,
-              ringBufferBound: !!ring && !ring.disposed,
-            },
-            radar: {
-              active: !!radarDS && !radarDS.disposed,
-              ringBufferBound: !!radarRing && !radarRing.disposed,
-            },
-            enginePrecipBound: !!engine?.precipRingBuffer,
-          };
-        },
-      });
-    }
-  }, [handlePrognosticVariableChange, prognosticModel, prognosticVariable, timelineMinutes]);
-
-  useEffect(() => {
-    if (typeof window !== 'undefined') {
-      (window as any).__INDICATRIX_PURITY_MODE__ = purityMode;
-      (window as any).setPurityMode = setPurityMode;
-    }
-  }, [purityMode]);
-
+  }, [prognosticModel, prognosticVariable, setProvenance, showClouds]);
 
   useEffect(() => {
     if (!isZenMode) {
@@ -398,7 +390,6 @@ export default function App() {
     handleAmbientOcclusionChangeDataLayer,
     handlePaperToothChangeDataLayer,
     handleReorderDataLayer,
-    handleSelectRenderStyle,
   } = useGlobeLayerManager();
 
   const handleAddDataLayerWithModelSync = useCallback(
@@ -438,9 +429,9 @@ export default function App() {
     (id: string, force?: boolean) => {
       const existing = dataLayers.find((l) => l.id === id);
       if (existing) {
-        if (force === true && existing.visible) return;
+        if (force !== undefined && existing.visible === force) return;
         handleToggleDataLayerWithModelSync(id);
-      } else {
+      } else if (force !== false) {
         const preset = getPresetById(id);
         if (preset) {
           handleAddDataLayerWithModelSync({
@@ -465,63 +456,71 @@ export default function App() {
     [dataLayers, handleToggleDataLayerWithModelSync, handleAddDataLayerWithModelSync]
   );
 
-  const fractureDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const vortexDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-
-  const handleFractureIntensityChange = useCallback(
-    (val: number) => {
-      if (typeof window !== 'undefined') {
-        (window as any).__INDICATRIX_LIVE_UNIFORMS__ = (window as any).__INDICATRIX_LIVE_UNIFORMS__ || {};
-        (window as any).__INDICATRIX_LIVE_UNIFORMS__.fractureIntensity = val;
-
-        const engine = (window as any).__INDICATRIX_WEBGPU_ENGINE__ || (window as any).__ENGINE;
-        if (engine && typeof engine.updateUniforms === 'function') {
-          engine.updateUniforms({ fractureIntensity: val });
-        }
-      }
-      if (fractureDebounceRef.current) clearTimeout(fractureDebounceRef.current);
-      fractureDebounceRef.current = setTimeout(() => {
-        setFractureIntensity(val);
-      }, 200);
-    },
-    [setFractureIntensity]
-  );
-
-  const handleFluidVortexStrengthChange = useCallback(
-    (val: number) => {
-      if (typeof window !== 'undefined') {
-        (window as any).__INDICATRIX_LIVE_UNIFORMS__ = (window as any).__INDICATRIX_LIVE_UNIFORMS__ || {};
-        (window as any).__INDICATRIX_LIVE_UNIFORMS__.vortexStrength = val;
-
-        const engine = (window as any).__INDICATRIX_WEBGPU_ENGINE__ || (window as any).__ENGINE;
-        if (engine && typeof engine.updateUniforms === 'function') {
-          engine.updateUniforms({ vortexStrength: val });
-        }
-      }
-      if (vortexDebounceRef.current) clearTimeout(vortexDebounceRef.current);
-      vortexDebounceRef.current = setTimeout(() => {
-        setFluidVortexStrength(val);
-      }, 200);
-    },
-    [setFluidVortexStrength]
-  );
-
   const isWeatherActive = useMemo(() => {
-    return dataLayers.some(
-      (l) =>
-        l.visible &&
-        (l.id === 'google-weathernext3' ||
-          l.id === 'live-doppler-radar' ||
-          l.id === 'noaa-gfs-wind' ||
-          l.id === 'noaa-gfs-jetstream' ||
-          l.id === 'atmospheric-clouds')
+    return (
+      Boolean(showClouds) ||
+      dataLayers.some(
+        (l) =>
+          l.visible &&
+          (l.id === 'google-weathernext3' ||
+            l.id === 'noaa-gfs-wind' ||
+            l.id === 'noaa-gfs-jetstream' ||
+            l.id === 'noaa-gfs-clouds' ||
+            l.id === 'atmospheric-clouds')
+      )
     );
-  }, [dataLayers]);
+  }, [dataLayers, showClouds]);
+
+  const inFlightModelChangeRef = useRef<boolean>(false);
 
   const handlePrognosticModelChange = useCallback(
     (model: PrognosticModelBackend) => {
+      const reqSeq = ++modelSwitchSeqRef.current;
+      prognosticModelRef.current = model;
+      inFlightModelChangeRef.current = true;
+      queueMicrotask(() => {
+        inFlightModelChangeRef.current = false;
+      });
       setPrognosticModel(model);
       const isWn = isWeatherNextModel(model);
+      const isSat = isSatelliteModel(model);
+      const resetToDatum = !isWn;
+      if (resetToDatum) {
+        telemetryStore.setLiveTimeline(null);
+        setTimelineMinutes(0);
+        setScrubTau(0);
+        setPrognosticVariable((prev) =>
+          prev === 'wind_10m_vector' || prev === 'ivt' ? prev : 'none'
+        );
+        setProvenance((prev) =>
+          prev
+            ? {
+                ...prev,
+                forecastHour: 0,
+                temporalBlendTau: 0,
+                activeSlotIndex: 0,
+                validTimestamp: prev.runTimestamp,
+              }
+            : prev
+        );
+        if (typeof window !== 'undefined' && (window as any).__INDICATRIX_LIVE_UNIFORMS__) {
+          (window as any).__INDICATRIX_LIVE_UNIFORMS__.weatherTimeMinutes = 0;
+          (window as any).__INDICATRIX_LIVE_UNIFORMS__.weatherTau = 0;
+          (window as any).__INDICATRIX_LIVE_UNIFORMS__.scrubTau = 0;
+        }
+      }
+      if (isWn || isSat) {
+        const gfsLayer = dataLayers.find((l) => l.id === 'noaa-gfs-clouds');
+        if (gfsLayer && gfsLayer.visible) {
+          handleToggleDataLayer('noaa-gfs-clouds');
+        }
+      }
+      if (!isWn) {
+        const wnLayer = dataLayers.find((l) => l.id === 'google-weathernext3');
+        if (wnLayer && wnLayer.visible) {
+          handleToggleDataLayer('google-weathernext3');
+        }
+      }
       if (isWn) {
         const exists = dataLayers.find((l) => l.id === 'google-weathernext3');
         if (exists && !exists.visible) {
@@ -567,49 +566,188 @@ export default function App() {
       if (typeof window !== 'undefined') {
         const engine = window.__INDICATRIX_WEBGPU_ENGINE__ || window.__ENGINE;
         if (engine) {
+          const wnTargetHour = resetToDatum
+            ? 0
+            : Math.min(11, Math.max(0, Math.floor((timelineMinutes ?? 0) / 60)));
+          if (resetToDatum) {
+            if (typeof engine.updateAtmosphereUniforms === 'function') {
+              engine.updateAtmosphereUniforms({
+                weatherTimeMinutes: 0,
+                weatherTau: 0,
+                scrubTau: 0,
+                tau: 0,
+              });
+            }
+            if (typeof engine.setTimelineMinutes === 'function') {
+              engine.setTimelineMinutes(0);
+            }
+            if (engine.precipRingBuffer && typeof engine.setPrecipitationRingBuffer === 'function') {
+              engine.setPrecipitationRingBuffer(null);
+            }
+          } else {
+            const wnRing = window.__INDICATRIX_WEATHERNEXT_RING_BUFFER__;
+            if (wnRing && !wnRing.disposed && engine.precipRingBuffer !== wnRing && typeof engine.setPrecipitationRingBuffer === 'function') {
+              engine.setPrecipitationRingBuffer(wnRing);
+            }
+          }
+          lastWindHourRef.current = isWn || isSat ? wnTargetHour : -1;
           if (typeof engine.loadWindTexture === 'function') {
-            if (isWn) {
-              engine.loadWindTexture('/data/weathernext/wind_10m_vector-0.bin').catch(() => {});
+            if (isWn || isSat) {
+              engine.loadWindTexture(`/data/weathernext/wind_10m_vector-${wnTargetHour}.bin`, 0).catch(() => {
+                if (modelSwitchSeqRef.current === reqSeq) {
+                  engine.loadWindTexture('/data/gfs-wind-latest.bin').catch(() => {});
+                }
+              });
+              const nextWindHour = Math.min(11, wnTargetHour + 1);
+              engine.loadWindTexture(`/data/weathernext/wind_10m_vector-${nextWindHour}.bin`, 1).catch(() => {});
             } else {
               engine.loadWindTexture('/data/gfs-wind-latest.bin').catch(() => {});
             }
           }
           if (typeof engine.loadAllCloudLayers === 'function') {
-            engine.loadAllCloudLayers(isWn).catch(() => {});
+            if (isSat) {
+              engine.loadAllCloudLayers(false, wnTargetHour, 'satellite').catch(() => {});
+            } else {
+              engine.loadAllCloudLayers(isWn, wnTargetHour, isWn ? 'weathernext3' : 'gfs').catch(() => {});
+            }
           }
         }
       }
     },
-    [dataLayers, handleToggleDataLayer, handleAddDataLayer]
+    [dataLayers, handleToggleDataLayer, handleAddDataLayer, setProvenance, timelineMinutes]
   );
 
-  const handleSelectRenderStyleWithVectorAuto = useCallback(
-    (style: DataLayerRenderStyle) => {
-      handleSelectRenderStyle(style);
-      setLayerMode(2);
-      if (style === 'architectural') {
-        setShowVectors(true);
-      } else if (style === 'hybrid') {
-        setShowVectors(true);
-      }
-    },
-    [handleSelectRenderStyle, setLayerMode, setShowVectors]
-  );
+  useEffect(() => {
+    if (typeof window !== 'undefined') {
+      window.__INDICATRIX_SET_ATMOSPHERIC_SCALE__ = (valOrFn: any) => {
+        setAtmosphericScale((prev) => {
+          const v = typeof valOrFn === 'function' ? valOrFn(prev) : valOrFn;
+          if (typeof v !== 'number' || !Number.isFinite(v)) return prev;
+          return Math.max(1.0, Math.min(12.0, v));
+        });
+      };
+      window.__INDICATRIX_SET_SHADOW_INTENSITY__ = (valOrFn: any) => {
+        setShadowIntensity((prev) => {
+          const v = typeof valOrFn === 'function' ? valOrFn(prev) : valOrFn;
+          if (typeof v !== 'number' || !Number.isFinite(v)) return prev;
+          return Math.max(0.0, Math.min(0.60, v));
+        });
+      };
+      window.__INDICATRIX_SET_VERTICAL_SCALE_MODE__ = () => {};
+      window.__INDICATRIX_SET_RAIN_SHADOW_FEEDBACK__ = (valOrFn: any) => {
+        setRainShadowFeedback((prev) => {
+          const v = typeof valOrFn === 'function' ? valOrFn(prev) : valOrFn;
+          if (typeof v !== 'number' || !Number.isFinite(v)) return prev;
+          return Math.max(0.0, Math.min(1.0, v));
+        });
+      };
+      window.__INDICATRIX_SET_PLUVIAL_GAMMA__ = (valOrFn: any) => {
+        setPluvialGamma((prev) => {
+          const v = typeof valOrFn === 'function' ? valOrFn(prev) : valOrFn;
+          if (typeof v !== 'number' || !Number.isFinite(v)) return prev;
+          return Math.max(0.0, Math.min(2.0, v));
+        });
+      };
+      window.__INDICATRIX_SET_TIMELINE_MINUTES__ = (valOrFn: any) => {
+        setTimelineMinutes((prev) => {
+          const v = typeof valOrFn === 'function' ? valOrFn(prev) : valOrFn;
+          if (typeof v !== 'number' || !Number.isFinite(v)) return prev;
+          const clamped = Math.max(0, Math.min(2880, v));
+          const engine = window.__INDICATRIX_WEBGPU_ENGINE__ || window.__ENGINE;
+          if (engine && typeof engine.setTimelineMinutes === 'function') {
+            engine.setTimelineMinutes(clamped);
+          }
+          return clamped;
+        });
+      };
+      window.__INDICATRIX_SET_PROGNOSTIC_VARIABLE__ = (variable: string) => {
+        handlePrognosticVariableChange(variable);
+      };
+      window.__INDICATRIX_SET_PROGNOSTIC_MODEL__ = (model: PrognosticModelBackend) => {
+        if (inFlightModelChangeRef.current) return;
+        handlePrognosticModelChange(model);
+      };
+      (window as any).__INDICATRIX_TOGGLE_PLANETARY_LAYER__ = (id: string, force?: boolean) => {
+        handleTogglePlanetaryLayer(id, force);
+      };
+      (window as any).__INDICATRIX_DATA_LAYERS__ = dataLayers;
+      (window as any).__INDICATRIX_PURITY_MODE__ = purityMode;
+      (window as any).setPurityMode = handleSetPurityMode;
+      (window as any).__INDICATRIX_SET_PURITY_MODE__ = handleSetPurityMode;
 
-  const activeDirection = useMemo<'architectural' | 'hybrid' | 'photoreal' | null>(() => {
-    const active = dataLayers.find(
-      (l) => l.visible && (l.renderStyle === 'architectural' || l.renderStyle === 'hybrid' || l.renderStyle === 'photoreal')
-    );
-    return (active?.renderStyle as 'architectural' | 'hybrid' | 'photoreal') ?? null;
-  }, [dataLayers]);
+      Object.defineProperty(window, '__INDICATRIX_WEATHER_DIAGNOSTICS__', {
+        configurable: true,
+        get: () => {
+          const ds =
+            window.__INDICATRIX_WEATHERNEXT_DATA_SOURCE__ ||
+            window.__INDICATRIX_WEATHERNEXT_SOURCE__;
+          const ring = window.__INDICATRIX_WEATHERNEXT_RING_BUFFER__;
+          const engine = window.__INDICATRIX_WEBGPU_ENGINE__ || window.__ENGINE;
+          return {
+            prognosticModel,
+            prognosticVariable,
+            timelineMinutes,
+            weatherNext: {
+              active: !!ds && !ds.disposed,
+              currentHour: ds?.getCurrentHour?.() ?? 0,
+              activeVariable: ds?.getActiveVariable?.() ?? prognosticVariable,
+              vramBytes: ds?.getVRAMFootprintBytes?.() ?? 0,
+              ringBufferBound: !!ring && !ring.disposed,
+            },
+            enginePrecipBound: !!engine?.precipRingBuffer,
+          };
+        },
+      });
+    }
+  }, [
+    dataLayers,
+    handlePrognosticModelChange,
+    handlePrognosticVariableChange,
+    handleSetPurityMode,
+    handleTogglePlanetaryLayer,
+    prognosticModel,
+    prognosticVariable,
+    purityMode,
+    timelineMinutes,
+  ]);
+
+  useEffect(() => {
+    if (typeof window !== 'undefined') {
+      (window as any).__INDICATRIX_PURITY_MODE__ = purityMode;
+      (window as any).setPurityMode = handleSetPurityMode;
+    }
+  }, [purityMode, handleSetPurityMode]);
 
   const primaryLayer = useMemo(() => {
     return (
       dataLayers.find(
-        (l) => l.visible && (l.renderStyle === 'architectural' || l.renderStyle === 'hybrid' || l.renderStyle === 'photoreal')
+        (l) => l.visible && (l.renderStyle === 'architectural' || l.renderStyle === 'hybrid')
       ) || dataLayers[0]
     );
   }, [dataLayers]);
+
+  const primaryLayerId = primaryLayer?.id || (layerMode === 0 ? 'hybrid-crust-hydrosphere' : 'architectural-topo-relief');
+
+  const applyMediumCalibration = useCallback((targetMode: 0 | 1 | 2) => {
+    if (!primaryLayerId) return;
+    const preset = getMediumCalibrationPreset(targetMode);
+    handleHillshadeChangeDataLayer(primaryLayerId, preset.sunAzimuth, preset.hillshadeIntensity, preset.sunAltitude);
+    handleDisplacementScaleChangeDataLayer(primaryLayerId, preset.displacementScale);
+    handlePeakExponentChangeDataLayer(primaryLayerId, preset.peakExponent);
+    handleAmbientOcclusionChangeDataLayer(primaryLayerId, preset.ambientOcclusion);
+    handleWaterClarityChangeDataLayer(primaryLayerId, preset.waterClarity);
+    handleSeaLevelOffsetChangeDataLayer(primaryLayerId, preset.seaLevelOffset);
+    handlePaperToothChangeDataLayer(primaryLayerId, preset.paperTooth);
+  }, [
+    primaryLayerId,
+    handleHillshadeChangeDataLayer,
+    handleDisplacementScaleChangeDataLayer,
+    handlePeakExponentChangeDataLayer,
+    handleAmbientOcclusionChangeDataLayer,
+    handleWaterClarityChangeDataLayer,
+    handleSeaLevelOffsetChangeDataLayer,
+    handlePaperToothChangeDataLayer,
+  ]);
 
   useEffect(() => {
     registerDevToolsAPI(engineState);
@@ -632,7 +770,10 @@ export default function App() {
       } else if (e.key === 'h' || e.key === 'H') {
         setIsZenMode((z) => !z);
       } else if (e.key === 't' || e.key === 'T') {
-        setTheme((t) => (((t + 1) % 3) as 0 | 1 | 2));
+        const nextTheme = ((theme + 1) % 3) as 0 | 1 | 2;
+        setPurityMode(false);
+        setTheme(nextTheme);
+        applyMediumCalibration(nextTheme);
       } else if (e.key === 'v' || e.key === 'V') {
         setShowVectors((s) => !s);
       } else if (e.key === 'b' || e.key === 'B') {
@@ -640,12 +781,6 @@ export default function App() {
         // setBackend((b) => (b === 'webgpu' ? 'webgl2' : 'webgpu'))
       } else if (e.key === 'd' || e.key === 'D') {
         toggleDemoMode();
-      } else if (e.key === '7') {
-        handleSelectRenderStyleWithVectorAuto('architectural');
-      } else if (e.key === '8') {
-        handleSelectRenderStyleWithVectorAuto('hybrid');
-      } else if (e.key === '9') {
-        handleSelectRenderStyleWithVectorAuto('photoreal');
       } else if (e.key === '1') {
         cancelGlide();
         glideToMode(0);
@@ -663,17 +798,17 @@ export default function App() {
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
   }, [
-    activeDirection,
+    applyMediumCalibration,
     cancelGlide,
     glideToAlpha,
     glideToMode,
-    handleSelectRenderStyleWithVectorAuto,
     hasWebGPU,
     setBackend,
     setIsPlaying,
     setIsZenMode,
     setShowVectors,
     setTheme,
+    theme,
     toggleDemoMode,
   ]);
 
@@ -716,36 +851,65 @@ export default function App() {
 
   const isLight = theme === 1;
 
-  // Dynamic cartographic navigation telemetry (decoupled from static target and 60fps render storm)
-  const [telemetryCoords, setTelemetryCoords] = useState<{ latDeg: number; lonDeg: number }>({ latDeg: 0, lonDeg: 0 });
-  const handleCoordsChange = useCallback((newLat: number, newLon: number) => {
-    setTelemetryCoords((prev) => (prev.latDeg === newLat && prev.lonDeg === newLon ? prev : { latDeg: newLat, lonDeg: newLon }));
+  // Dynamic cartographic navigation telemetry routed to external leaf store (0 <App /> commits/sec)
+  const handleCoordsChange = useCallback((newLat: number, newLon: number, newCamDist?: number) => {
+    telemetryStore.setGeodeticCoords(newLat, newLon, newCamDist);
   }, []);
 
-  const { latDeg, lonDeg } = telemetryCoords;
-  const latStr = `${Math.abs(latDeg).toString().padStart(2, '0')}°00'${latDeg >= 0 ? 'N' : 'S'}`;
-  const lonStr = `${Math.abs(lonDeg).toString().padStart(3, '0')}°00'${lonDeg >= 0 ? 'E' : 'W'}`;
-  const mapScaleStr = alpha < 0.01 
-    ? '1 : 127,420,000' 
-    : `1 : ${Math.round(127420000 / Math.max(0.2, Math.cos((latDeg * Math.PI) / 180))).toLocaleString('en-US')}`;
+  useEffect(() => {
+    telemetryStore.setUnfurlScaleContext(alpha);
+  }, [alpha]);
+
+  useEffect(() => {
+    telemetryStore.setCameraAltitude(
+      Math.hypot(webgpuCameraPos[0], webgpuCameraPos[1], webgpuCameraPos[2])
+    );
+  }, [webgpuCameraPos]);
 
   const isSidebarActive = !isZenMode && isSidebarOpen;
 
+  const handleZenEnable = useCallback(() => setIsZenMode(true), [setIsZenMode]);
+  const handleThemeCycle = useCallback(() => setTheme((t) => (((t + 1) % 3) as 0 | 1 | 2)), [setTheme]);
+  const handleCartoucheToggle = useCallback(() => setShowCartouche((s) => !s), [setShowCartouche]);
+  const handleVectorsToggle = useCallback(() => setShowVectors((s) => !s), [setShowVectors]);
+  const handleToponymyToggle = useCallback(() => setShowToponymy((s) => !s), [setShowToponymy]);
+  const handlePurityModeToggle = useCallback(() => handleSetPurityMode((p) => !p), [handleSetPurityMode]);
+  const handleTerrainShadowsToggle = useCallback(() => setTerrainShadows((s) => !s), []);
+  const handleGeomorphicHydrologyToggle = useCallback(() => setGeomorphicHydrology((s) => !s), []);
+
+  const handleDockTogglePlay = useCallback(() => {
+    cancelGlide();
+    setIsPlaying((p) => !p);
+  }, [cancelGlide, setIsPlaying]);
+
+  const handleDockToggleSpeed = useCallback(() => {
+    setPlaybackSpeed((s) => (s === 0.5 ? 1.0 : s === 1.0 ? 2.0 : 0.5));
+  }, [setPlaybackSpeed]);
+
+  const handleDockAlphaChange = useCallback(
+    (val: number) => {
+      cancelGlide();
+      setIsPlaying(false);
+      if (telemetryStore.getLiveUnfurl() !== null) {
+        if (typeof window !== 'undefined') {
+          (window as any).__INDICATRIX_SCRUB_ALPHA__ = val;
+        }
+      } else {
+        setAlpha(val);
+      }
+    },
+    [cancelGlide, setIsPlaying, setAlpha]
+  );
+
   const handleSnapCamera = useCallback(
     (view: 'equator' | 'pole' | 'seam' | 'isometric' | 'horizon') => {
-      if (view === 'horizon') {
-        setShowClouds(true);
-        setAtmosphericScale((s) => (s <= 1.05 ? 6.0 : Math.max(s, 6.0)));
-        if (typeof window !== 'undefined' && window.__INDICATRIX_CAMERA__?.snapHorizonCrossSection) {
-          window.__INDICATRIX_CAMERA__.snapHorizonCrossSection(1.6);
-        } else {
-          snapCamera(view);
-        }
+      if (view === 'horizon' && typeof window !== 'undefined' && window.__INDICATRIX_CAMERA__?.snapHorizonCrossSection) {
+        window.__INDICATRIX_CAMERA__.snapHorizonCrossSection(1.6);
         return;
       }
       snapCamera(view);
     },
-    [snapCamera, setShowClouds, setAtmosphericScale]
+    [snapCamera]
   );
 
   return (
@@ -768,18 +932,10 @@ export default function App() {
 
         {/* Top Technical Calibration Bar (Aligned on 20px grid axis with 10px neatline clearance moat) */}
         {!isZenMode && (
-          <header className={`absolute top-5 left-5 right-5 ${isCatalogOpen ? 'xl:right-[51.75rem] md:right-[26.5rem]' : 'md:right-[26.5rem]'} ${isSidebarActive ? 'max-md:hidden' : ''} h-7 flex items-center justify-between gap-4 text-micro font-mono tracking-widest uppercase z-20 pointer-events-none px-3 rounded-[3px] border backdrop-blur-md shadow-sm transition-all duration-300 scroll-curl-lip bg-[var(--theme-panel-bg)] border-[var(--theme-panel-border)] text-[var(--theme-text-primary)]`}>
-            <div className="flex items-center gap-2 overflow-hidden whitespace-nowrap z-10 min-w-0 pr-3">
-              <span className="min-w-0 font-bold truncate">HYDROGRAPHIC SURVEY<span className="hidden xl:inline"> // CARTOGRAPHIC MATRIX</span></span>
-              <span className="hidden lg:inline opacity-40 shrink-0">|</span>
-              <span className="hidden lg:inline opacity-80 truncate shrink-0">SCALE {mapScaleStr}</span>
-            </div>
-            <div className="flex items-center gap-2.5 shrink-0 z-10 pl-3">
-              <span className="font-bold text-[var(--theme-text-accent)] tabular-nums">{latStr} · {lonStr}</span>
-              <span className="hidden sm:inline opacity-40 shrink-0">|</span>
-              <span className="hidden sm:inline opacity-80 font-bold shrink-0">WGS84 // EPSG:4326</span>
-            </div>
-          </header>
+          <CalibrationHeaderBar
+            isCatalogOpen={isCatalogOpen}
+            isSidebarActive={isSidebarActive}
+          />
         )}
 
 
@@ -801,16 +957,10 @@ export default function App() {
                 layerMode={layerMode}
                 theme={theme}
                 volumetricClouds={volumetricClouds}
-                isolatedStratum={isolatedStratum}
-                showSoundings={showSoundings}
-                showTriangulation={showTriangulation}
                 showCartouche={showCartouche}
                 resolution={resolution}
                 cameraTarget={cameraTarget}
                 cameraPosition={webgpuCameraPos}
-                activeOverlay={activeOverlay}
-                showLandmarks={showLandmarks}
-                showTissot={showTissot}
                 showVectors={showVectors}
                 showToponymy={showToponymy}
                 dataLayers={dataLayers}
@@ -818,8 +968,6 @@ export default function App() {
                 cdlodEnabled={cdlodEnabled}
                 cdlodDiagnosticMode={cdlodDiagnosticMode}
                 startTime={appStartTimeRef.current}
-                vortexStrength={fluidVortexStrength}
-                fractureIntensity={fractureIntensity}
                 isZenMode={isZenMode}
                 onGpuProfilerReport={setGpuReport}
                 onFpsUpdate={handleFpsUpdate}
@@ -831,7 +979,6 @@ export default function App() {
                 demoSequence={demoSequence}
                 onDemoModeChange={handleDemoModeChange}
                 showClouds={showClouds}
-                showAtmosphere={showAtmosphere}
                 showCloudLow={showCloudLow}
                 showCloudMid={showCloudMid}
                 showCloudHigh={showCloudHigh}
@@ -851,7 +998,6 @@ export default function App() {
                 verticalScaleMode={verticalScaleMode}
                 rainShadowFeedback={rainShadowFeedback}
                 pluvialGamma={pluvialGamma}
-                weatherOpticalMode={weatherOpticalMode}
                 timelineMinutes={timelineMinutes}
                 scrubTau={scrubTau}
                 weatherTau={scrubTau}
@@ -903,16 +1049,12 @@ export default function App() {
         {/* Top-Right Telemetry & Cartographic HUD */}
         <TelemetryHUD
           isZenMode={isZenMode}
-          onZenToggle={() => setIsZenMode(true)}
+          onZenToggle={handleZenEnable}
           theme={theme}
-          onThemeToggle={() => setTheme((t) => (((t + 1) % 3) as 0 | 1 | 2))}
-          onSelectThemeMode={(m) => setTheme(m)}
-          showSoundings={showSoundings}
-          onSoundingsToggle={() => setShowSoundings((s) => !s)}
-          showTriangulation={showTriangulation}
-          onTriangulationToggle={() => setShowTriangulation((s) => !s)}
+          onThemeToggle={handleThemeCycle}
+          onSelectThemeMode={setTheme}
           showCartouche={showCartouche}
-          onCartoucheToggle={() => setShowCartouche((s) => !s)}
+          onCartoucheToggle={handleCartoucheToggle}
           backend={backend}
           onBackendChange={setBackend}
           hasWebGPU={hasWebGPU}
@@ -922,24 +1064,12 @@ export default function App() {
           onLayerModeChange={setLayerMode}
           mode={mode}
           onModeChange={glideToMode}
-          cursorPhysicsEnabled={cursorPhysicsEnabled}
-          onCursorPhysicsToggle={setCursorPhysicsEnabled}
-          activeOverlay={activeOverlay}
-          onOverlayChange={setActiveOverlay}
-          showLandmarks={showLandmarks}
-          onLandmarksToggle={() => setShowLandmarks((s) => !s)}
-          showTissot={showTissot}
-          onTissotToggle={() => setShowTissot((s) => !s)}
           showVectors={showVectors}
-          onVectorsToggle={() => setShowVectors((s) => !s)}
+          onVectorsToggle={handleVectorsToggle}
           showToponymy={showToponymy}
-          onToponymyToggle={() => setShowToponymy((s) => !s)}
+          onToponymyToggle={handleToponymyToggle}
           onToponymyChange={setShowToponymy}
           alpha={alpha}
-          fps={fps}
-          latStr={latStr}
-          lonStr={lonStr}
-          mapScaleStr={mapScaleStr}
           dataInfo={dataInfo}
           cameraPosition={webgpuCameraPos}
           onSnapCamera={handleSnapCamera}
@@ -960,12 +1090,6 @@ export default function App() {
           onAmbientOcclusionChangeDataLayer={handleAmbientOcclusionChangeDataLayer}
           onPaperToothChangeDataLayer={handlePaperToothChangeDataLayer}
           onReorderDataLayer={handleReorderDataLayer}
-          onSelectRenderStyle={handleSelectRenderStyleWithVectorAuto}
-          fractureIntensity={fractureIntensity}
-          onFractureIntensityChange={handleFractureIntensityChange}
-          fluidVortexStrength={fluidVortexStrength}
-          onFluidVortexStrengthChange={handleFluidVortexStrengthChange}
-          gpuReport={gpuReport}
           isCatalogOpen={isCatalogOpen}
           onCatalogOpenChange={setIsCatalogOpen}
           isSidebarOpen={isSidebarOpen}
@@ -976,8 +1100,6 @@ export default function App() {
           onSelectDemoSequence={selectDemoSequence}
           showClouds={showClouds}
           onShowCloudsChange={setShowClouds}
-          showAtmosphere={showAtmosphere}
-          onShowAtmosphereChange={setShowAtmosphere}
           showCloudLow={showCloudLow}
           onShowCloudLowChange={setShowCloudLow}
           showCloudMid={showCloudMid}
@@ -1008,13 +1130,10 @@ export default function App() {
           onAtmosphericScaleChange={setAtmosphericScale}
           shadowIntensity={shadowIntensity}
           onShadowIntensityChange={setShadowIntensity}
-          verticalScaleMode={verticalScaleMode}
           rainShadowFeedback={rainShadowFeedback}
           onRainShadowFeedbackChange={setRainShadowFeedback}
           pluvialGamma={pluvialGamma}
           onPluvialGammaChange={setPluvialGamma}
-          weatherOpticalMode={weatherOpticalMode}
-          onWeatherOpticalModeChange={setWeatherOpticalMode}
           timelineMinutes={timelineMinutes}
           onTimelineChange={handleTimelineChange}
           thermodynamicGating={thermodynamicGating}
@@ -1024,26 +1143,21 @@ export default function App() {
           prognosticVariable={prognosticVariable}
           onPrognosticVariableChange={handlePrognosticVariableChange}
           purityMode={purityMode}
-          onPurityModeToggle={() => setPurityMode((p) => !p)}
+          onPurityModeToggle={handlePurityModeToggle}
           contourActive={contourActive}
           onContourActiveToggle={setContourActive}
-          cdlodEnabled={cdlodEnabled}
-          onCdlodToggle={setCdlodEnabled}
-          cdlodDiagnosticMode={cdlodDiagnosticMode}
-          onCdlodDiagnosticModeChange={setCdlodDiagnosticMode}
-          setCdlodDiagnosticMode={setCdlodDiagnosticMode}
           provenance={provenance}
           windSpeedMultiplier={windSpeedMultiplier}
           onWindSpeedMultiplierChange={setWindSpeedMultiplier}
           windParticleLifetime={windParticleLifetime}
           onWindParticleLifetimeChange={setWindParticleLifetime}
           terrainShadows={terrainShadows}
-          onTerrainShadowsToggle={() => setTerrainShadows((s) => !s)}
+          onTerrainShadowsToggle={handleTerrainShadowsToggle}
           onTerrainShadowsChange={setTerrainShadows}
           penumbraSoftness={penumbraSoftness}
           onPenumbraSoftnessChange={setPenumbraSoftness}
           geomorphicHydrology={geomorphicHydrology}
-          onGeomorphicHydrologyToggle={() => setGeomorphicHydrology((s) => !s)}
+          onGeomorphicHydrologyToggle={handleGeomorphicHydrologyToggle}
           onGeomorphicHydrologyChange={setGeomorphicHydrology}
           pluvialDischargeCoupling={pluvialDischargeCoupling}
           onPluvialDischargeCouplingChange={setPluvialDischargeCoupling}
@@ -1055,19 +1169,11 @@ export default function App() {
         <NavigationDock
           isZenMode={isZenMode}
           isPlaying={isPlaying}
-          onTogglePlay={() => {
-            cancelGlide();
-            setIsPlaying((p) => !p);
-          }}
+          onTogglePlay={handleDockTogglePlay}
           playbackSpeed={playbackSpeed}
-          onToggleSpeed={() => setPlaybackSpeed((s) => (s === 0.5 ? 1.0 : s === 1.0 ? 2.0 : 0.5))}
+          onToggleSpeed={handleDockToggleSpeed}
           alpha={alpha}
-          onAlphaChange={(val) => {
-            cancelGlide();
-            setIsPlaying(false);
-            cancelGlide();
-            setAlpha(val);
-          }}
+          onAlphaChange={handleDockAlphaChange}
           onGlideToAlpha={glideToAlpha}
           onGlideToMode={glideToMode}
           onCancelGlide={cancelGlide}
@@ -1100,9 +1206,7 @@ export default function App() {
 
               </span>
               <span className="opacity-40">|</span>
-              <span className="opacity-80 font-bold tabular-nums">
-                α: {Math.round(alpha * 100)}%
-              </span>
+              <ZenAlphaReadout alpha={alpha} />
             </div>
             <button
               onClick={() => setIsZenMode(false)}

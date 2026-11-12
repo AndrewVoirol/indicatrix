@@ -1,36 +1,18 @@
-import React, { useState, useMemo, useCallback, useEffect } from 'react';
-import { SimulationMode, GeodesicOverlayMode } from '../../../types';
+import React, { useState, useMemo, useEffect, useRef } from 'react';
 import { TactileSwitch } from '../../ui/TactileSwitch';
 import { VernierSlider } from '../../ui/VernierSlider';
 import { TactileSelect } from '../../ui/TactileSelect';
 
 export interface KinematicsTabProps {
-  theme: 0 | 1 | 2;
-  mode: SimulationMode;
-  alpha: number;
-  latStr: string;
   cameraPosition?: [number, number, number];
   onSnapCamera: (v: 'equator' | 'pole' | 'seam' | 'isometric' | 'horizon') => void;
+  alpha?: number;
+  isActive?: boolean;
   isDemoMode?: boolean;
   demoSequence?: 'hawaii' | 'cape-cod' | 'grand-canyon' | 'fuji';
   onToggleDemoMode?: (seq?: 'hawaii' | 'cape-cod' | 'grand-canyon' | 'fuji') => void;
   onSelectDemoSequence?: (seq: 'hawaii' | 'cape-cod' | 'grand-canyon' | 'fuji') => void;
-  fractureIntensity?: number;
-  onFractureIntensityChange?: (v: number) => void;
-  fluidVortexStrength?: number;
-  onFluidVortexStrengthChange?: (v: number) => void;
-  showTissot: boolean;
-  onTissotToggle: () => void;
-  activeOverlay: GeodesicOverlayMode;
-  onOverlayChange: (o: GeodesicOverlayMode) => void;
 }
-
-export const PROJECTION_MODES = [
-  { id: 0, roman: 'I', label: 'Linear' },
-  { id: 1, roman: 'II', label: 'Scroll' },
-  { id: 2, roman: 'III', label: 'Fracture' },
-  { id: 3, roman: 'IV', label: 'Fluid' },
-] as const;
 
 export const DEMO_PRESETS = [
   { id: 'hawaii', label: 'Hawaii', coordinates: "19°49'N 155°28'W", description: 'Volcanic hotspot & ocean trench' },
@@ -40,32 +22,33 @@ export const DEMO_PRESETS = [
 ] as const;
 
 export const KinematicsTab: React.FC<KinematicsTabProps> = ({
-  theme,
-  mode,
-  alpha,
-  latStr,
   cameraPosition,
   onSnapCamera,
+  alpha = 0,
+  isActive = true,
   isDemoMode = false,
   demoSequence = 'hawaii',
   onToggleDemoMode,
   onSelectDemoSequence,
-  fractureIntensity = 1.0,
-  onFractureIntensityChange,
-  fluidVortexStrength = 1.0,
-  onFluidVortexStrengthChange,
-  showTissot,
-  onTissotToggle,
-  activeOverlay,
-  onOverlayChange,
 }) => {
   const [activeSnap, setActiveSnap] = useState<'equator' | 'pole' | 'seam' | 'isometric' | 'horizon' | null>(null);
+  const snapAnchorRef = useRef<{ time: number; settledPos: [number, number, number] | null } | null>(null);
   const [liveCameraState, setLiveCameraState] = useState<{
     pos: [number, number, number] | null;
     pitch: number | null;
-  }>({ pos: null, pitch: null });
+    coords: { lat: number; lon: number } | null;
+    camDist: number | null;
+  }>({ pos: null, pitch: null, coords: null, camDist: null });
 
   useEffect(() => {
+    if (isDemoMode) {
+      setActiveSnap(null);
+      snapAnchorRef.current = null;
+    }
+  }, [isDemoMode]);
+
+  useEffect(() => {
+    if (!isActive) return;
     if (typeof window === 'undefined') return;
     if (typeof navigator !== 'undefined' && /jsdom|HappyDOM/i.test(navigator.userAgent || '')) return;
     const syncCam = () => {
@@ -73,13 +56,41 @@ export const KinematicsTab: React.FC<KinematicsTabProps> = ({
       if (!cam) return;
       const pos = typeof cam.getPosition === 'function' ? cam.getPosition() : null;
       const pitchVal = typeof cam.getPitch === 'function' ? cam.getPitch() : (typeof cam.pitch === 'number' ? cam.pitch : null);
+      const activeCoords = typeof cam.getActiveCoords === 'function' ? cam.getActiveCoords() : null;
+      const distVal = typeof cam.getCamDist === 'function' ? cam.getCamDist() : null;
+
+      if (snapAnchorRef.current && Array.isArray(pos) && pos.length >= 3) {
+        const elapsed = performance.now() - snapAnchorRef.current.time;
+        if (elapsed > 1800) {
+          if (!snapAnchorRef.current.settledPos) {
+            snapAnchorRef.current.settledPos = [Number(pos[0]) || 0, Number(pos[1]) || 0, Number(pos[2]) || 15];
+          } else {
+            const dx = (Number(pos[0]) || 0) - snapAnchorRef.current.settledPos[0];
+            const dy = (Number(pos[1]) || 0) - snapAnchorRef.current.settledPos[1];
+            const dz = (Number(pos[2]) || 0) - snapAnchorRef.current.settledPos[2];
+            if (Math.hypot(dx, dy, dz) > 0.15) {
+              snapAnchorRef.current = null;
+              setActiveSnap(null);
+            }
+          }
+        }
+      }
+
       setLiveCameraState((prev) => {
         const nextPos: [number, number, number] | null = Array.isArray(pos) && pos.length >= 3
           ? [Number(pos[0]) || 0, Number(pos[1]) || 0, Number(pos[2]) || 15]
           : prev.pos;
         const nextPitch = typeof pitchVal === 'number' && Number.isFinite(pitchVal) ? pitchVal : prev.pitch;
+        const nextCoords =
+          activeCoords && Number.isFinite(activeCoords.lat) && Number.isFinite(activeCoords.lon)
+            ? { lat: Number(activeCoords.lat), lon: Number(activeCoords.lon) }
+            : prev.coords;
+        const nextDist = typeof distVal === 'number' && Number.isFinite(distVal) ? distVal : prev.camDist;
         if (
           prev.pitch === nextPitch &&
+          prev.camDist === nextDist &&
+          prev.coords?.lat === nextCoords?.lat &&
+          prev.coords?.lon === nextCoords?.lon &&
           prev.pos &&
           nextPos &&
           Math.abs(prev.pos[0] - nextPos[0]) < 0.005 &&
@@ -88,65 +99,47 @@ export const KinematicsTab: React.FC<KinematicsTabProps> = ({
         ) {
           return prev;
         }
-        return { pos: nextPos, pitch: nextPitch };
+        return { pos: nextPos, pitch: nextPitch, coords: nextCoords, camDist: nextDist };
       });
     };
     syncCam();
     const timer = window.setInterval(syncCam, 120);
     return () => window.clearInterval(timer);
-  }, []);
+  }, [isActive]);
 
   const attitudeReadout = useMemo(() => {
-    const pos = cameraPosition || liveCameraState.pos || [0, 0, 15];
+    const pos = liveCameraState.pos || cameraPosition || [0, 0, 15];
     const [x, y, z] = pos;
-    const r = Math.sqrt(x * x + y * y + z * z);
-    const alt = r > 0.001 ? r.toFixed(1) : '15.0';
-    let pitch = (Math.asin(Math.max(-1, Math.min(1, y / (r || 1)))) * (180 / Math.PI)).toFixed(1);
-    if (pitch === '-0.0') pitch = '0.0';
-    let yaw = (Math.atan2(x, z) * (180 / Math.PI)).toFixed(1);
-    if (yaw === '-0.0') yaw = '0.0';
-    return `PITCH: ${pitch}° · YAW: ${yaw}° · ALT: ${alt} R`;
-  }, [cameraPosition, liveCameraState.pos]);
+    let latNum: number;
+    let lonNum: number;
+    let altStr: string;
 
-  const parsedLat = useMemo(() => {
-    if (!latStr) return 0;
-    const match = latStr.match(/(\d+)°(?:(\d+)['\u2032])?([NS])?/);
-    if (!match) return 0;
-    const deg = parseFloat(match[1]) + (match[2] ? parseFloat(match[2]) / 60 : 0);
-    return match[3] === 'S' ? -deg : deg;
-  }, [latStr]);
-
-  const tissotTelemetry = useMemo(() => {
-    const latRad = (parsedLat * Math.PI) / 180;
-    const cosLat = Math.max(0.087, Math.cos(latRad));
-    const eqArea = ((1 - alpha) * 1.0 + alpha * 1.0).toFixed(3);
-    const camBaseRatio = mode === 1 ? 1.0 / (cosLat * cosLat) : mode === 0 ? 1.0 / cosLat : 1.0;
-    const localArea = ((1 - alpha) * 1.0 + alpha * camBaseRatio).toFixed(3);
-    const polarBaseRatio = mode === 1 ? 131.6 : mode === 0 ? 11.5 : mode === 3 ? 1.0 : 1.12;
-    const polarVal = (1 - alpha) * 1.0 + alpha * polarBaseRatio;
-    const polarStr = mode === 1 ? (alpha < 0.01 ? '1.000×' : `${polarVal.toFixed(1)}× (85° limit)`) : `${polarVal.toFixed(2)}×`;
-    return { eqArea, localArea, polarStr };
-  }, [parsedLat, alpha, mode]);
-
-  const handleSelectGeodesicFeed = useCallback(
-    (feed: GeodesicOverlayMode) => {
-      onOverlayChange?.(feed);
-      if (typeof window !== 'undefined') {
-        const camDev = (window as any).__INDICATRIX_CAMERA__;
-        if (feed === 'conveyor') {
-          if (camDev?.easeToCoordinates) camDev.easeToCoordinates(-165, 10, 14.0, 1.4);
-          else if (camDev?.lookAtCoordinates) camDev.lookAtCoordinates(-165, 10, 14.0);
-        } else if (feed === 'migration') {
-          if (camDev?.easeToCoordinates) camDev.easeToCoordinates(-175, 15, 14.0, 1.4);
-          else if (camDev?.lookAtCoordinates) camDev.lookAtCoordinates(-175, 15, 14.0);
-        } else if (feed === 'antipodes') {
-          if (camDev?.easeToCoordinates) camDev.easeToCoordinates(-65, 0, 14.0, 1.4);
-          else if (camDev?.lookAtCoordinates) camDev.lookAtCoordinates(-65, 0, 14.0);
-        }
+    if (alpha > 0.5) {
+      // Planar unfolded chart
+      if (liveCameraState.coords) {
+        latNum = liveCameraState.coords.lat;
+        lonNum = liveCameraState.coords.lon;
+      } else {
+        lonNum = Math.max(-180, Math.min(180, (x / 5.0) * (180 / Math.PI)));
+        latNum = Math.max(-90, Math.min(90, (y / 5.0) * (180 / Math.PI)));
       }
-    },
-    [onOverlayChange]
-  );
+      const effDist = liveCameraState.camDist ?? (5.0 + Math.abs(z - 5.0));
+      altStr = effDist > 0.001 ? effDist.toFixed(1) : '15.0';
+    } else {
+      const r = Math.sqrt(x * x + y * y + z * z);
+      altStr = r > 0.001 ? r.toFixed(1) : '15.0';
+      latNum = Math.asin(Math.max(-1, Math.min(1, y / (r || 1)))) * (180 / Math.PI);
+      lonNum = Math.atan2(x, z) * (180 / Math.PI);
+    }
+
+    let lat = latNum.toFixed(1);
+    if (lat === '-0.0') lat = '0.0';
+    let lon = lonNum.toFixed(1);
+    if (lon === '-0.0') lon = '0.0';
+    let pitchVal = (liveCameraState.pitch ?? 0).toFixed(1);
+    if (pitchVal === '-0.0') pitchVal = '0.0';
+    return `LAT: ${lat}° · LON: ${lon}° · PITCH: ${pitchVal}° · ALT: ${altStr} R`;
+  }, [alpha, cameraPosition, liveCameraState.camDist, liveCameraState.coords, liveCameraState.pos, liveCameraState.pitch]);
 
   return (
     <>
@@ -180,6 +173,14 @@ export const KinematicsTab: React.FC<KinematicsTabProps> = ({
                 type="button"
                 onClick={() => {
                   setActiveSnap(snap.key);
+                  snapAnchorRef.current = { time: performance.now(), settledPos: null };
+                  setLiveCameraState((prev) => ({
+                    ...prev,
+                    pitch: snap.key === 'horizon' ? 78 : 0,
+                  }));
+                  if (snap.key !== 'horizon' && typeof window !== 'undefined' && (window as any).__INDICATRIX_LIVE_UNIFORMS__) {
+                    (window as any).__INDICATRIX_LIVE_UNIFORMS__.cameraPitchDeg = 0;
+                  }
                   onSnapCamera(snap.key);
                 }}
                 data-glyph={snap.glyph}
@@ -198,22 +199,13 @@ export const KinematicsTab: React.FC<KinematicsTabProps> = ({
         </div>
 
         <div className="pt-2 border-t border-[var(--theme-card-border)] space-y-1.5">
-          <div className="flex items-center justify-between">
-            <div className="flex flex-col">
-              <span className="text-micro font-bold uppercase tracking-wider text-[var(--theme-text-primary)]">
-                Flyover Tour
-              </span>
-              <span className="text-nano font-mono text-[var(--theme-text-tertiary)]">
-                Cinematic orbital & regional insets
-              </span>
-            </div>
-            <TactileSwitch
-              checked={Boolean(isDemoMode)}
-              onChange={() => onToggleDemoMode?.(demoSequence)}
-              title="Toggle Continuous Cinematics & Regional Insets Tour"
-              label={isDemoMode ? 'Active' : 'Off'}
-            />
-          </div>
+          <TactileSwitch
+            checked={Boolean(isDemoMode)}
+            onChange={() => onToggleDemoMode?.(demoSequence)}
+            title="Toggle Continuous Cinematics & Regional Insets Tour"
+            label="Flyover Tour"
+            sublabel="Cinematic orbital & regional insets"
+          />
           <TactileSelect
             id="sidebar-demo-sequence"
             value={demoSequence || 'hawaii'}
@@ -224,14 +216,14 @@ export const KinematicsTab: React.FC<KinematicsTabProps> = ({
         </div>
       </div>
 
-      {/* Observation Presets & Camera Horizon Pitch (moved from Atmosphere tab) */}
+      {/* Camera Horizon Pitch */}
       <div className="p-2.5 rounded-[3px] border border-[var(--theme-card-border)] bg-[var(--theme-card-bg)] space-y-2 transition-all shadow-sm">
         <div className="flex items-center justify-between text-nano">
           <span className="font-bold text-[var(--theme-text-primary)] uppercase tracking-wider text-micro">
-            Observation Presets
+            Camera Horizon Pitch
           </span>
           <span className="text-[var(--theme-text-muted)] font-mono text-nano">
-            Altitude & Pitch
+            0° Nadir — 85° Grazing
           </span>
         </div>
 
@@ -252,6 +244,8 @@ export const KinematicsTab: React.FC<KinematicsTabProps> = ({
           max={85}
           step={1}
           onChange={(val: number) => {
+            setActiveSnap(null);
+            snapAnchorRef.current = null;
             setLiveCameraState((prev) => ({ ...prev, pitch: val }));
             if (typeof window !== 'undefined') {
               const cam = (window as any).__INDICATRIX_CAMERA__;
@@ -272,213 +266,6 @@ export const KinematicsTab: React.FC<KinematicsTabProps> = ({
           tooltip="Camera Horizon Pitch Angle (0° Nadir to 85° Grazing)"
           className="!border-0 !bg-transparent !p-0 !shadow-none"
         />
-
-        {/* Tropospheric Altitude Presets */}
-        <div className="space-y-1 pt-1 border-t border-[var(--theme-card-border-50)]">
-          <span className="font-mono uppercase tracking-wider text-nano text-[var(--theme-text-muted)]">
-            Tropospheric Altitude Presets
-          </span>
-          <div className="grid grid-cols-3 gap-1">
-            {[
-              { label: 'Orbital', alt: 16.0, pitch: 0.0, hdg: 0.0, title: 'Orbital (14,000 km)' },
-              { label: 'Stratosphere', alt: 5.012, pitch: 52.0, hdg: 20.0, title: 'Stratosphere (15 km)' },
-              { label: 'Cirrus', alt: 5.007, pitch: 68.0, hdg: 45.0, title: 'Cirrus Deck (9 km)' },
-              { label: 'Altocumulus', alt: 5.0035, pitch: 78.0, hdg: 90.0, title: 'Altocumulus Deck (4 km)' },
-              { label: 'Sub-Cloud', alt: 5.0009, pitch: 84.0, hdg: 135.0, title: 'Sub-Cloud Ceiling (1.2 km)' },
-              { label: 'Peak (300m)', alt: 5.0003, pitch: 98.0, hdg: 180.0, title: 'Ground / Peak (300 m)' },
-            ].map((preset) => (
-              <button
-                key={preset.label}
-                type="button"
-                onClick={() => {
-                  if (typeof window !== 'undefined' && (window as any).__INDICATRIX_CAMERA__?.setObliqueView) {
-                    const coords = (window as any).__INDICATRIX_CAMERA__?.activeCoords || { lon: -121.76, lat: 46.85 };
-                    (window as any).__INDICATRIX_CAMERA__.setObliqueView(
-                      coords.lon ?? -121.76,
-                      coords.lat ?? 46.85,
-                      preset.alt,
-                      preset.pitch,
-                      preset.hdg
-                    );
-                  }
-                }}
-                className="py-1 px-1 rounded-[2px] border text-center font-mono text-micro uppercase tracking-wider bg-[var(--theme-control-bg)] hover:bg-[var(--theme-control-hover-bg)] text-[var(--theme-text-primary)] border-[var(--theme-control-border)] transition-colors cursor-pointer truncate"
-                title={preset.title}
-              >
-                {preset.label}
-              </button>
-            ))}
-          </div>
-        </div>
-      </div>
-
-      {/* 2. Projection Manifold Station */}
-      <div className="p-2.5 rounded-[3px] border border-[var(--theme-card-border)] bg-[var(--theme-card-bg)] space-y-2 transition-all shadow-sm">
-        <div className="flex items-center justify-between">
-          <span className="text-micro uppercase font-bold tracking-wider text-[var(--theme-text-primary)]">
-            Projection Manifold
-          </span>
-          <span className="text-nano font-mono text-[var(--theme-text-muted)]">
-            Dock Controlled
-          </span>
-        </div>
-
-        <div
-          className="px-2.5 py-1.5 rounded-[2px] border border-[var(--theme-control-border)] bg-[var(--theme-control-bg)] flex items-center justify-between transition-all"
-          title="Projection mode is controlled via the Navigation Dock"
-        >
-          <div className="flex flex-col">
-            <span className="text-nano font-mono uppercase tracking-wider text-[var(--theme-text-muted)]">
-              Active Manifold
-            </span>
-            <span className="text-micro font-bold font-mono text-[var(--theme-text-primary)]">
-              Mode {PROJECTION_MODES[mode]?.roman ?? 'I'} · {PROJECTION_MODES[mode]?.label ?? 'Linear'}
-            </span>
-          </div>
-          <span className="text-nano font-mono px-2 py-0.5 rounded-[2px] bg-[var(--theme-control-active-bg)] text-[var(--theme-control-active-text)] border border-[var(--theme-control-active-border)] shadow-sm font-semibold">
-            Synchronized
-          </span>
-        </div>
-
-        {mode === 2 && (
-          <div className="pt-2 border-t border-[var(--theme-card-border)] animate-in fade-in slide-in-from-top-1 duration-150">
-            <VernierSlider
-              id="sidebar-fracture-intensity"
-              label="Fracture"
-              tooltip="Griffith linear elastic fracture mechanics (LEFM) rift expansion multiplier (0.50× to 2.50×)"
-              value={fractureIntensity ?? 1.0}
-              min={0.5}
-              max={2.5}
-              step={0.05}
-              defaultValue={1.0}
-              readout={`${(fractureIntensity ?? 1.0).toFixed(2)}×`}
-              onChange={(v) => onFractureIntensityChange?.(v)}
-              className="!border-0 !bg-transparent !p-0 !shadow-none"
-            />
-          </div>
-        )}
-
-        {mode === 3 && (
-          <div className="pt-2 border-t border-[var(--theme-card-border)] animate-in fade-in slide-in-from-top-1 duration-150">
-            <VernierSlider
-              id="sidebar-vortex-strength"
-              label="Vortex"
-              tooltip="Lamb-Oseen hydrodynamic vortex circulation intensity for fluid manifold unfurling (0.20× to 3.00×)"
-              value={fluidVortexStrength ?? 1.0}
-              min={0.2}
-              max={3.0}
-              step={0.05}
-              defaultValue={1.0}
-              readout={`${(fluidVortexStrength ?? 1.0).toFixed(2)}×`}
-              onChange={(v) => onFluidVortexStrengthChange?.(v)}
-              className="!border-0 !bg-transparent !p-0 !shadow-none"
-            />
-          </div>
-        )}
-
-        <div className="pt-2 border-t border-[var(--theme-card-border)] space-y-2">
-          <div className="flex items-center justify-between">
-            <div className="flex flex-col">
-              <span className="text-micro font-bold uppercase tracking-wider text-[var(--theme-text-primary)]">
-                Distortion Indicatrix
-              </span>
-              <span className="text-nano font-mono text-[var(--theme-text-tertiary)]">
-                Tissot deformation ellipses
-              </span>
-            </div>
-            <TactileSwitch
-              checked={showTissot}
-              onChange={onTissotToggle}
-              title="Toggle Tissot Distortion Indicatrix Ellipses"
-              label={showTissot ? 'Active' : 'Off'}
-            />
-          </div>
-
-          {showTissot && (
-            <div className="p-2 rounded-[2px] border text-micro space-y-1.5 tabular-nums bg-[var(--theme-control-bg)] border-[var(--theme-control-border)] text-[var(--theme-text-primary)]">
-              <div className="flex justify-between items-center text-nano uppercase tracking-wider font-semibold">
-                <span>Distortion Metric</span>
-                <span className="text-[var(--theme-status-sage)] font-bold">Morphing</span>
-              </div>
-              <div className="grid grid-cols-3 gap-1.5 text-nano font-mono">
-                <div>
-                  <span className="text-[var(--theme-text-muted)] block truncate text-nano uppercase">Eq. Area:</span>
-                  <span className="font-semibold text-[var(--theme-text-primary)]">{tissotTelemetry.eqArea}×</span>
-                </div>
-                <div>
-                  <span className="text-[var(--theme-text-muted)] block truncate text-nano uppercase">Local ({latStr.trim()}):</span>
-                  <span className="font-semibold text-[var(--theme-text-primary)]">{tissotTelemetry.localArea}×</span>
-                </div>
-                <div>
-                  <span className="text-[var(--theme-text-muted)] block truncate text-nano uppercase">Polar Dilation:</span>
-                  <span className="font-semibold text-[var(--theme-text-primary)]">{tissotTelemetry.polarStr}</span>
-                </div>
-              </div>
-            </div>
-          )}
-        </div>
-      </div>
-
-      {/* 3. Global Geodesic Feeds Card */}
-      <div className="p-2.5 rounded-[3px] border border-[var(--theme-card-border)] bg-[var(--theme-card-bg)] space-y-2 transition-all shadow-sm">
-        <div className="flex items-center justify-between">
-          <div className="text-micro uppercase font-bold tracking-wider text-[var(--theme-text-primary)]">
-            Global Geodesic Feeds
-          </div>
-          <span className="text-nano font-mono text-[var(--theme-text-muted)]">
-            {activeOverlay === 'off' ? 'Off' : activeOverlay}
-          </span>
-        </div>
-
-        <div className="grid grid-cols-4 gap-1">
-          <button
-            type="button"
-            onClick={() => handleSelectGeodesicFeed('off')}
-            className={`py-1.5 px-1 rounded-[2px] text-nano font-bold transition-all text-center border cursor-pointer ${
-              activeOverlay === 'off'
-                ? 'bg-[var(--theme-control-active-bg)] text-[var(--theme-control-active-text)] border-[var(--theme-control-active-border)] shadow-sm font-semibold ring-1 ring-[var(--theme-control-active-ring)]'
-                : 'border-[var(--theme-control-border)] text-[var(--theme-text-secondary)] hover:text-[var(--theme-text-primary)] hover:border-[var(--theme-card-border-hover)] hover:bg-[var(--theme-control-hover-bg)] bg-[var(--theme-control-bg)]'
-            }`}
-          >
-            Off
-          </button>
-          <button
-            type="button"
-            onClick={() => handleSelectGeodesicFeed('antipodes')}
-            title="Antipodal Geodesic Connectors"
-            className={`py-1.5 px-1 rounded-[2px] text-nano font-bold transition-all text-center border cursor-pointer ${
-              activeOverlay === 'antipodes'
-                ? 'bg-[var(--theme-direction-a-bg)] text-[var(--theme-direction-a-text)] border-[var(--theme-direction-a-border)] shadow-sm font-semibold ring-1 ring-[var(--theme-direction-a-ring)]'
-                : 'border-[var(--theme-control-border)] text-[var(--theme-text-secondary)] hover:text-[var(--theme-text-accent)] hover:border-[var(--theme-text-accent-40)] hover:bg-[var(--theme-control-hover-bg)] bg-[var(--theme-control-bg)]'
-            }`}
-          >
-            Antipodes
-          </button>
-          <button
-            type="button"
-            onClick={() => handleSelectGeodesicFeed('conveyor')}
-            title="Global Oceanic Conveyor Belt"
-            className={`py-1.5 px-1 rounded-[2px] text-nano font-bold transition-all text-center border cursor-pointer ${
-              activeOverlay === 'conveyor'
-                ? 'bg-[var(--theme-direction-b-bg)] text-[var(--theme-direction-b-text)] border-[var(--theme-direction-b-border)] shadow-sm font-semibold ring-1 ring-[var(--theme-direction-b-ring)]'
-                : 'border-[var(--theme-control-border)] text-[var(--theme-text-secondary)] hover:text-[var(--theme-status-sage)] hover:border-[var(--theme-status-sage-50)] hover:bg-[var(--theme-control-hover-bg)] bg-[var(--theme-control-bg)]'
-            }`}
-          >
-            Conveyor
-          </button>
-          <button
-            type="button"
-            onClick={() => handleSelectGeodesicFeed('migration')}
-            title="Great Circle Migration"
-            className={`py-1.5 px-1 rounded-[2px] text-nano font-bold transition-all text-center border cursor-pointer ${
-              activeOverlay === 'migration'
-                ? 'bg-[var(--theme-direction-c-bg)] text-[var(--theme-direction-c-text)] border-[var(--theme-direction-c-border)] shadow-sm font-semibold ring-1 ring-[var(--theme-direction-c-ring)]'
-                : 'border-[var(--theme-control-border)] text-[var(--theme-text-secondary)] hover:text-[var(--theme-status-amber)] hover:border-[var(--theme-status-amber-50)] hover:bg-[var(--theme-control-hover-bg)] bg-[var(--theme-control-bg)]'
-            }`}
-          >
-            Migration
-          </button>
-        </div>
       </div>
     </>
   );

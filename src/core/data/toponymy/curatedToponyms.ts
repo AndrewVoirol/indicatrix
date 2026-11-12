@@ -8,7 +8,6 @@
 // ============================================================================
 
 import { ToponymLabel, ToponymCategory, ToponymTier } from './types';
-import { ARCHIVAL_SOUNDINGS, GEODETIC_BENCHMARKS } from '../archivalSoundings';
 
 // ----------------------------------------------------------------------------
 // Hierarchical Zoom-Gating Camera Distance Thresholds (ZOOM_DETAIL_SPEC_LEDGER §5.2)
@@ -65,6 +64,9 @@ export const GLOBAL_SUMMITS: ToponymLabel[] = [
   { id: 'FUJI', text: '▲ Mt. Fuji 3,776 m', lat: 35.3606, lon: 138.7274, elevationMeters: 3776, fontSize: 10.5, priority: 1, category: 'summit', tier: 'local', minCamDist: TOPONYM_CAM_DIST_LOCAL },
   { id: 'AORAKI', text: '▲ Aoraki Mt. Cook 3,724 m', lat: -43.5950, lon: 170.1419, elevationMeters: 3724, fontSize: 10.0, priority: 2, category: 'summit', tier: 'local', minCamDist: TOPONYM_CAM_DIST_LOCAL },
   { id: 'TEIDE', text: '▲ Mt. Teide 3,715 m', lat: 28.2723, lon: -16.6425, elevationMeters: 3715, fontSize: 10.0, priority: 2, category: 'summit', tier: 'local', minCamDist: TOPONYM_CAM_DIST_LOCAL },
+  { id: 'LONGS_PEAK', text: '▲ Longs Peak 4,346 m', lat: 40.2550, lon: -105.6151, elevationMeters: 4346, fontSize: 10.5, priority: 2, category: 'summit', tier: 'local', minCamDist: TOPONYM_CAM_DIST_LOCAL },
+  { id: 'EAGLE_PEAK_YNP', text: '▲ Eagle Peak 3,462 m', lat: 44.3214, lon: -110.0274, elevationMeters: 3462, fontSize: 10.0, priority: 2, category: 'summit', tier: 'local', minCamDist: TOPONYM_CAM_DIST_LOCAL },
+  { id: 'MT_WASHBURN', text: '▲ Mt. Washburn 3,122 m', lat: 44.7977, lon: -110.4344, elevationMeters: 3122, fontSize: 10.0, priority: 2, category: 'summit', tier: 'local', minCamDist: TOPONYM_CAM_DIST_LOCAL },
 ];
 
 // ----------------------------------------------------------------------------
@@ -166,6 +168,7 @@ export const CONTINENTAL_SHIELDS: ToponymLabel[] = [
   { id: 'DECCAN_TRAPS', text: 'Deccan Plateau', lat: 16.5000, lon: 76.0000, elevationMeters: 700, fontSize: 11.0, priority: 2, category: 'shield', tier: 'regional', minCamDist: TOPONYM_CAM_DIST_REGIONAL },
   { id: 'PATAGONIAN_PLATEAU', text: 'Patagonian Plateau', lat: -45.0000, lon: -69.0000, elevationMeters: 1000, fontSize: 11.0, priority: 2, category: 'shield', tier: 'regional', minCamDist: TOPONYM_CAM_DIST_REGIONAL },
   { id: 'ETHIOPIAN_HIGHLANDS', text: 'Ethiopian Highlands', lat: 11.0000, lon: 39.5000, elevationMeters: 2500, fontSize: 11.0, priority: 2, category: 'shield', tier: 'regional', minCamDist: TOPONYM_CAM_DIST_REGIONAL },
+  { id: 'YELLOWSTONE_CALDERA', text: 'Yellowstone Caldera', lat: 44.4600, lon: -110.5000, elevationMeters: 2400, fontSize: 11.5, priority: 1, category: 'shield', tier: 'regional', minCamDist: TOPONYM_CAM_DIST_REGIONAL },
 ];
 
 // ----------------------------------------------------------------------------
@@ -187,6 +190,7 @@ export const MOUNTAIN_RANGES: ToponymLabel[] = [
   { id: 'APPALACHIANS', text: 'Appalachian Mountains', lat: 37.0000, lon: -80.0000, elevationMeters: 1200, fontSize: 11.5, priority: 2, category: 'range', tier: 'regional', minCamDist: TOPONYM_CAM_DIST_REGIONAL },
   { id: 'GRAND_CANYON_GORGE', text: 'Grand Canyon Gorge', lat: 36.1300, lon: -112.1400, elevationMeters: 2100, fontSize: 12.0, priority: 1, category: 'range', tier: 'regional', minCamDist: TOPONYM_CAM_DIST_REGIONAL },
   { id: 'MAUNA_LOA_SHIELD', text: 'Mauna Loa Shield', lat: 19.5500, lon: -155.8300, elevationMeters: 1850, fontSize: 12.0, priority: 1, category: 'range', tier: 'regional', minCamDist: TOPONYM_CAM_DIST_REGIONAL },
+  { id: 'BOULDER_FLATIRONS', text: 'Front Range & Flatirons', lat: 39.9990, lon: -105.2930, elevationMeters: 2150, fontSize: 11.5, priority: 1, category: 'range', tier: 'regional', minCamDist: TOPONYM_CAM_DIST_REGIONAL },
 ];
 
 // ----------------------------------------------------------------------------
@@ -232,54 +236,7 @@ export const GREAT_CIRCLES: ToponymLabel[] = [
 ];
 
 // ----------------------------------------------------------------------------
-// 9. Historical 19th-Century Geodetic Survey Benchmarks
-// ----------------------------------------------------------------------------
-export const GEODETIC_SURVEY_LABELS: ToponymLabel[] = GEODETIC_BENCHMARKS.map((bm) => ({
-  id: `BM_${bm.id}`,
-  text: `[${bm.id}] ${bm.name}`,
-  lat: bm.lat,
-  lon: bm.lon,
-  elevationMeters: 0,
-  fontSize: 9.5,
-  fontStyle: 1, // Technical font
-  priority: 3,
-  category: 'geodetic' as ToponymCategory,
-  tier: 'local' as ToponymTier,
-  minCamDist: TOPONYM_CAM_DIST_LOCAL,
-}));
-
-// ----------------------------------------------------------------------------
-// 10. Archival Hydrographic Depth Soundings
-// ----------------------------------------------------------------------------
-export const ARCHIVAL_SOUNDING_LABELS: ToponymLabel[] = [
-  ...ARCHIVAL_SOUNDINGS.map((s, idx) => ({
-    id: `SND_${idx}`,
-    text: `${s.depthFm} fm (${s.name})`,
-    lat: s.lat,
-    lon: s.lon,
-    elevationMeters: -s.depthM,
-    fontSize: 9.0,
-    priority: 3,
-    category: 'sounding' as ToponymCategory,
-    tier: 'local' as ToponymTier,
-    minCamDist: TOPONYM_CAM_DIST_LOCAL,
-  })),
-  {
-    id: 'SND_KONA_ABYSS',
-    text: '2140 fm (Kona Trench)',
-    lat: 19.5100,
-    lon: -155.9400,
-    elevationMeters: -3914,
-    fontSize: 9.5,
-    priority: 2,
-    category: 'sounding' as ToponymCategory,
-    tier: 'local' as ToponymTier,
-    minCamDist: TOPONYM_CAM_DIST_LOCAL,
-  },
-];
-
-// ----------------------------------------------------------------------------
-// 11. Continental Landmasses (ZOOM_DETAIL_SPEC_LEDGER §5.2)
+// 9. Continental Landmasses (ZOOM_DETAIL_SPEC_LEDGER §5.2)
 // ----------------------------------------------------------------------------
 /**
  * Prominent continental landmass inscriptions for orbital view (z < 4).
@@ -295,7 +252,7 @@ export const CONTINENTS: ToponymLabel[] = [
 ];
 
 // ----------------------------------------------------------------------------
-// 12. Major Sovereign States & Historical Territories (ZOOM_DETAIL_SPEC_LEDGER §5.2)
+// 10. Major Sovereign States & Historical Territories (ZOOM_DETAIL_SPEC_LEDGER §5.2)
 // ----------------------------------------------------------------------------
 /**
  * Prominent sovereign states and historical cartographic realms for regional view (4 <= z < 8).
@@ -342,8 +299,6 @@ export const CURATED_ARCHIVAL_TOPONYMS: ToponymLabel[] = [
   ...SOVEREIGN_STATES,
   ...OCEANIC_FEATURES,
   ...GREAT_CIRCLES,
-  ...GEODETIC_SURVEY_LABELS,
-  ...ARCHIVAL_SOUNDING_LABELS,
 ];
 
 // ----------------------------------------------------------------------------

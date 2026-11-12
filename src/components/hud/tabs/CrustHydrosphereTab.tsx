@@ -4,14 +4,7 @@ import { HypsometricReliefCurve } from '../instruments/HypsometricReliefCurve';
 import { BathymetricTideGauge } from '../instruments/BathymetricTideGauge';
 import { TactileSwitch } from '../../ui/TactileSwitch';
 import { VernierSlider } from '../../ui/VernierSlider';
-import { ThemeManager } from '../../../core/themes/ThemeManager';
 import type { DataLayerItem } from '../UnifiedRightSidebar';
-
-export const PIGMENT_SWATCHES: Record<0 | 1 | 2, Array<{ hex: string; depth: string }>> = {
-  0: [{ hex: '#0f171f', depth: '-11,000m' }, { hex: '#22384a', depth: 'Shelf Break' }, { hex: '#3b788a', depth: 'Coastal' }, { hex: '#cbb692', depth: 'Steppe' }, { hex: '#f4ede1', depth: 'Glacial' }],
-  1: [{ hex: '#263b52', depth: '-11,000m' }, { hex: '#77998b', depth: 'Shelf Break' }, { hex: '#cfb588', depth: 'Coastal' }, { hex: '#9e6d50', depth: 'Steppe' }, { hex: '#fdfcf9', depth: 'Glacial' }],
-  2: [{ hex: '#0e1824', depth: '-11,000m' }, { hex: '#162b42', depth: 'Shelf Break' }, { hex: '#294d75', depth: 'Coastal' }, { hex: '#4f79a3', depth: 'Steppe' }, { hex: '#e8edf2', depth: 'Glacial' }],
-};
 
 export interface CrustHydrosphereTabProps {
   theme: 0 | 1 | 2;
@@ -24,23 +17,8 @@ export interface CrustHydrosphereTabProps {
   onAmbientOcclusionChangeDataLayer?: (id: string, ao: number) => void;
   onSeaLevelOffsetChangeDataLayer?: (id: string, offset: number) => void;
   onWaterClarityChangeDataLayer?: (id: string, clarity: number) => void;
-  onPaperToothChangeDataLayer?: (id: string, tooth: number) => void;
-  isolatedStratum: number | null;
-  setIsolatedStratum: (stratum: number | null) => void;
-  onIsolatedStratumChange?: (stratum: number | null, swatch?: { hex: string; depth: string } | null) => void;
-  applyMediumCalibration: (targetMode: 0 | 1 | 2) => void;
-  layerMode: 0 | 1 | 2;
-  onLayerModeChange: (l: 0 | 1 | 2) => void;
   showVectors: boolean;
   onVectorsToggle: () => void;
-  showSoundings?: boolean;
-  onSoundingsToggle?: () => void;
-  showTriangulation?: boolean;
-  onTriangulationToggle?: () => void;
-  showLandmarks: boolean;
-  onLandmarksToggle: () => void;
-  propShowClouds?: boolean;
-  handleToggleClouds: (val: boolean) => void;
   terrainShadows?: boolean;
   onTerrainShadowsToggle?: () => void;
   onTerrainShadowsChange?: (enabled: boolean) => void;
@@ -56,9 +34,10 @@ export interface CrustHydrosphereTabProps {
   showToponymy?: boolean;
   onToponymyToggle?: () => void;
   onToponymyChange?: (enabled: boolean) => void;
-  purityMode?: boolean;
   contourActive?: boolean;
   onContourActiveChange?: (enabled: boolean) => void;
+  xdrSolarGlint?: boolean;
+  onXdrSolarGlintChange?: (enabled: boolean) => void;
 }
 
 export const CrustHydrosphereTab: React.FC<CrustHydrosphereTabProps> = ({
@@ -72,23 +51,8 @@ export const CrustHydrosphereTab: React.FC<CrustHydrosphereTabProps> = ({
   onAmbientOcclusionChangeDataLayer,
   onSeaLevelOffsetChangeDataLayer,
   onWaterClarityChangeDataLayer,
-  onPaperToothChangeDataLayer,
-  isolatedStratum,
-  setIsolatedStratum,
-  onIsolatedStratumChange,
-  applyMediumCalibration,
-  layerMode,
-  onLayerModeChange,
   showVectors,
   onVectorsToggle,
-  showSoundings = false,
-  onSoundingsToggle,
-  showTriangulation = false,
-  onTriangulationToggle,
-  showLandmarks,
-  onLandmarksToggle,
-  propShowClouds,
-  handleToggleClouds,
   terrainShadows: propTerrainShadows,
   onTerrainShadowsToggle,
   onTerrainShadowsChange,
@@ -104,9 +68,10 @@ export const CrustHydrosphereTab: React.FC<CrustHydrosphereTabProps> = ({
   showToponymy: propShowToponymy,
   onToponymyToggle,
   onToponymyChange,
-  purityMode = false,
   contourActive: propContourActive,
   onContourActiveChange,
+  xdrSolarGlint: propXdrSolarGlint,
+  onXdrSolarGlintChange,
 }) => {
   const [internalTerrainShadows, setInternalTerrainShadows] = useState<boolean>(() => {
     if (typeof window !== 'undefined') {
@@ -326,6 +291,35 @@ export const CrustHydrosphereTab: React.FC<CrustHydrosphereTabProps> = ({
     }
   }, [onBedrockIncisionChange]);
 
+  const [internalXdrSolarGlint, setInternalXdrSolarGlint] = useState<boolean>(() => {
+    if (typeof window !== 'undefined') {
+      const live = (window as any).__INDICATRIX_LIVE_UNIFORMS__;
+      if (live?.xdrSolarGlint !== undefined) return Boolean(live.xdrSolarGlint);
+      const engine = (window as any).__INDICATRIX_WEBGPU_ENGINE__;
+      if (engine && typeof engine.isXdrSolarGlintEnabled === 'function') {
+        return engine.isXdrSolarGlintEnabled();
+      }
+    }
+    return false;
+  });
+
+  const activeXdrSolarGlint = propXdrSolarGlint !== undefined ? propXdrSolarGlint : internalXdrSolarGlint;
+
+  const handleToggleXdrSolarGlint = useCallback((nextVal?: boolean) => {
+    const val = nextVal !== undefined ? nextVal : !activeXdrSolarGlint;
+    setInternalXdrSolarGlint(val);
+    onXdrSolarGlintChange?.(val);
+    if (typeof window !== 'undefined') {
+      const live = (window as any).__INDICATRIX_LIVE_UNIFORMS__ || {};
+      live.xdrSolarGlint = val;
+      (window as any).__INDICATRIX_LIVE_UNIFORMS__ = live;
+      const engine = (window as any).__INDICATRIX_WEBGPU_ENGINE__;
+      if (engine && typeof engine.setXdrSolarGlintEnabled === 'function') {
+        engine.setXdrSolarGlintEnabled(val);
+      }
+    }
+  }, [activeXdrSolarGlint, onXdrSolarGlintChange]);
+
   return (
     <>
       {/* 1. Solar Illumination & Hillshade Station */}
@@ -365,7 +359,6 @@ export const CrustHydrosphereTab: React.FC<CrustHydrosphereTabProps> = ({
             title="Toggle Dynamic Terrain Horizon Self-Shadows"
             label="Terrain Self-Shadows"
             sublabel="Horizon occlusion & canyon shadow rays"
-            indicatorColor="var(--theme-status-amber)"
           />
 
           {/* Collapsible Slider: Penumbra Softness */}
@@ -402,6 +395,17 @@ export const CrustHydrosphereTab: React.FC<CrustHydrosphereTabProps> = ({
               />
             </div>
           </div>
+
+          <div className="pt-2 border-t border-[var(--theme-card-border)]">
+            <TactileSwitch
+              id="sidebar-xdr-solar-glint-toggle"
+              checked={activeXdrSolarGlint}
+              onChange={handleToggleXdrSolarGlint}
+              title="Toggle [BETA] XDR Extended Dynamic Range Solar Glint (rgba16float)"
+              label="[BETA] XDR Solar Glint"
+              sublabel="Extended toneMapping rgba16float (>1.0 Nit)"
+            />
+          </div>
         </div>
       </PolarSunCompass>
 
@@ -430,90 +434,6 @@ export const CrustHydrosphereTab: React.FC<CrustHydrosphereTabProps> = ({
             className="!border-0 !bg-transparent !p-0 !shadow-none"
           />
         </div>
-
-        {/* Elevation Stratum Filter */}
-        <div className="pt-2 border-t border-[var(--theme-card-border)] space-y-1">
-          <div className="flex items-center justify-between text-nano font-medium text-[var(--theme-text-secondary)]">
-            <span className="uppercase tracking-wider">Hypsometric Strata</span>
-            {isolatedStratum !== null && (
-              <button
-                type="button"
-                onClick={() => {
-                  setIsolatedStratum(null);
-                  onIsolatedStratumChange?.(null, null);
-                  ThemeManager.getInstance().setIsolatedStratum(null, null);
-                  if (primaryLayerId) {
-                    applyMediumCalibration(theme);
-                  }
-                }}
-                className="cursor-pointer text-nano text-[var(--theme-text-accent)] hover:underline"
-              >
-                Reset
-              </button>
-            )}
-          </div>
-          <div className="grid grid-cols-5 gap-1" role="group" aria-label="Hypsometric stratum pigment pans">
-            {PIGMENT_SWATCHES[theme].map((swatch, idx) => {
-              const isIsolated = isolatedStratum === idx;
-              return (
-                <button
-                  key={idx}
-                  type="button"
-                  onClick={() => {
-                    const nextStratum = isolatedStratum === idx ? null : idx;
-                    const nextSwatch = nextStratum !== null ? swatch : null;
-                    setIsolatedStratum(nextStratum);
-                    onIsolatedStratumChange?.(nextStratum, nextSwatch);
-                    ThemeManager.getInstance().setIsolatedStratum(nextStratum, nextSwatch);
-
-                    if (primaryLayerId) {
-                      if (nextStratum === null) {
-                        applyMediumCalibration(theme);
-                      } else if (idx === 0) {
-                        onSeaLevelOffsetChangeDataLayer?.(primaryLayerId, -25);
-                        onWaterClarityChangeDataLayer?.(primaryLayerId, 0.92);
-                      } else if (idx === 1) {
-                        onSeaLevelOffsetChangeDataLayer?.(primaryLayerId, -8);
-                        onWaterClarityChangeDataLayer?.(primaryLayerId, 0.82);
-                        onAmbientOcclusionChangeDataLayer?.(primaryLayerId, 0.72);
-                      } else if (idx === 2) {
-                        onSeaLevelOffsetChangeDataLayer?.(primaryLayerId, 0);
-                        onWaterClarityChangeDataLayer?.(primaryLayerId, 0.75);
-                      } else if (idx === 3) {
-                        onPeakExponentChangeDataLayer?.(primaryLayerId, 1.3);
-                        onDisplacementScaleChangeDataLayer?.(primaryLayerId, 0.12);
-                      } else if (idx === 4) {
-                        onPeakExponentChangeDataLayer?.(primaryLayerId, 2.0);
-                        onDisplacementScaleChangeDataLayer?.(primaryLayerId, 0.16);
-                        onAmbientOcclusionChangeDataLayer?.(primaryLayerId, 0.75);
-                      }
-                    }
-                  }}
-                  className={`pigment-pan p-1 rounded-[2px] border text-center flex flex-col items-center gap-1 transition-all shadow-sm cursor-pointer select-none ${
-                    isIsolated
-                      ? 'ring-2 ring-[var(--theme-text-accent)] border-[var(--theme-control-active-border)] bg-[var(--theme-control-active-bg)]'
-                      : 'border-[var(--theme-card-border)] bg-[var(--theme-control-bg)] hover:border-[var(--theme-card-border-hover)]'
-                  }`}
-                  title={`${swatch.depth} (${swatch.hex})`}
-                  aria-label={`Isolate ${swatch.depth} stratum (${swatch.hex})`}
-                  aria-pressed={isIsolated}
-                >
-                  <div
-                    className="w-full h-3.5 rounded-[1px] border border-black/20 shadow-inner shrink-0"
-                    style={{ backgroundColor: swatch.hex }}
-                  />
-                  <div className={`text-nano font-mono ${isIsolated ? 'opacity-100' : 'opacity-80'} uppercase tracking-tighter ${
-                    isIsolated
-                      ? 'text-[var(--theme-control-active-text)]'
-                      : 'text-[var(--theme-text-secondary)]'
-                  } shrink-0 truncate w-full text-center`}>
-                    {swatch.depth}
-                  </div>
-                </button>
-              );
-            })}
-          </div>
-        </div>
       </HypsometricReliefCurve>
 
       {/* 3. Bathymetric Hydrosphere & Drainage Station */}
@@ -534,7 +454,6 @@ export const CrustHydrosphereTab: React.FC<CrustHydrosphereTabProps> = ({
             title="Toggle Dynamic Geomorphic Hydrology & Basin Accumulation"
             label="Geomorphic Hydrology"
             sublabel="D-∞ catchment routing & Leopold-Maddock"
-            indicatorColor="var(--theme-status-amber)"
           />
 
           {/* Collapsible Sliders: Pluvial Discharge Coupling & Bedrock Incision */}
@@ -621,64 +540,19 @@ export const CrustHydrosphereTab: React.FC<CrustHydrosphereTabProps> = ({
             title="Toggle Topographic & Bathymetric Isolines"
             label="Topographic & Bathymetric Isolines"
             sublabel="Multi-scale elevation & isobath contours"
-            indicatorColor="var(--theme-text-accent)"
           />
         </div>
 
-        {/* Geodetic Survey Feeds: Soundings, Triangulation, Landmarks */}
-        <div className="pt-2 border-t border-[var(--theme-card-border)] space-y-1.5">
-          <div className="text-micro uppercase font-bold tracking-wider text-[var(--theme-text-muted)]">
-            Geodetic Survey Feeds
-          </div>
-          <div className="space-y-1.5 pt-0.5">
-            <TactileSwitch
-              checked={showSoundings}
-              onChange={onSoundingsToggle}
-              title="Toggle Soundings"
-              label="Soundings"
-              sublabel="Marine bathymetric depth matrix"
-              indicatorColor="var(--theme-status-slate)"
-            />
-            <TactileSwitch
-              checked={showTriangulation}
-              onChange={onTriangulationToggle}
-              title="Toggle Triangulation"
-              label="Triangulation"
-              sublabel="Geodetic Delaunay survey baseline"
-              indicatorColor="var(--theme-text-accent)"
-            />
-            <TactileSwitch
-              checked={showLandmarks}
-              onChange={onLandmarksToggle}
-              title="Toggle Landmarks"
-              label="Landmarks"
-              sublabel="Astronomical observatories & promontories"
-              indicatorColor="var(--theme-status-amber)"
-            />
-            <TactileSwitch
-              id="sidebar-toponymy-toggle"
-              checked={propShowToponymy !== undefined ? propShowToponymy : internalShowToponymy}
-              onChange={handleToggleToponymy}
-              title="Toggle Toponymy & Spot Elevations"
-              label="Toponymy & Spot Elevations"
-              sublabel="MSDF copperplate labels & summit markers"
-              indicatorColor="var(--theme-status-emerald)"
-            />
-          </div>
+        <div className="pt-2 border-t border-[var(--theme-card-border)]">
+          <TactileSwitch
+            id="sidebar-toponymy-toggle"
+            checked={propShowToponymy !== undefined ? propShowToponymy : internalShowToponymy}
+            onChange={handleToggleToponymy}
+            title="Toggle Toponymy & Spot Elevations"
+            label="Toponymy & Spot Elevations"
+            sublabel="MSDF copperplate labels & summit markers"
+          />
         </div>
-      </div>
-
-      {/* Atmospheric Clouds & DeepMind WeatherNext 3 Master Switch */}
-      <div className="p-2.5 rounded-[3px] border border-[var(--theme-card-border)] bg-[var(--theme-card-bg)] space-y-2 transition-all shadow-sm">
-        <TactileSwitch
-          id="sidebar-cartography-clouds-toggle"
-          checked={Boolean(propShowClouds)}
-          onChange={handleToggleClouds}
-          title="Master toggle for atmospheric cloud cover and 3D volumetric raymarching"
-          label="Atmospheric Clouds"
-          sublabel="DeepMind WeatherNext 3 (0.1° AI) & 3D Raymarch"
-          indicatorColor="var(--theme-status-slate)"
-        />
       </div>
     </>
   );

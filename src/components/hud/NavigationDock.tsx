@@ -1,6 +1,7 @@
 import React, { useRef, useCallback, useEffect } from 'react';
 import { CurvatureUnfurlSextant } from './instruments/CurvatureUnfurlSextant';
 import { SimulationMode } from '../../types';
+import { telemetryStore, useTelemetryLiveUnfurl } from '../../core/TelemetryStore';
 
 export interface NavigationDockProps {
   isZenMode: boolean;
@@ -12,8 +13,6 @@ export interface NavigationDockProps {
   onAlphaChange: (val: number) => void;
   onGlideToAlpha: (target: number) => void;
   theme: 0 | 1 | 2;
-  activeDirection?: 'architectural' | 'hybrid' | 'photoreal' | null;
-  onSelectRenderStyle?: (style: 'architectural' | 'hybrid' | 'photoreal') => void;
   mode?: SimulationMode;
   onGlideToMode?: (mode: SimulationMode) => void;
   onModeChange?: (mode: SimulationMode) => void;
@@ -29,18 +28,16 @@ const PROJECTION_MODES: Array<{ id: SimulationMode; label: string }> = [
   { id: 3, label: 'Fluid' },
 ];
 
-export const NavigationDock: React.FC<NavigationDockProps> = ({
+const NavigationDockInner: React.FC<NavigationDockProps> = ({
   isZenMode,
   isPlaying,
   onTogglePlay,
   playbackSpeed,
   onToggleSpeed,
-  alpha,
+  alpha: propAlpha,
   onAlphaChange,
   onGlideToAlpha,
   theme,
-  activeDirection,
-  onSelectRenderStyle,
   mode = 0,
   onGlideToMode,
   onModeChange,
@@ -48,11 +45,14 @@ export const NavigationDock: React.FC<NavigationDockProps> = ({
   onCancelGlide,
   isSidebarOpen = false,
 }) => {
+  const alpha = useTelemetryLiveUnfurl(propAlpha, !isZenMode);
   const isLight = theme === 1;
   const glideRafRef = useRef<number | null>(null);
   const inFlightTargetModeRef = useRef<SimulationMode | null>(null);
   const targetRestoreAlphaRef = useRef<number | null>(null);
   const emittedAlphasRef = useRef<number[]>([]);
+  const externalGlideTargetRef = useRef<SimulationMode | null>(null);
+  const externalRestoreAlphaRef = useRef<number | null>(null);
 
   const cancelGlide = useCallback(() => {
     if (glideRafRef.current !== null) {
@@ -62,13 +62,21 @@ export const NavigationDock: React.FC<NavigationDockProps> = ({
     inFlightTargetModeRef.current = null;
     targetRestoreAlphaRef.current = null;
     emittedAlphasRef.current = [];
+    externalGlideTargetRef.current = null;
+    externalRestoreAlphaRef.current = null;
   }, []);
 
   useEffect(() => {
+    telemetryStore.setLiveUnfurl(null);
     return () => {
       cancelGlide();
+      telemetryStore.setLiveUnfurl(null);
     };
   }, [cancelGlide]);
+
+  useEffect(() => {
+    telemetryStore.setLiveUnfurl(null);
+  }, [propAlpha]);
 
   useEffect(() => {
     // If mode changed externally, cancel any in-flight glide
@@ -76,6 +84,16 @@ export const NavigationDock: React.FC<NavigationDockProps> = ({
       cancelGlide();
     }
   }, [mode, cancelGlide]);
+
+  useEffect(() => {
+    if (externalGlideTargetRef.current !== null && externalGlideTargetRef.current === mode) {
+      const restoreTarget = externalRestoreAlphaRef.current;
+      if (restoreTarget === null || Math.abs(propAlpha - restoreTarget) < 0.01) {
+        externalGlideTargetRef.current = null;
+        externalRestoreAlphaRef.current = null;
+      }
+    }
+  }, [mode, propAlpha]);
 
   useEffect(() => {
     // If playback started, cancel any in-flight glide
@@ -88,7 +106,7 @@ export const NavigationDock: React.FC<NavigationDockProps> = ({
     // If alpha was updated externally during glide (not by NavigationDock's own RAF), cancel glide
     if (glideRafRef.current !== null && emittedAlphasRef.current.length > 0) {
       const matchIdx = emittedAlphasRef.current.findIndex(
-        (val) => Math.abs(val - alpha) < 0.001
+        (val) => Math.abs(val - propAlpha) < 0.001
       );
       if (matchIdx !== -1) {
         emittedAlphasRef.current.splice(0, matchIdx + 1);
@@ -96,16 +114,20 @@ export const NavigationDock: React.FC<NavigationDockProps> = ({
         cancelGlide();
       }
     }
-  }, [alpha, cancelGlide]);
+  }, [propAlpha, cancelGlide]);
 
   if (isZenMode) return null;
 
   const handleSelectMode = (newMode: SimulationMode) => {
-    // Clicking active mode pill is a no-op
-    if (newMode === mode && inFlightTargetModeRef.current === null) {
+    // Clicking active mode pill is a no-op unless an external/internal glide to another mode is in flight
+    if (
+      newMode === mode &&
+      inFlightTargetModeRef.current === null &&
+      externalGlideTargetRef.current === null
+    ) {
       return;
     }
-    if (newMode === inFlightTargetModeRef.current) {
+    if (newMode === inFlightTargetModeRef.current || newMode === externalGlideTargetRef.current) {
       return;
     }
 
@@ -114,9 +136,29 @@ export const NavigationDock: React.FC<NavigationDockProps> = ({
     }
 
     if (onGlideToMode) {
+      const restoreAlpha = externalRestoreAlphaRef.current !== null ? externalRestoreAlphaRef.current : alpha;
+      if (newMode === mode && externalGlideTargetRef.current !== null) {
+        cancelGlide();
+        onCancelGlide?.();
+        if (restoreAlpha > 0.01) {
+          onGlideToAlpha(restoreAlpha);
+        }
+        return;
+      }
+      if (alpha <= 0.01) {
+        cancelGlide();
+        onCancelGlide?.();
+        onGlideToMode(newMode);
+        onModeChange?.(newMode);
+        onSelectMode?.(newMode);
+        if (restoreAlpha > 0.01) {
+          onGlideToAlpha(restoreAlpha);
+        }
+        return;
+      }
+      externalGlideTargetRef.current = newMode;
+      externalRestoreAlphaRef.current = restoreAlpha;
       onGlideToMode(newMode);
-      onModeChange?.(newMode);
-      onSelectMode?.(newMode);
       return;
     }
 
@@ -211,7 +253,7 @@ export const NavigationDock: React.FC<NavigationDockProps> = ({
       style={{ fontFamily: 'var(--theme-font-telemetry)' }}
     >
       <div
-        className={`flex items-center gap-3 px-5 pt-2.5 pb-7 rounded-[3px] shadow-2xl pointer-events-auto border transition-colors relative scroll-curl-lip max-w-[calc(100vw-2.5rem)] overflow-x-auto scrollbar-none bg-[var(--theme-panel-bg)] border-[var(--theme-panel-border)] text-[var(--theme-text-primary)] ${
+        className={`flex items-center gap-3 px-5 py-2.5 rounded-[3px] shadow-2xl pointer-events-auto border transition-colors relative scroll-curl-lip max-w-[calc(100vw-2.5rem)] overflow-x-auto scrollbar-none bg-[var(--theme-panel-bg)] border-[var(--theme-panel-border)] text-[var(--theme-text-primary)] ${
           theme === 1 ? 'paper-cream-panel' : theme === 2 ? 'paper-cyanotype' : 'paper-tharp'
         }`}
       >
@@ -255,6 +297,7 @@ export const NavigationDock: React.FC<NavigationDockProps> = ({
         <button
           onClick={() => {
             cancelGlide();
+            onCancelGlide?.();
             onTogglePlay();
           }}
           title={isPlaying ? 'Pause Continuous Unfurl Loop (Space)' : 'Play Continuous Unfurl Loop (Space)'}
@@ -289,13 +332,27 @@ export const NavigationDock: React.FC<NavigationDockProps> = ({
             onGlideToAlpha(0.0);
           }}
           title="Glide camera and manifold to closed Riemannian sphere (Press G)"
-          className={`tactile-btn text-body font-semibold uppercase tracking-widest flex items-center gap-1.5 px-2.5 py-1 rounded-[2px] transition-all shrink-0 border z-10 ${
+          aria-label="Glide camera and manifold to closed Riemannian sphere (Press G)"
+          className={`tactile-btn text-body font-semibold uppercase tracking-widest flex items-center gap-1.5 px-2 py-1 rounded-[2px] transition-all shrink-0 border z-10 ${
             alpha < 0.03
               ? 'bg-[var(--theme-control-active-bg)] text-[var(--theme-control-active-text)] border-[var(--theme-control-active-border)] shadow-sm ring-1 ring-[var(--theme-control-active-ring)] font-semibold'
               : 'bg-[var(--theme-control-bg)] text-[var(--theme-control-text)] border-[var(--theme-control-border)] hover:bg-[var(--theme-control-hover-bg)] hover:text-[var(--theme-control-hover-text)]'
           }`}
         >
-          <span>Globe</span>
+          <svg
+            className="w-3.5 h-3.5 shrink-0"
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            strokeWidth="1.75"
+            strokeLinecap="round"
+            strokeLinejoin="round"
+            aria-hidden="true"
+          >
+            <circle cx="12" cy="12" r="9" />
+            <path d="M3.6 9h16.8M3.6 15h16.8" />
+            <path d="M12 3a14.5 14.5 0 0 0 0 18 14.5 14.5 0 0 0 0-18" />
+          </svg>
           <kbd
             className={`text-nano px-1 py-0.5 rounded-[1px] font-normal ${
               alpha < 0.03
@@ -338,13 +395,27 @@ export const NavigationDock: React.FC<NavigationDockProps> = ({
             onGlideToAlpha(1.0);
           }}
           title="Glide camera and manifold to planar map (Press M)"
-          className={`tactile-btn text-body font-semibold uppercase tracking-widest flex items-center gap-1.5 px-2.5 py-1 rounded-[2px] transition-all shrink-0 border z-10 ${
+          aria-label="Glide camera and manifold to planar map (Press M)"
+          className={`tactile-btn text-body font-semibold uppercase tracking-widest flex items-center gap-1.5 px-2 py-1 rounded-[2px] transition-all shrink-0 border z-10 ${
             alpha > 0.97
               ? 'bg-[var(--theme-control-active-bg)] text-[var(--theme-control-active-text)] border-[var(--theme-control-active-border)] shadow-sm ring-1 ring-[var(--theme-control-active-ring)] font-semibold'
               : 'bg-[var(--theme-control-bg)] text-[var(--theme-control-text)] border-[var(--theme-control-border)] hover:bg-[var(--theme-control-hover-bg)] hover:text-[var(--theme-control-hover-text)]'
           }`}
         >
-          <span>Map</span>
+          <svg
+            className="w-3.5 h-3.5 shrink-0"
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            strokeWidth="1.75"
+            strokeLinecap="round"
+            strokeLinejoin="round"
+            aria-hidden="true"
+          >
+            <polygon points="3 6 9 3 15 6 21 3 21 18 15 21 9 18 3 21" />
+            <line x1="9" y1="3" x2="9" y2="18" />
+            <line x1="15" y1="6" x2="15" y2="21" />
+          </svg>
           <kbd
             className={`text-nano px-1 py-0.5 rounded-[1px] font-normal ${
               alpha > 0.97
@@ -367,3 +438,5 @@ export const NavigationDock: React.FC<NavigationDockProps> = ({
     </div>
   );
 };
+
+export const NavigationDock = NavigationDockInner;

@@ -19,8 +19,10 @@ __pycache__/
 # Fetch or generate locally via:
 #   npm run refresh:planetary
 #   npm run weather:fetch (or npm run weather:mock)
+#   npm run satellite:fetch (or npm run satellite:mock)
 #   npm run precompute -- --density 1m
 public/data/*.bin
+!public/data/sdf-font-atlas-1024.bin
 public/data/weathernext/*.bin
 public/*-u16.bin
 public/*.cog.tif

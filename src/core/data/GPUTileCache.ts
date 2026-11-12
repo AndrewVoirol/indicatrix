@@ -42,21 +42,25 @@ export interface GPUTileCacheStats {
 export class GPUTileCache {
   public static readonly DEFAULT_CAPACITY: number = 64;
   public static readonly TILE_DIMENSION: number = 256;
-  public static readonly CHANNELS: number = 4;
-  public static readonly BYTES_PER_ROW: number = 256 * 4 * 2; // 2048 bytes (256-byte aligned)
+  public static readonly CHANNELS: number = 2;
+  public static readonly BYTES_PER_ROW: number = 256 * 2 * 2; // 1024 bytes (256-byte aligned)
   public static readonly ROWS_PER_IMAGE: number = 256;
   public static readonly FLOATS_PER_SLOT_DESCRIPTOR: number = 8; // bounds (vec4<f32>) + meta (vec4<f32>)
 
   public readonly capacity: number;
   public readonly tileDimension: number;
+  public readonly mipLevelCount: number;
 
   private device: GPUDevice | null = null;
   private gpuTexture: GPUTexture | null = null;
   private gpuTextureView: GPUTextureView | null = null;
   private slotViews: (GPUTextureView | null)[] = [];
   private slotDescriptorBuffer: GPUBuffer | null = null;
+  private mipBindGroupLayout: GPUBindGroupLayout | null = null;
+  private mipPipeline: GPURenderPipeline | null = null;
+  private mipSampler: GPUSampler | null = null;
 
-  // Zero-GC: Static mirror buffer preallocated for tile Float16 conversion
+  // Zero-GC: Static mirror buffer preallocated for tile Float16 conversion ([bHalf, aHalf])
   private readonly f16UploadBuffer: Uint16Array;
 
   // Zero-GC: Static mirror buffer preallocated for 64-slot shader descriptor table (64 * 8 floats = 2048 bytes)
@@ -80,8 +84,9 @@ export class GPUTileCache {
   constructor(capacity: number = GPUTileCache.DEFAULT_CAPACITY, tileDimension: number = GPUTileCache.TILE_DIMENSION) {
     this.capacity = capacity;
     this.tileDimension = tileDimension;
+    this.mipLevelCount = Math.floor(Math.log2(Math.max(1, tileDimension))) + 1;
 
-    // 256 * 256 * 4 channels = 262,144 uint16 elements (512 KB)
+    // 256 * 256 * 2 channels = 131,072 uint16 elements (256 KB)
     this.f16UploadBuffer = new Uint16Array(this.tileDimension * this.tileDimension * GPUTileCache.CHANNELS);
     this.slotDescriptorData = new Float32Array(this.capacity * GPUTileCache.FLOATS_PER_SLOT_DESCRIPTOR);
     this.sortedSlotIndices = new Int32Array(this.capacity);
@@ -105,16 +110,19 @@ export class GPUTileCache {
 
   public initialize(device: GPUDevice): void {
     this.device = device;
+    this.mipBindGroupLayout = null;
+    this.mipPipeline = null;
+    this.mipSampler = null;
 
-    // Create 64-layer 2D array texture
+    // Create 64-layer 2D array texture (rg16float with 9 mip levels = 21.33 MiB)
     this.gpuTexture = device.createTexture({
       label: 'gpu_tile_cache_array',
       size: [this.tileDimension, this.tileDimension, this.capacity],
-      mipLevelCount: 1,
-      format: 'rgba16float',
+      mipLevelCount: this.mipLevelCount,
+      format: 'rg16float',
       usage: (typeof GPUTextureUsage !== 'undefined'
-        ? (GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST)
-        : (4 | 8)),
+        ? (GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST | GPUTextureUsage.RENDER_ATTACHMENT)
+        : (4 | 8 | 16)),
     });
 
     this.gpuTextureView = this.gpuTexture.createView({
@@ -126,6 +134,8 @@ export class GPUTileCache {
         dimension: '2d',
         baseArrayLayer: i,
         arrayLayerCount: 1,
+        baseMipLevel: 0,
+        mipLevelCount: 1,
       });
     }
   }
@@ -224,7 +234,8 @@ export class GPUTileCache {
 
   public uploadElevationTile(
     slotIndex: number,
-    elevData: Float32Array
+    elevData: Float32Array,
+    skipSync: boolean = false
   ): boolean {
     if (!this.device || !this.gpuTexture) return false;
     if (slotIndex < 0 || slotIndex >= this.capacity) return false;
@@ -233,24 +244,26 @@ export class GPUTileCache {
     const f16 = this.f16UploadBuffer;
 
     // Elevation decoding & encoding parity (Full range [-10924m .. +8848m])
-    // Channel B encodes continuous shoreline land mask ramp [-15m .. +15m] -> [0.0 .. 1.0]
+    // Compacted rg16float layout: .r = bNorm (coastal/fjord confidence mask), .g = signed elevMeters in [-10924m .. +8848m]
+    //   0.0 = sea-level water (<= +0.02m, covering 0.00m AWS Terrarium bays/estuaries & negative depths)
+    //   0.5 = neutral intertidal (+0.15m)
+    //   1.0 = coastal land (>= +1.50m)
     for (let i = 0; i < count; i++) {
       const elev = elevData[i];
-      const rNorm = Math.max(0.0, Math.min(1.0, elev / 8848.0));
-      const gNorm = Math.max(0.0, Math.min(1.0, -elev / 10924.0));
-      const bNorm = Math.max(0.0, Math.min(1.0, (elev + 15.0) / 30.0));
-      const aNorm = Math.max(0.0, Math.min(1.0, (elev + 10924.0) / 19772.0));
+      const bNorm = elev > 0.15
+        ? 0.5 + 0.5 * Math.max(0.0, Math.min(1.0, (elev - 0.15) / 1.35))
+        : 0.5 * (1.0 - Math.max(0.0, Math.min(1.0, (0.15 - elev) / 0.13)));
+      const clampedElev = Math.max(-10924.0, Math.min(8848.0, elev));
 
-      const baseIdx = i * 4;
-      f16[baseIdx + 0] = encodeFloat16(rNorm);
-      f16[baseIdx + 1] = encodeFloat16(gNorm);
-      f16[baseIdx + 2] = encodeFloat16(bNorm);
-      f16[baseIdx + 3] = encodeFloat16(aNorm);
+      const baseIdx = i * 2;
+      f16[baseIdx + 0] = encodeFloat16(bNorm);
+      f16[baseIdx + 1] = encodeFloat16(clampedElev);
     }
 
     this.device.queue.writeTexture(
       {
         texture: this.gpuTexture,
+        mipLevel: 0,
         origin: { x: 0, y: 0, z: slotIndex },
       },
       f16.buffer,
@@ -261,14 +274,197 @@ export class GPUTileCache {
       },
       [this.tileDimension, this.tileDimension, 1]
     );
+    this.generateSlotMips(slotIndex);
 
     const slot = this.slots[slotIndex];
     if (slot.isAllocated) {
       slot.hasData = true;
     }
     this.totalUploads++;
-    this.syncSlotDescriptorBuffer();
+    if (!skipSync) {
+      this.syncSlotDescriptorBuffer();
+    }
     return true;
+  }
+
+  /**
+   * Uploads a worker-prepared Float16 rg16float buffer ([bHalf, elevHalf]) to mip 0
+   * and generates mips 1..8 via Phase 2's generateSlotMips GPU pyramid.
+   */
+  public uploadPackedRG16Tile(
+    slotIndex: number,
+    f16Data: Uint16Array | ArrayBuffer,
+    skipSync: boolean = false
+  ): boolean {
+    if (!this.device || !this.gpuTexture) return false;
+    if (slotIndex < 0 || slotIndex >= this.capacity) return false;
+    const expectedBytes = GPUTileCache.BYTES_PER_ROW * GPUTileCache.ROWS_PER_IMAGE;
+    const buf = f16Data instanceof ArrayBuffer ? f16Data : f16Data.buffer;
+    const byteOffset = f16Data instanceof ArrayBuffer ? 0 : f16Data.byteOffset;
+    if (buf.byteLength - byteOffset < expectedBytes) return false;
+
+    this.device.queue.writeTexture(
+      {
+        texture: this.gpuTexture,
+        mipLevel: 0,
+        origin: { x: 0, y: 0, z: slotIndex },
+      },
+      buf,
+      {
+        bytesPerRow: GPUTileCache.BYTES_PER_ROW,
+        rowsPerImage: GPUTileCache.ROWS_PER_IMAGE,
+        offset: byteOffset,
+      },
+      [this.tileDimension, this.tileDimension, 1]
+    );
+    this.generateSlotMips(slotIndex);
+
+    const slot = this.slots[slotIndex];
+    if (slot.isAllocated) {
+      slot.hasData = true;
+    }
+    this.totalUploads++;
+    if (!skipSync) {
+      this.syncSlotDescriptorBuffer();
+    }
+    return true;
+  }
+
+  /**
+   * Generates mip levels 1..(mipLevelCount - 1) for a single array layer via Core-WebGPU RENDER_ATTACHMENT fragment blits.
+   */
+  public generateSlotMips(slotIndex: number): void {
+    const dev = this.device;
+    const tex = this.gpuTexture;
+    if (
+      !dev ||
+      !tex ||
+      this.mipLevelCount <= 1 ||
+      slotIndex < 0 ||
+      slotIndex >= this.capacity ||
+      typeof dev.createRenderPipeline !== 'function' ||
+      typeof dev.createBindGroupLayout !== 'function' ||
+      typeof dev.createPipelineLayout !== 'function' ||
+      typeof dev.createCommandEncoder !== 'function' ||
+      typeof dev.createBindGroup !== 'function' ||
+      typeof dev.createSampler !== 'function' ||
+      typeof dev.createShaderModule !== 'function' ||
+      typeof dev.queue?.submit !== 'function'
+    ) {
+      return;
+    }
+
+    if (!this.mipPipeline || !this.mipBindGroupLayout || !this.mipSampler) {
+      const module = dev.createShaderModule({
+        label: 'gpu_tile_cache_rg16float_mip_blit',
+        code: `
+struct VSOut {
+  @builtin(position) pos: vec4<f32>,
+  @location(0) uv: vec2<f32>,
+};
+@vertex fn vs(@builtin(vertex_index) vi: u32) -> VSOut {
+  var out: VSOut;
+  var p = vec2<f32>(-1.0, -1.0);
+  if (vi == 1u) { p = vec2<f32>(3.0, -1.0); }
+  else if (vi == 2u) { p = vec2<f32>(-1.0, 3.0); }
+  out.pos = vec4<f32>(p, 0.0, 1.0);
+  out.uv = vec2<f32>(p.x * 0.5 + 0.5, 1.0 - (p.y * 0.5 + 0.5));
+  return out;
+}
+@group(0) @binding(0) var srcTex: texture_2d<f32>;
+@group(0) @binding(1) var samp: sampler;
+fn roundF32ToExactF16(val: f32) -> f32 {
+  let clamped = clamp(val, -65504.0, 65504.0);
+  let bits = bitcast<u32>(clamped);
+  let absBits = bits & 0x7fffffffu;
+  if (absBits == 0u) { return clamped; }
+  let exp32 = (absBits >> 23u) & 0xffu;
+  if (exp32 <= 112u) {
+    if (exp32 < 102u) { return bitcast<f32>(bits & 0x80000000u); }
+    return round(clamped * 16777216.0) * (1.0 / 16777216.0);
+  }
+  let bias = 0x0fffu + ((bits >> 13u) & 1u);
+  return bitcast<f32>((bits + bias) & 0xffffe000u);
+}
+@fragment fn fs(in: VSOut) -> @location(0) vec2<f32> {
+  let c = vec2<i32>(in.pos.xy) * 2;
+  let maxC = vec2<i32>(textureDimensions(srcTex, 0)) - vec2<i32>(1);
+  let p00 = textureLoad(srcTex, min(c, maxC), 0).rg;
+  let p10 = textureLoad(srcTex, min(c + vec2<i32>(1, 0), maxC), 0).rg;
+  let p01 = textureLoad(srcTex, min(c + vec2<i32>(0, 1), maxC), 0).rg;
+  let p11 = textureLoad(srcTex, min(c + vec2<i32>(1, 1), maxC), 0).rg;
+  let mean = (p00 + p10 + p01 + p11) * 0.25;
+  let unusedSamp = textureSampleLevel(srcTex, samp, in.uv, 0.0).x * 0.0;
+  return vec2<f32>(roundF32ToExactF16(mean.x + unusedSamp), roundF32ToExactF16(mean.y));
+}
+`,
+      });
+      this.mipBindGroupLayout = dev.createBindGroupLayout({
+        label: 'gpu_tile_cache_rg16float_mip_bgl',
+        entries: [
+          { binding: 0, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: 'float' } },
+          { binding: 1, visibility: GPUShaderStage.FRAGMENT, sampler: { type: 'filtering' } },
+        ],
+      });
+      this.mipPipeline = dev.createRenderPipeline({
+        label: 'gpu_tile_cache_rg16float_mip_pipeline',
+        layout: dev.createPipelineLayout({
+          label: 'gpu_tile_cache_rg16float_mip_pl',
+          bindGroupLayouts: [this.mipBindGroupLayout],
+        }),
+        vertex: { module, entryPoint: 'vs' },
+        fragment: { module, entryPoint: 'fs', targets: [{ format: 'rg16float' }] },
+        primitive: { topology: 'triangle-list' },
+      });
+      this.mipSampler = dev.createSampler({
+        label: 'gpu_tile_cache_rg16float_mip_sampler',
+        magFilter: 'linear',
+        minFilter: 'linear',
+        addressModeU: 'clamp-to-edge',
+        addressModeV: 'clamp-to-edge',
+      });
+    }
+
+    const layout = this.mipBindGroupLayout;
+    const encoder = dev.createCommandEncoder({ label: `gpu_tile_cache_mips_slot_${slotIndex}` });
+    for (let mip = 1; mip < this.mipLevelCount; mip++) {
+      const srcView = tex.createView({
+        dimension: '2d',
+        baseArrayLayer: slotIndex,
+        arrayLayerCount: 1,
+        baseMipLevel: mip - 1,
+        mipLevelCount: 1,
+      });
+      const dstView = tex.createView({
+        dimension: '2d',
+        baseArrayLayer: slotIndex,
+        arrayLayerCount: 1,
+        baseMipLevel: mip,
+        mipLevelCount: 1,
+      });
+      const bg = dev.createBindGroup({
+        layout,
+        entries: [
+          { binding: 0, resource: srcView },
+          { binding: 1, resource: this.mipSampler },
+        ],
+      });
+      const pass = encoder.beginRenderPass({
+        colorAttachments: [
+          {
+            view: dstView,
+            loadOp: 'clear',
+            storeOp: 'store',
+            clearValue: { r: 0, g: 0, b: 0, a: 0 },
+          },
+        ],
+      });
+      pass.setPipeline(this.mipPipeline);
+      pass.setBindGroup(0, bg);
+      pass.draw(3);
+      pass.end();
+    }
+    dev.queue.submit([encoder.finish()]);
   }
 
   /**
@@ -291,8 +487,18 @@ export class GPUTileCache {
 
     const anchorLon = anchorSlot ? 0.5 * (anchorSlot.bounds.minLon + anchorSlot.bounds.maxLon) : 0;
     const anchorLat = anchorSlot ? 0.5 * (anchorSlot.bounds.minLat + anchorSlot.bounds.maxLat) : 0;
+    const anchorPrefix = anchorSlot && anchorSlot.key.includes(':')
+      ? anchorSlot.key.slice(0, anchorSlot.key.indexOf(':'))
+      : '';
     const isNearAnchor = (s: GPUTileSlot): boolean => {
       if (!anchorSlot) return true;
+      const sPrefix = s.key.includes(':') ? s.key.slice(0, s.key.indexOf(':')) : '';
+      if (sPrefix !== anchorPrefix) return false;
+      if (sPrefix === 'terrarium') {
+        if (s.lod !== anchorSlot.lod) return false;
+        if (anchorSlot.lastUsed - s.lastUsed >= 49) return false;
+        return Math.abs(s.x - anchorSlot.x) <= 6 && Math.abs(s.y - anchorSlot.y) <= 6;
+      }
       const cLon = 0.5 * (s.bounds.minLon + s.bounds.maxLon);
       const cLat = 0.5 * (s.bounds.minLat + s.bounds.maxLat);
       return Math.abs(cLon - anchorLon) <= 6.0 && Math.abs(cLat - anchorLat) <= 6.0;
@@ -340,7 +546,8 @@ export class GPUTileCache {
     for (let rank = 0; rank < count; rank++) {
       const s = this.slots[this.sortedSlotIndices[rank]];
       const b = s.bounds;
-      if (isNearAnchor(s) && s.lod === topClusterLod) {
+      const inActiveCluster = isNearAnchor(s) && s.lod === topClusterLod;
+      if (inActiveCluster) {
         clusterCount++;
         if (b.minLon < cMinLon) cMinLon = b.minLon;
         if (b.minLat < cMinLat) cMinLat = b.minLat;
@@ -354,6 +561,7 @@ export class GPUTileCache {
         if (otherRank === rank) continue;
         const other = this.slots[this.sortedSlotIndices[otherRank]];
         if (other.lod < s.lod) continue;
+        if (inActiveCluster && (!isNearAnchor(other) || other.lod !== topClusterLod)) continue;
         const ob = other.bounds;
         const latOverlap = Math.min(b.maxLat, ob.maxLat) - Math.max(b.minLat, ob.minLat) > eps;
         const lonOverlap = Math.min(b.maxLon, ob.maxLon) - Math.max(b.minLon, ob.minLon) > eps;
@@ -493,6 +701,9 @@ export class GPUTileCache {
       this.gpuTextureView = null;
       this.slotViews.fill(null);
     }
+    this.mipBindGroupLayout = null;
+    this.mipPipeline = null;
+    this.mipSampler = null;
     this.device = null;
   }
 }

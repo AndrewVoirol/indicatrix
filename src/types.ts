@@ -29,7 +29,7 @@ export interface DataLayerItem {
   sunAltitude?: number;
   hillshadeIntensity?: number;
   url?: string;
-  renderStyle?: 'architectural' | 'hybrid' | 'photoreal';
+  renderStyle?: 'architectural' | 'hybrid';
   seaLevelOffset?: number;
   waterClarity?: number;
   peakExponent?: number;

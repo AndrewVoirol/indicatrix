@@ -6,6 +6,7 @@
 
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { SimulationMode } from '../../../types';
+import { telemetryStore, useTelemetryLiveUnfurl } from '../../../core/TelemetryStore';
 
 export interface CurvatureUnfurlSextantProps {
   alpha: number; // 0.000 (Sphere) to 1.000 (Map)
@@ -38,8 +39,8 @@ const MILESTONES_BY_MODE: Record<number, MilestoneStage[]> = {
     { t: 1.0, label: 'PLANAR MAP (K = 0)', desc: 'Unrolled Mercator cylinder', sub: 'Unrolled Mercator cylinder' },
   ],
   2: [
-    { t: 0.0, label: 'SPHERE (K > 0)', desc: 'Hoop stress accumulating along seam', sub: 'Hoop stress accumulating along seam' },
-    { t: 0.3, label: 'ANTIMERIDIAN RUPTURE', desc: 'Griffith LEFM crack opens at equator', sub: 'Griffith LEFM crack opens at equator' },
+    { t: 0.0, label: 'SPHERE (K > 0)', desc: 'Hoop stress accumulating along ridge', sub: 'Hoop stress accumulating along ridge' },
+    { t: 0.3, label: 'MID-ATLANTIC RIFT', desc: 'Mid-Atlantic Ridge tectonic calving', sub: 'Mid-Atlantic Ridge tectonic calving' },
     { t: 0.7, label: 'FLAP PEELING', desc: 'Elastic stress dissipation', sub: 'Elastic stress dissipation' },
     { t: 1.0, label: 'PLANAR MAP (K = 0)', desc: 'Unrolled planar fracture manifold', sub: 'Unrolled planar fracture manifold' },
   ],
@@ -63,7 +64,9 @@ export const CurvatureUnfurlSextant: React.FC<CurvatureUnfurlSextantProps> = ({
   isLight = false,
   theme = isLight ? 1 : 0,
 }) => {
+  const liveUnfurlAlpha = useTelemetryLiveUnfurl(alpha);
   const boxRef = useRef<HTMLDivElement>(null);
+  const cachedRectRef = useRef<{ left: number; top: number; width: number; height: number } | null>(null);
   const isDraggingRef = useRef(false);
   const [isHovered, setIsHovered] = useState(false);
   const lastClientXRef = useRef(0);
@@ -71,28 +74,58 @@ export const CurvatureUnfurlSextant: React.FC<CurvatureUnfurlSextantProps> = ({
   const velocityRef = useRef(0);
   const momentumRafRef = useRef<number | null>(null);
   const stationaryTimeoutRef = useRef<NodeJS.Timeout | null>(null);
-  const lastInteractedAlphaRef = useRef<number>(alpha);
+  const lastInteractedAlphaRef = useRef<number>(liveUnfurlAlpha);
+
+  const refreshCachedRect = useCallback(() => {
+    const el = boxRef.current;
+    if (!el) return null;
+    const r = el.getBoundingClientRect();
+    if (r.width <= 0 || r.height <= 0) {
+      cachedRectRef.current = null;
+      return null;
+    }
+    const snap = { left: r.left, top: r.top, width: r.width, height: r.height };
+    cachedRectRef.current = snap;
+    return snap;
+  }, []);
 
   useEffect(() => {
-    lastInteractedAlphaRef.current = alpha;
+    const el = boxRef.current;
+    if (!el) return;
+    refreshCachedRect();
+    if (typeof ResizeObserver === 'undefined') return;
+    const ro = new ResizeObserver(() => {
+      refreshCachedRect();
+    });
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, [refreshCachedRect]);
+
+  useEffect(() => {
+    lastInteractedAlphaRef.current = liveUnfurlAlpha;
+  }, [liveUnfurlAlpha]);
+
+  useEffect(() => {
+    if (!isDraggingRef.current && momentumRafRef.current === null) {
+      telemetryStore.setLiveUnfurl(null);
+    }
   }, [alpha]);
 
   useEffect(() => {
+    telemetryStore.setLiveUnfurl(null);
     return () => {
       if (momentumRafRef.current) cancelAnimationFrame(momentumRafRef.current);
       if (stationaryTimeoutRef.current) clearTimeout(stationaryTimeoutRef.current);
+      telemetryStore.setLiveUnfurl(null);
     };
   }, []);
-
-
 
   const [dragAlpha, setDragAlpha] = useState<number | null>(null);
 
   const updateFromPointer = useCallback(
-    (clientX: number) => {
-      if (!boxRef.current) return;
-      const rect = boxRef.current.getBoundingClientRect();
-      if (rect.width <= 0) return;
+    (clientX: number, isContinuousDrag: boolean = true) => {
+      const rect = cachedRectRef.current ?? refreshCachedRect();
+      if (!rect || rect.width <= 0 || rect.height <= 0) return;
       // Active arc span: calibrated pointer clientX relative to SVG arc path [15, 225] inside 240 viewBox.
       // Because the SVG uses xMidYMid meet, it is letterboxed inside the container. We must calculate the 
       // actual rendered dimensions and centering padding to project the screen coordinate to the arc correctly.
@@ -102,22 +135,30 @@ export const CurvatureUnfurlSextant: React.FC<CurvatureUnfurlSextantProps> = ({
       
       const arcStartX_px = svgLeftPadding + (15 * svgScale);
       const arcWidth_px = 210 * svgScale;
+      if (arcWidth_px <= 0) return;
       
       const rawFrac = (clientX - (rect.left + arcStartX_px)) / arcWidth_px;
-      let normX = Math.max(0.0, Math.min(1.0, rawFrac));
+      const normX = Math.max(0.0, Math.min(1.0, rawFrac));
 
       const nextAlpha = parseFloat(normX.toFixed(4));
 
-      // Render reticle thumb using local drag coordinates, bypassing 30Hz React throttle
+      // Render reticle thumb using local drag coordinates, bypassing root React commits
       lastInteractedAlphaRef.current = nextAlpha;
       setDragAlpha(nextAlpha);
+      if (isContinuousDrag) {
+        telemetryStore.setLiveUnfurl(nextAlpha);
+      } else {
+        telemetryStore.setLiveUnfurl(null);
+      }
       onAlphaChange(nextAlpha);
     },
-    [onAlphaChange]
+    [onAlphaChange, refreshCachedRect]
   );
 
   const handlePointerDown = (e: React.PointerEvent) => {
     if (e.button !== 0) return;
+    const rect = refreshCachedRect();
+    if (!rect) return;
     onCancelGlide?.();
     isDraggingRef.current = true;
     if (stationaryTimeoutRef.current) {
@@ -136,7 +177,7 @@ export const CurvatureUnfurlSextant: React.FC<CurvatureUnfurlSextantProps> = ({
     } catch {
       // Ignore
     }
-    updateFromPointer(e.clientX);
+    updateFromPointer(e.clientX, true);
   };
 
   const handlePointerMove = (e: React.PointerEvent) => {
@@ -147,25 +188,23 @@ export const CurvatureUnfurlSextant: React.FC<CurvatureUnfurlSextantProps> = ({
     }
     const now = performance.now();
     const dt = now - lastTimeRef.current;
-    if (dt > 4 && boxRef.current) {
-      const rect = boxRef.current.getBoundingClientRect();
-      if (rect.width > 0) {
-        const svgScale = rect.height / 36;
-        const arcWidth_px = 210 * svgScale;
-        const dx = (e.clientX - lastClientXRef.current) / arcWidth_px;
-        velocityRef.current = dx / dt; // normalized fraction per ms
-        lastClientXRef.current = e.clientX;
-        lastTimeRef.current = now;
-      }
+    const rect = cachedRectRef.current;
+    if (dt > 4 && rect && rect.width > 0 && rect.height > 0) {
+      const svgScale = rect.height / 36;
+      const arcWidth_px = 210 * svgScale;
+      const dx = (e.clientX - lastClientXRef.current) / arcWidth_px;
+      velocityRef.current = dx / dt; // normalized fraction per ms
+      lastClientXRef.current = e.clientX;
+      lastTimeRef.current = now;
     }
-    updateFromPointer(e.clientX);
+    updateFromPointer(e.clientX, true);
 
     // If pointer stops moving within a milestone detent radius while still dragging,
     // decay velocity and snap activeAlpha directly to milestone after brief pause (40ms)
     stationaryTimeoutRef.current = setTimeout(() => {
       if (!isDraggingRef.current) return;
       velocityRef.current = 0;
-      updateFromPointer(lastClientXRef.current);
+      updateFromPointer(lastClientXRef.current, true);
     }, 40);
   };
 
@@ -205,25 +244,29 @@ export const CurvatureUnfurlSextant: React.FC<CurvatureUnfurlSextantProps> = ({
         vel *= 0.60; // rapid friction damping over 20-50ms (2-3 frames)
         currentAlpha = Math.max(0.0, Math.min(1.0, currentAlpha + vel * 16));
         const clampedAlpha = parseFloat(currentAlpha.toFixed(4));
-        setDragAlpha(clampedAlpha);
-        onAlphaChange(clampedAlpha);
         if (Math.abs(vel) < 0.00008) {
           momentumRafRef.current = null;
           setDragAlpha(null);
+          telemetryStore.setLiveUnfurl(null);
+          onAlphaChange(clampedAlpha);
           return;
         }
+        setDragAlpha(clampedAlpha);
+        telemetryStore.setLiveUnfurl(clampedAlpha);
+        onAlphaChange(clampedAlpha);
         momentumRafRef.current = requestAnimationFrame(step);
       };
       momentumRafRef.current = requestAnimationFrame(step);
     } else {
       lastInteractedAlphaRef.current = currentAlpha;
       setDragAlpha(null);
+      telemetryStore.setLiveUnfurl(null);
       onAlphaChange(currentAlpha);
     }
   };
 
-  // Local drag alpha takes precedence during interactions to bypass 30Hz React throttle
-  const activeAlpha = dragAlpha !== null ? dragAlpha : alpha;
+  // Local drag alpha or TelemetryStore live unfurl takes precedence during interactions
+  const activeAlpha = dragAlpha !== null ? dragAlpha : liveUnfurlAlpha;
 
   // SVG dimensions: 240 x 36
   const peakY = 6 + activeAlpha * 20;
@@ -375,19 +418,17 @@ export const CurvatureUnfurlSextant: React.FC<CurvatureUnfurlSextantProps> = ({
           />
         </svg>
 
-        {/* Milestone Tick Labels */}
-        <div className="absolute top-1 left-2 text-nano font-mono font-bold pointer-events-none text-[var(--theme-text-accent)]">
+        {/* Milestone Tick Labels & In-Slider Stage Telemetry Tag */}
+        <div className="absolute top-0.5 left-2 text-nano font-mono font-bold pointer-events-none text-[var(--theme-text-accent)]">
           K &gt; 0
         </div>
-        <div className="absolute top-1 right-2 text-nano font-mono font-bold pointer-events-none text-[var(--theme-text-accent)]">
+        <div className="absolute top-0.5 inset-x-12 h-3.5 leading-tight text-center truncate text-nano font-mono tracking-wider uppercase pointer-events-none">
+          <span className="font-bold text-[var(--theme-text-accent)]">{currentMilestone.label}</span>
+          <span className="opacity-70 text-[var(--theme-text-secondary)]"> · {currentMilestone.desc}</span>
+        </div>
+        <div className="absolute top-0.5 right-2 text-nano font-mono font-bold pointer-events-none text-[var(--theme-text-accent)]">
           K = 0
         </div>
-      </div>
-
-      {/* Stage Telemetry Tag */}
-      <div className="absolute top-full mt-1 w-full h-3.5 leading-tight text-center truncate text-micro font-mono tracking-wider uppercase pointer-events-none">
-        <span className="font-bold text-[var(--theme-text-accent)]">{currentMilestone.label}</span>
-        <span className="opacity-70 text-[var(--theme-text-secondary)]"> · {currentMilestone.desc}</span>
       </div>
     </div>
   );

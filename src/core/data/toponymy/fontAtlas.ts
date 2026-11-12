@@ -785,3 +785,128 @@ export function layoutToponymLabels(
 
   return { instances: out, glyphCount: glyphIndex };
 }
+
+// ============================================================================
+// Prebaked 1024x1024 SDF Font Atlas Binary Serialization & Fast Loader
+// ============================================================================
+
+export const SDF_ATLAS_BINARY_MAGIC = 0x46445349; // 'ISDF' little-endian
+export const SDF_ATLAS_BINARY_VERSION = 1;
+export const SDF_ATLAS_HEADER_BYTES = 16;
+export const DEFAULT_SDF_ATLAS_URL = '/data/sdf-font-atlas-1024.bin';
+
+let preloadedSDFAtlasPixels: Uint8Array | null = null;
+let inFlightSDFAtlasPromise: Promise<Uint8Array | null> | null = null;
+let memoizedProceduralAtlas: Uint8Array | null = null;
+
+export function encodePrebakedSDFAtlas(pixels: Uint8Array): Uint8Array {
+  const expectedPixels = ATLAS_WIDTH * ATLAS_HEIGHT;
+  if (pixels.byteLength !== expectedPixels) {
+    throw new Error(`Expected ${expectedPixels} SDF atlas bytes, got ${pixels.byteLength}`);
+  }
+  const out = new Uint8Array(SDF_ATLAS_HEADER_BYTES + expectedPixels);
+  const dv = new DataView(out.buffer);
+  dv.setUint32(0, SDF_ATLAS_BINARY_MAGIC, true);
+  dv.setUint32(4, SDF_ATLAS_BINARY_VERSION, true);
+  dv.setUint32(8, ATLAS_WIDTH, true);
+  dv.setUint32(12, ATLAS_HEIGHT, true);
+  out.set(pixels, SDF_ATLAS_HEADER_BYTES);
+  return out;
+}
+
+export function decodePrebakedSDFAtlas(input: ArrayBuffer | Uint8Array): Uint8Array | null {
+  const view =
+    input instanceof Uint8Array
+      ? input
+      : input instanceof ArrayBuffer
+      ? new Uint8Array(input)
+      : null;
+  const expectedPixels = ATLAS_WIDTH * ATLAS_HEIGHT;
+  if (!view || view.byteLength !== SDF_ATLAS_HEADER_BYTES + expectedPixels) {
+    return null;
+  }
+  const dv = new DataView(view.buffer, view.byteOffset, view.byteLength);
+  const magic = dv.getUint32(0, true);
+  const version = dv.getUint32(4, true);
+  const width = dv.getUint32(8, true);
+  const height = dv.getUint32(12, true);
+  if (
+    magic !== SDF_ATLAS_BINARY_MAGIC ||
+    version !== SDF_ATLAS_BINARY_VERSION ||
+    width !== ATLAS_WIDTH ||
+    height !== ATLAS_HEIGHT
+  ) {
+    return null;
+  }
+  return view.subarray(SDF_ATLAS_HEADER_BYTES, SDF_ATLAS_HEADER_BYTES + expectedPixels);
+}
+
+function isVitestEnv(): boolean {
+  const proc = (globalThis as unknown as { process?: { env?: Record<string, string | undefined> } }).process;
+  return Boolean(proc?.env?.VITEST);
+}
+
+export function getPreloadedSDFAtlas(): Uint8Array | null {
+  return preloadedSDFAtlasPixels;
+}
+
+export function resetPreloadedSDFAtlasForTests(): void {
+  preloadedSDFAtlasPixels = null;
+  inFlightSDFAtlasPromise = null;
+}
+
+export async function loadPrebakedSDFAtlas(
+  url: string = DEFAULT_SDF_ATLAS_URL,
+  allowInVitest = false
+): Promise<Uint8Array | null> {
+  if (isVitestEnv() && !allowInVitest) {
+    return null;
+  }
+  if (typeof fetch !== 'function') {
+    return null;
+  }
+  try {
+    const res = await fetch(url);
+    if (!res.ok) return null;
+    const contentType = res.headers?.get?.('content-type') || '';
+    if (contentType.includes('text/html')) return null;
+    const ab = await res.arrayBuffer();
+    const decoded = decodePrebakedSDFAtlas(ab);
+    if (decoded) {
+      // Copy into compact standalone Uint8Array so header slice is released
+      const copy = new Uint8Array(decoded.byteLength);
+      copy.set(decoded);
+      preloadedSDFAtlasPixels = copy;
+      return copy;
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+export function preloadSDFAtlas(url: string = DEFAULT_SDF_ATLAS_URL): Promise<Uint8Array | null> {
+  if (preloadedSDFAtlasPixels) {
+    return Promise.resolve(preloadedSDFAtlasPixels);
+  }
+  if (isVitestEnv()) {
+    return Promise.resolve(null);
+  }
+  if (!inFlightSDFAtlasPromise) {
+    inFlightSDFAtlasPromise = loadPrebakedSDFAtlas(url).finally(() => {
+      inFlightSDFAtlasPromise = null;
+    });
+  }
+  return inFlightSDFAtlasPromise;
+}
+
+export function getOrGenerateSDFAtlas(): Uint8Array {
+  if (preloadedSDFAtlasPixels) {
+    return preloadedSDFAtlasPixels;
+  }
+  if (!memoizedProceduralAtlas) {
+    memoizedProceduralAtlas = generateProceduralSDFAtlas();
+  }
+  return memoizedProceduralAtlas;
+}
+

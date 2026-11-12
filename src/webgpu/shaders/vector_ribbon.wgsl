@@ -25,7 +25,7 @@ struct SimUniforms {
     u_viewMatrix: mat4x4<f32>,
     u_projectionMatrix: mat4x4<f32>,
     u_vectorTierOverride: f32, // 0.0 = auto, 1.0 = orbit, 2.0 = regional, 3.0 = local
-    _padRte0_1: f32,
+    u_purityMode: f32,
     _padRte0_2: f32,
     _padRte0_3: f32,
     _padRte1: vec4<f32>,
@@ -90,19 +90,44 @@ struct VertexOutput {
 // ----------------------------------------------------------------------------
 // Analytical 3D Solenoidal Curl Noise (div u = 0 guaranteed)
 // ----------------------------------------------------------------------------
+fn evaluateGridManifold(uv: vec2<f32>, unfurl: f32, mode: u32) -> DeformedVertex {
+    let lambda = (uv.x - 0.5) * (2.0 * PI);
+    let phi = (0.5 - uv.y) * PI;
+    let cosLat = cos(phi);
+    let sinLat = sin(phi);
+    let cosLon = cos(lambda);
+    let sinLon = sin(lambda);
+    let pos3D = vec3<f32>(RADIUS * cosLat * sinLon, RADIUS * sinLat, RADIUS * cosLat * cosLon);
+    let clampedPhi = clamp(phi, -1.4835, 1.4835);
+    let mercatorY = log(tan(PI * 0.25 + clampedPhi * 0.5)) * RADIUS;
+    let mercatorX = lambda * RADIUS;
+    let targetY = select(mercatorY, phi * RADIUS, mode == 0u);
+    let target2D = vec2<f32>(mercatorX, targetY);
+    return evaluateManifoldCore(
+        pos3D, target2D, unfurl, mode,
+        sim.u_time, sim.u_cursorHitPos, sim.u_cursorActive, sim.u_cursorVel
+    );
+}
+
 fn getRegionalBlendWeight(uv: vec2<f32>) -> f32 {
     let lon = uv.x * 360.0 - 180.0;
     let lat = 90.0 - uv.y * 180.0;
+    let ptManifold = evaluateGridManifold(uv, sim.u_unfurl, sim.u_mode);
+    let ptDist = length(sim.u_cameraPos.xyz - ptManifold.pos);
+    let dispScaleGate = 1.0 - smoothstep(0.48, 0.68, sim.u_displacementScale * 2.8);
+    let tileZoomGate = (1.0 - smoothstep(0.45, 0.72, ptDist)) * dispScaleGate;
+    let regZoomGate = (1.0 - smoothstep(1.05, 1.85, ptDist)) * dispScaleGate;
 
     var bestTileWeight: f32 = 0.0;
     let cBounds = u_regionalOverlay.u_pad1;
     let hasClusterBounds = cBounds.z > cBounds.x && cBounds.w > cBounds.y;
     let inTileCluster = !hasClusterBounds || (lon >= cBounds.x && lon <= cBounds.z && lat >= cBounds.y && lat <= cBounds.w);
-    let slotCount = select(0u, min(u_regionalOverlay.u_pad3, 64u), inTileCluster);
+    let slotCount = select(0u, min(u_regionalOverlay.u_pad3, 64u), inTileCluster && tileZoomGate > 0.001);
     let gridF = max(1.0, round(sqrt(f32(slotCount))));
     let gridN = u32(gridF);
     let relX = clamp((lon - cBounds.x) / max(1e-5, cBounds.z - cBounds.x), 0.0, 0.99999);
     let relY = clamp((cBounds.w - lat) / max(1e-5, cBounds.w - cBounds.y), 0.0, 0.99999);
+    let clusterBorderW = select(1.0, smoothstep(0.0, 0.18, min(relX, 1.0 - relX)) * smoothstep(0.0, 0.18, min(relY, 1.0 - relY)), hasClusterBounds);
     let guessIdx = select(0u, min(slotCount - 1u, u32(floor(relY * gridF)) * gridN + u32(floor(relX * gridF))), slotCount > 0u);
     for (var step: u32 = 0u; step < slotCount; step = step + 1u) {
         let i = select(select(step, step - 1u, step <= guessIdx), guessIdx, step == 0u);
@@ -112,7 +137,7 @@ fn getRegionalBlendWeight(uv: vec2<f32>) -> f32 {
             let tileU = (lon - b.x) / (b.z - b.x);
             let tileV = (b.w - lat) / (b.w - b.y);
             let edgeMask = u32(floor(slot.tileMeta.x / 64.0));
-            let blendDeg = 0.05;
+            let blendDeg = 0.12;
             let marginU = clamp(blendDeg / (b.z - b.x), 0.001, 0.49);
             let marginV = clamp(blendDeg / (b.w - b.y), 0.001, 0.49);
 
@@ -121,13 +146,13 @@ fn getRegionalBlendWeight(uv: vec2<f32>) -> f32 {
             let wNorth = select(smoothstep(0.0, marginV, tileV), 1.0, (edgeMask & 8u) != 0u);
             let wSouth = select(smoothstep(0.0, marginV, 1.0 - tileV), 1.0, (edgeMask & 2u) != 0u);
 
-            let slotWeight = min(wWest, wEast) * min(wNorth, wSouth);
+            let slotWeight = min(wWest, wEast) * min(wNorth, wSouth) * clusterBorderW * tileZoomGate;
             bestTileWeight = max(bestTileWeight, slotWeight);
             break;
         }
     }
 
-    if (u_regionalOverlay.u_regionalActive != 1u) {
+    if (u_regionalOverlay.u_regionalActive != 1u || regZoomGate <= 0.001) {
         return bestTileWeight;
     }
 
@@ -151,7 +176,7 @@ fn getRegionalBlendWeight(uv: vec2<f32>) -> f32 {
     let regU = (lon - minLon) / (maxLon - minLon);
     let regV = (maxLat - lat) / (maxLat - minLat);
 
-    let blendDeg = 0.05;
+    let blendDeg = 0.08;
     let lonSpan = maxLon - minLon;
     let latSpan = maxLat - minLat;
     let marginU = clamp(blendDeg / lonSpan, 0.001, 0.49);
@@ -162,15 +187,39 @@ fn getRegionalBlendWeight(uv: vec2<f32>) -> f32 {
 
     let weightU = smoothstep(0.0, marginU, distU);
     let weightV = smoothstep(0.0, marginV, distV);
-    return max(bestTileWeight, weightU * weightV);
+    return max(bestTileWeight, weightU * weightV * regZoomGate);
+}
+
+// Unpacks 2-channel rg16float [bNorm, elevMeters] DEM sample into legacy vec4(r, g, b, a) layout
+fn unpackGlobalDemRG(s: vec4<f32>) -> vec4<f32> {
+    let b = s.r;
+    let a = s.g;
+    let elevM = a * 19772.0 - 10924.0;
+    return vec4<f32>(clamp(elevM / 8848.0, 0.0, 1.0), clamp(-elevM / 10924.0, 0.0, 1.0), b, a);
+}
+
+fn unpackDemRG(s: vec4<f32>) -> vec4<f32> {
+    let b = s.r;
+    let elevM = s.g;
+    let a = clamp((elevM + 10924.0) / 19772.0, 0.0, 1.0);
+    return vec4<f32>(clamp(elevM / 8848.0, 0.0, 1.0), clamp(-elevM / 10924.0, 0.0, 1.0), b, a);
 }
 
 fn sampleRegionalComposite(uv: vec2<f32>, globalSample: vec4<f32>, lod: f32) -> vec4<f32> {
     let lon = uv.x * 360.0 - 180.0;
     let lat = 90.0 - uv.y * 180.0;
     var compositeSample = globalSample;
+    let globalElevM = globalSample.a * 19772.0 - 10924.0;
+    let isInlandBasin = globalSample.b > 0.90 && globalElevM < -2.0;
+    let ptManifold = evaluateGridManifold(uv, sim.u_unfurl, sim.u_mode);
+    let ptDist = length(sim.u_cameraPos.xyz - ptManifold.pos);
+    let dispScaleGate = 1.0 - smoothstep(0.48, 0.68, sim.u_displacementScale * 2.8);
+    let tileZoomGate = (1.0 - smoothstep(0.45, 0.72, ptDist)) * dispScaleGate;
+    let regZoomGate = (1.0 - smoothstep(1.05, 1.85, ptDist)) * dispScaleGate;
 
-    if (u_regionalOverlay.u_regionalActive == 1u) {
+    var activeRegWeight: f32 = 0.0;
+    var activeRegTsY: f32 = 1.0;
+    if (u_regionalOverlay.u_regionalActive == 1u && regZoomGate > 0.001) {
         let bounds = u_regionalOverlay.u_regionalBounds;
         let minLon = bounds.x;
         let minLat = bounds.y;
@@ -179,24 +228,32 @@ fn sampleRegionalComposite(uv: vec2<f32>, globalSample: vec4<f32>, lod: f32) -> 
         if (lon >= minLon && lon <= maxLon && lat >= minLat && lat <= maxLat && maxLon > minLon && maxLat > minLat) {
             let regU = clamp((lon - minLon) / (maxLon - minLon), 0.0, 1.0);
             let regV = clamp((maxLat - lat) / (maxLat - minLat), 0.0, 1.0);
-            let blendDeg = 0.05;
+            let blendDeg = 0.08;
             let marginU = clamp(blendDeg / (maxLon - minLon), 0.001, 0.49);
             let marginV = clamp(blendDeg / (maxLat - minLat), 0.001, 0.49);
             let regW = smoothstep(0.0, marginU, min(regU, 1.0 - regU)) * smoothstep(0.0, marginV, min(regV, 1.0 - regV));
-            let regSample = textureSampleLevel(u_regionalDEMTexture, u_demSampler, vec2<f32>(regU, regV), lod);
-            compositeSample = mix(compositeSample, regSample, regW);
-            return compositeSample;
+            let regSample = unpackDemRG(textureSampleLevel(u_regionalDEMTexture, u_demSampler, vec2<f32>(regU, regV), lod));
+            let hasRegBathy = regSample.g > 0.00015;
+            let regLandGate = smoothstep(0.35, 0.65, globalSample.b);
+            let regCoastalMask = clamp(max(regLandGate, smoothstep(-140.0, -10.0, globalElevM)) + regSample.b + select(0.0, 1.0, hasRegBathy), 0.0, 1.0);
+            let effRegB = select(mix(globalSample.b, regSample.b, regCoastalMask), globalSample.b, isInlandBasin);
+            let effRegA = select(select(min(globalSample.a, (10924.0 - 4.5) / 19772.0), regSample.a, effRegB > 0.01 || isInlandBasin), regSample.a, hasRegBathy);
+            let safeRegSample = vec4<f32>(regSample.r, regSample.g, effRegB, effRegA);
+            activeRegWeight = regW * regCoastalMask * regZoomGate;
+            activeRegTsY = (maxLat - minLat) / (180.0 * max(f32(textureDimensions(u_regionalDEMTexture).y), 1.0));
+            compositeSample = mix(compositeSample, safeRegSample, activeRegWeight);
         }
     }
 
     let cBounds = u_regionalOverlay.u_pad1;
     let hasClusterBounds = cBounds.z > cBounds.x && cBounds.w > cBounds.y;
     let inTileCluster = !hasClusterBounds || (lon >= cBounds.x && lon <= cBounds.z && lat >= cBounds.y && lat <= cBounds.w);
-    let slotCount = select(0u, min(u_regionalOverlay.u_pad3, 64u), inTileCluster);
+    let slotCount = select(0u, min(u_regionalOverlay.u_pad3, 64u), inTileCluster && tileZoomGate > 0.001);
     let gridF = max(1.0, round(sqrt(f32(slotCount))));
     let gridN = u32(gridF);
     let relX = clamp((lon - cBounds.x) / max(1e-5, cBounds.z - cBounds.x), 0.0, 0.99999);
     let relY = clamp((cBounds.w - lat) / max(1e-5, cBounds.w - cBounds.y), 0.0, 0.99999);
+    let clusterBorderW = select(1.0, smoothstep(0.0, 0.09, min(relX, 1.0 - relX)) * smoothstep(0.0, 0.09, min(relY, 1.0 - relY)), hasClusterBounds);
     let guessIdx = select(0u, min(slotCount - 1u, u32(floor(relY * gridF)) * gridN + u32(floor(relX * gridF))), slotCount > 0u);
     for (var step: u32 = 0u; step < slotCount; step = step + 1u) {
         let i = select(select(step, step - 1u, step <= guessIdx), guessIdx, step == 0u);
@@ -214,15 +271,30 @@ fn sampleRegionalComposite(uv: vec2<f32>, globalSample: vec4<f32>, lod: f32) -> 
             let wEast  = select(smoothstep(0.0, marginU, 1.0 - tileU), 1.0, (edgeMask & 4u) != 0u);
             let wNorth = select(smoothstep(0.0, marginV, tileV), 1.0, (edgeMask & 8u) != 0u);
             let wSouth = select(smoothstep(0.0, marginV, 1.0 - tileV), 1.0, (edgeMask & 2u) != 0u);
-            let slotWeight = min(wWest, wEast) * min(wNorth, wSouth);
+            let slotWeight = min(wWest, wEast) * min(wNorth, wSouth) * clusterBorderW * tileZoomGate;
 
+            let isRegionalCogTile = (u32(slot.tileMeta.x) & 63u) == 14u;
             let effCols = max(1.0, slot.tileMeta.z * 256.0);
             let effRows = max(1.0, slot.tileMeta.w * 256.0);
-            let sampU = (0.5 + tileU * (effCols - 1.0)) / 256.0;
-            let sampV = (0.5 + tileV * (effRows - 1.0)) / 256.0;
-            let tileSample = textureSampleLevel(u_tileCacheArray, u_demSampler, vec2<f32>(sampU, sampV), i32(slot.tileMeta.y), 0.0);
-            let tileLandGate = smoothstep(0.35, 0.65, globalSample.b);
-            compositeSample = mix(compositeSample, tileSample, slotWeight * tileLandGate);
+            let sampU = select((0.5 + tileU * (effCols - 1.0)) / 256.0, clamp(tileU * effCols, 0.5, effCols - 0.5) / 256.0, isRegionalCogTile);
+            let sampV = select((0.5 + tileV * (effRows - 1.0)) / 256.0, clamp(tileV * effRows, 0.5, effRows - 0.5) / 256.0, isRegionalCogTile);
+            let tileSample = unpackDemRG(textureSampleLevel(u_tileCacheArray, u_demSampler, vec2<f32>(sampU, sampV), i32(slot.tileMeta.y), 0.0));
+            let tileAddLand = clamp((tileSample.b - 0.504) * 2.0, 0.0, 1.0);
+            let isOffshoreOcean = (globalSample.a * 19772.0 - 10924.0) < -15.0 && tileSample.b <= 0.504;
+            let tileLandGate = select(max(smoothstep(0.35, 0.65, globalSample.b), tileAddLand), 0.0, isOffshoreOcean);
+            let tileCarveWater = clamp((0.496 - tileSample.b) * 2.04, 0.0, 1.0);
+            let fjordCarveGate = (1.0 - smoothstep(180.0, 480.0, globalElevM)) * (1.0 - select(0.0, 1.0, isInlandBasin));
+            let hasCogTileBathy = isRegionalCogTile && tileSample.g > 0.00015;
+            let tileCoastalMask = select(max(tileLandGate, select(tileCarveWater * fjordCarveGate, 0.0, isOffshoreOcean)), 1.0, hasCogTileBathy || (isRegionalCogTile && tileSample.b > 0.01));
+            let carvedLandMask = max(0.0, compositeSample.b * (1.0 - tileCarveWater * fjordCarveGate));
+            let targetTileB = max(carvedLandMask, tileAddLand);
+            let effTileB = select(select(mix(compositeSample.b, targetTileB, tileCoastalMask), tileSample.b, isRegionalCogTile), compositeSample.b, isInlandBasin);
+            let effTileG = select(compositeSample.g, tileSample.g, hasCogTileBathy);
+            let effTileA = select(min(compositeSample.a, (10924.0 - 4.5 * (1.0 - effTileB)) / 19772.0), tileSample.a, effTileB > 0.45 || isInlandBasin || hasCogTileBathy);
+            let safeTileSample = vec4<f32>(tileSample.r * clamp(effTileB * 2.0, 0.0, 1.0), effTileG, effTileB, effTileA);
+            let tileTsY = max(0.0001, b.w - b.y) / (180.0 * effRows);
+            let tileRefinesReg = select(1.0, 1.0 - activeRegWeight, activeRegWeight > 0.001 && tileTsY >= activeRegTsY * 0.85);
+            compositeSample = mix(compositeSample, safeTileSample, slotWeight * tileCoastalMask * tileRefinesReg);
             break;
         }
     }
@@ -230,55 +302,79 @@ fn sampleRegionalComposite(uv: vec2<f32>, globalSample: vec4<f32>, lod: f32) -> 
     return compositeSample;
 }
 
-fn applyVectorDisplacement(basePos: vec3<f32>, baseNormal: vec3<f32>, pointType: f32, restPos3D: vec3<f32>) -> vec3<f32> {
+fn evaluateElevationDisplacement(elevM: f32, dispScale: f32, poleAtten: f32, exponent: f32, limbAtten: f32) -> f32 {
+    var disp: f32 = 0.0;
+    if (sim.u_pad2 > 0.5) {
+        if (elevM >= 0.0) {
+            let logNormH = log(1.0 + elevM / 1200.0) / log(1.0 + 8848.0 / 1200.0);
+            let expLogNormH = pow(clamp(logNormH, 0.0, 1.0), exponent);
+            disp = expLogNormH * dispScale * poleAtten;
+        } else {
+            let logNormD = log(1.0 + (-elevM) / 1500.0) / log(1.0 + 10924.0 / 1500.0);
+            let clampedLogD = clamp(logNormD, 0.0, 1.0);
+            let shelfLogD = clampedLogD / (1.0 + 2.25 * (1.0 - clampedLogD));
+            disp = -shelfLogD * (dispScale * 0.78) * poleAtten * limbAtten;
+        }
+    } else {
+        if (elevM >= 0.0) {
+            let normH = elevM / 8848.0;
+            let expNormH = pow(clamp(normH, 0.0, 1.0), exponent);
+            disp = expNormH * dispScale * poleAtten;
+        } else {
+            let normD = clamp(-elevM / 10924.0, 0.0, 1.0);
+            let shelfD = normD / (1.0 + 1.5 * (1.0 - normD));
+            disp = -shelfD * dispScale * poleAtten * limbAtten;
+        }
+    }
+    return disp;
+}
+
+fn applyVectorDisplacement(basePos: vec3<f32>, baseNormal: vec3<f32>, pointType: f32, restPos3D: vec3<f32>) -> vec4<f32> {
     let curR = RADIUS;
     let lambda = atan2(restPos3D.x, restPos3D.z);
     let phi = asin(clamp(restPos3D.y / curR, -0.9998, 0.9998));
     let demUv = vec2<f32>((lambda + PI) / (2.0 * PI), 0.5 - phi / PI);
     let patchDist = length(sim.u_cameraPos.xyz - basePos);
     let patchLOD = clamp(log2(max(1.0, patchDist * 0.2)), 0.0, 4.0);
-    let demSampleGlobal = textureSampleLevel(u_demTexture, u_demSampler, demUv, patchLOD);
-    let demSample = sampleRegionalComposite(demUv, demSampleGlobal, patchLOD);
+    let dispScale = sim.u_displacementScale * 2.8;
+    let exaggFilterMip = clamp(log2(max(1.0, dispScale * 9.5)), 0.0, 1.65);
+    let vertMip = max(min(patchLOD * 0.25, 0.95), max(0.65, exaggFilterMip));
+    let vertStepUV = vec2<f32>(0.0012, 0.0018);
+    let demSampleGlobal = unpackGlobalDemRG(textureSampleLevel(u_demTexture, u_demSampler, demUv, vertMip));
+    let demGlobalR = unpackGlobalDemRG(textureSampleLevel(u_demTexture, u_demSampler, vec2<f32>(fract(demUv.x + vertStepUV.x), demUv.y), vertMip));
+    let demGlobalL = unpackGlobalDemRG(textureSampleLevel(u_demTexture, u_demSampler, vec2<f32>(fract(demUv.x - vertStepUV.x + 1.0), demUv.y), vertMip));
+    let demGlobalU = unpackGlobalDemRG(textureSampleLevel(u_demTexture, u_demSampler, vec2<f32>(demUv.x, clamp(demUv.y + vertStepUV.y, 0.0, 1.0)), vertMip));
+    let demGlobalD = unpackGlobalDemRG(textureSampleLevel(u_demTexture, u_demSampler, vec2<f32>(demUv.x, clamp(demUv.y - vertStepUV.y, 0.0, 1.0)), vertMip));
+    let closeVertBlend = 1.0 - smoothstep(0.35, 1.25, patchDist);
+    let demSampleComp = sampleRegionalComposite(demUv, demSampleGlobal, patchLOD);
+    let demSample = mix(demSampleGlobal, demSampleComp, closeVertBlend);
 
     let poleDist = abs(demUv.y - 0.5) * 2.0;
     let poleAtten = 1.0 - smoothstep(0.85, 0.98, poleDist);
-    let elevMeters = demSample.a * 19772.0 - 10924.0;
-    var normalDisplacement: f32 = 0.0;
-    let dispScale = sim.u_displacementScale * 2.8;
-
-    let exponent = select(1.0, clamp(sim.u_peakExponent, 0.2, 4.0), sim.u_peakExponent > 0.01);
-    if (sim.u_pad2 > 0.5) {
-        if (elevMeters >= 0.0) {
-            let logNormH = log(1.0 + elevMeters / 1200.0) / log(1.0 + 8848.0 / 1200.0);
-            let expLogNormH = pow(clamp(logNormH, 0.0, 1.0), exponent);
-            normalDisplacement = expLogNormH * dispScale * poleAtten;
-        } else {
-            let logNormD = log(1.0 + (-elevMeters) / 1500.0) / log(1.0 + 10924.0 / 1500.0);
-            normalDisplacement = -logNormD * dispScale * poleAtten;
-        }
-    } else {
-        if (elevMeters >= 0.0) {
-            let normH = elevMeters / 8848.0;
-            let expNormH = pow(clamp(normH, 0.0, 1.0), exponent);
-            normalDisplacement = expNormH * dispScale * poleAtten;
-        } else {
-            let normD = clamp(-elevMeters / 10924.0, 0.0, 1.0);
-            let shelfD = normD / (1.0 + 1.5 * (1.0 - normD));
-            normalDisplacement = -shelfD * dispScale * poleAtten;
-        }
-    }
+    let rawElevM = demSample.a * 19772.0 - 10924.0;
+    let landRimElevM = max(demSample.r, demSampleGlobal.r) * 8848.0;
+    // Prevent underwater GEBCO lake-bed / ocean-bed bathymetry in .a from pulling shorelines or river mouths underwater,
+    // while keeping ocean coastlines at 0.0m sea level and canyon rivers on the valley floor (zero lateral detachment at oblique angles).
+    let elevMeters = max(rawElevM, landRimElevM);
 
     let viewDir = normalize(sim.u_cameraPos.xyz - basePos);
     let facing = dot(baseNormal, viewDir);
     let globeWeight = 1.0 - smoothstep(0.0, 0.05, sim.u_unfurl);
     let limbAtten = mix(1.0, smoothstep(0.000, 0.005, facing), globeWeight);
-    if (normalDisplacement < 0.0) {
-        normalDisplacement = normalDisplacement * limbAtten;
-    }
+    let exponent = select(1.0, clamp(sim.u_peakExponent, 0.2, 4.0), sim.u_peakExponent > 0.01);
+
+    let normalDisplacement = evaluateElevationDisplacement(elevMeters, dispScale, poleAtten, exponent, limbAtten);
+
+    // Local CDLOD cell chord envelope: applied strictly in clipPos.z along the camera view ray so screen-space XY
+    // remains 100% locked to the true terrain shoreline/riverbed at all oblique angles while clearing CDLOD bluff chords.
+    let roofLandR = max(max(demSample.r, demSampleGlobal.r), max(max(demGlobalR.r, demGlobalL.r), max(demGlobalU.r, demGlobalD.r)));
+    let roofElevM = max(elevMeters, roofLandR * 8848.0);
+    let roofDisplacement = evaluateElevationDisplacement(roofElevM, dispScale, poleAtten, exponent, limbAtten);
+    let roofClearanceWorld = max(0.0, roofDisplacement - normalDisplacement) + 0.0032 * dispScale + 0.0012;
 
     // Eliminated 0.025 normal standoff: set standoff = 0.0 to conform directly to terrain surface without floating spikes
     let standoff = 0.0;
-    return basePos + baseNormal * (normalDisplacement + standoff);
+    return vec4<f32>(basePos + baseNormal * (normalDisplacement + standoff), roofClearanceWorld);
 }
 
 // ----------------------------------------------------------------------------
@@ -301,7 +397,8 @@ fn vs_main(in: VertexInput) -> VertexOutput {
         sim.u_unfurl, sim.u_mode, sim.u_time,
         sim.u_cursorHitPos, sim.u_cursorActive, sim.u_cursorVel
     );
-    let dispPosA = applyVectorDisplacement(defA.pos, defA.normal, in.posA_3d.w, normPosA);
+    let dispA = applyVectorDisplacement(defA.pos, defA.normal, in.posA_3d.w, normPosA);
+    let dispPosA = dispA.xyz;
 
     let normPosB = normalize(in.posB_3d.xyz) * RADIUS;
     let defB = evaluateManifoldCore(
@@ -309,7 +406,9 @@ fn vs_main(in: VertexInput) -> VertexOutput {
         sim.u_unfurl, sim.u_mode, sim.u_time,
         sim.u_cursorHitPos, sim.u_cursorActive, sim.u_cursorVel
     );
-    let dispPosB = applyVectorDisplacement(defB.pos, defB.normal, in.posB_3d.w, normPosB);
+    let dispB = applyVectorDisplacement(defB.pos, defB.normal, in.posB_3d.w, normPosB);
+    let dispPosB = dispB.xyz;
+    let segRoofClearance = max(dispA.w, dispB.w);
 
     // Compute view-space positions, normals, and horizon facing for both endpoints
     let viewPosA = sim.u_viewMatrix * vec4<f32>(dispPosA, 1.0);
@@ -399,11 +498,12 @@ fn vs_main(in: VertexInput) -> VertexOutput {
         } else {
             // Auto LOD switching with smooth cross-fading
             if (tierTag < 1.5) {
-                // Orbit Tier (1:110M generalized boundaries)
+                // Orbit Tier (1:110M generalized boundaries, restricted to deep space r > 30)
                 tierVisibility = smoothstep(10.5, 13.5, camDist);
+                tierVisibility = tierVisibility * smoothstep(30.0, 34.0, camDist);
             } else if (tierTag < 2.5) {
-                // Regional Tier (1:10M standard vectors)
-                let fadeIn = 1.0 - smoothstep(12.0, 14.0, camDist);
+                // Regional Tier (1:10M standard vectors — continuous across orbital & mid-scale up to r = 30)
+                let fadeIn = 1.0 - smoothstep(30.0, 34.0, camDist);
                 let fadeOut = smoothstep(5.6, 6.8, camDist);
                 tierVisibility = fadeIn * fadeOut;
             } else {
@@ -447,21 +547,49 @@ fn vs_main(in: VertexInput) -> VertexOutput {
             return out;
         }
     } else {
-        // Close-Zoom Vector-to-DEM Shoreline Handoff (M13-P2-T1):
-        // At close zoom (camDist < 5.55), coarse 1:50m Natural Earth coastline chords
-        // form visible straight polygon segments over high-resolution slippy DEM shorelines.
-        // Smoothly hand off coarse coastline ink inside active regional/slippy DEM coverage
-        // so the crisp DEM shoreline contour and hypsometric shelf transition take over.
+        // Close-Zoom Vector-to-DEM Composite Shoreline Handoff:
+        // Coarse Natural Earth coastline chords fade out smoothly in an exact partition of unity
+        // with crust_hydrosphere.wgsl's sub-pixel composite DEM shoreline stroke whenever
+        // regional COGs or AWS Terrarium slippy tiles refine the ocean shoreline, while
+        // preserving 100% of inland lake & endorheic basin shorelines (minGlobalShoreB > 0.60).
         let midRest3D = normalize(0.5 * (in.posA_3d.xyz + in.posB_3d.xyz)) * RADIUS;
         let midLambda = atan2(midRest3D.x, midRest3D.z);
         let midPhi = asin(clamp(midRest3D.y / RADIUS, -0.9998, 0.9998));
         let midDemUv = vec2<f32>((midLambda + PI) / (2.0 * PI), 0.5 - midPhi / PI);
         let regWeight = getRegionalBlendWeight(midDemUv);
-        let closeCoastFade = select(
-            mix(1.0, smoothstep(5.08, 5.55, camDist), smoothstep(0.25, 0.75, regWeight)),
-            1.0,
-            sim._padRte0_1 > 0.5
-        );
+        var inlandLakeShoreMask: f32 = 0.0;
+        if (regWeight > 0.02) {
+            let midGlobalB = textureSampleLevel(u_demTexture, u_demSampler, midDemUv, 0.0).r;
+            let shoreStepUv = vec2<f32>(0.085 / 360.0, 0.085 / 180.0);
+            let shoreDiagUv = vec2<f32>(0.060 / 360.0, 0.060 / 180.0);
+            let gB_E = textureSampleLevel(u_demTexture, u_demSampler, vec2<f32>(fract(midDemUv.x + shoreStepUv.x), midDemUv.y), 0.0).r;
+            let gB_W = textureSampleLevel(u_demTexture, u_demSampler, vec2<f32>(fract(midDemUv.x - shoreStepUv.x + 1.0), midDemUv.y), 0.0).r;
+            let gB_N = textureSampleLevel(u_demTexture, u_demSampler, vec2<f32>(midDemUv.x, clamp(midDemUv.y - shoreStepUv.y, 0.0, 1.0)), 0.0).r;
+            let gB_S = textureSampleLevel(u_demTexture, u_demSampler, vec2<f32>(midDemUv.x, clamp(midDemUv.y + shoreStepUv.y, 0.0, 1.0)), 0.0).r;
+            let gB_NE = textureSampleLevel(u_demTexture, u_demSampler, vec2<f32>(fract(midDemUv.x + shoreDiagUv.x), clamp(midDemUv.y - shoreDiagUv.y, 0.0, 1.0)), 0.0).r;
+            let gB_NW = textureSampleLevel(u_demTexture, u_demSampler, vec2<f32>(fract(midDemUv.x - shoreDiagUv.x + 1.0), clamp(midDemUv.y - shoreDiagUv.y, 0.0, 1.0)), 0.0).r;
+            let gB_SE = textureSampleLevel(u_demTexture, u_demSampler, vec2<f32>(fract(midDemUv.x + shoreDiagUv.x), clamp(midDemUv.y + shoreDiagUv.y, 0.0, 1.0)), 0.0).r;
+            let gB_SW = textureSampleLevel(u_demTexture, u_demSampler, vec2<f32>(fract(midDemUv.x - shoreDiagUv.x + 1.0), clamp(midDemUv.y + shoreDiagUv.y, 0.0, 1.0)), 0.0).r;
+            let minGlobalShoreB = min(midGlobalB, min(min(min(gB_E, gB_W), min(gB_N, gB_S)), min(min(gB_NE, gB_NW), min(gB_SE, gB_SW))));
+            inlandLakeShoreMask = smoothstep(0.56, 0.64, minGlobalShoreB);
+        }
+        let isSlippyCoast = rawOrderA > 0.5;
+        let lonADeg = atan2(normPosA.x, normPosA.z) * (180.0 / PI);
+        let latADeg = asin(clamp(normPosA.y / RADIUS, -0.9998, 0.9998)) * (180.0 / PI);
+        let lonBDeg = atan2(normPosB.x, normPosB.z) * (180.0 / PI);
+        let latBDeg = asin(clamp(normPosB.y / RADIUS, -0.9998, 0.9998)) * (180.0 / PI);
+        let dLonDeg = abs(lonADeg - lonBDeg);
+        let dLatDeg = abs(latADeg - latBDeg);
+        let isLatGridSeam = abs(latADeg - round(latADeg)) < 0.0045 && abs(latBDeg - round(latBDeg)) < 0.0045 && abs(round(latADeg) - round(latBDeg)) < 0.01 && dLonDeg > 0.012;
+        let isLonGridSeam = abs(lonADeg - round(lonADeg)) < 0.0045 && abs(lonBDeg - round(lonBDeg)) < 0.0045 && abs(round(lonADeg) - round(lonBDeg)) < 0.01 && dLatDeg > 0.012;
+        if (isLatGridSeam || isLonGridSeam) {
+            out.clipPos = vec4<f32>(0.0, 0.0, -1.0, 0.0);
+            return out;
+        }
+        let effRegCoastWeight = smoothstep(0.02, 0.25, regWeight) * (1.0 - inlandLakeShoreMask);
+        let staticCoastFade = select(1.0 - effRegCoastWeight, 1.0, sim.u_purityMode > 0.5);
+        let dynamicCoastFade = 0.0;
+        let closeCoastFade = select(staticCoastFade, dynamicCoastFade, isSlippyCoast);
         tierVisibility = tierVisibility * closeCoastFade;
         if (tierVisibility <= 0.005) {
             out.clipPos = vec4<f32>(0.0, 0.0, -1.0, 0.0);
@@ -515,7 +643,8 @@ fn vs_main(in: VertexInput) -> VertexOutput {
     let limbTaper = mix(1.0, horizonFalloff(max(0.0, facingEnd), 0.15, 0.0, 0.08), sphereFactor);
 
     let nominalHalfWidthPhys = adaptiveHalfWidthCss * sim.u_dpr * widthScale;
-    let geomHalfWidthPhys = max(nominalHalfWidthPhys, 0.25) * limbTaper;
+    let riverCloseBoost = select(1.0, mix(1.55, 1.15, orbitT), isRiver);
+    let geomHalfWidthPhys = max(nominalHalfWidthPhys * riverCloseBoost, select(0.25, 0.42, isRiver)) * limbTaper;
     let featherPhys = 0.65 * limbTaper;
     let totalRadiusPhys = geomHalfWidthPhys + featherPhys;
 
@@ -548,6 +677,10 @@ fn vs_main(in: VertexInput) -> VertexOutput {
         baseClip.z,
         baseClip.w
     );
+    let p32 = max(0.0001, abs(sim.u_projectionMatrix[3][2]));
+    let safeW = max(nearGuard, out.clipPos.w - segRoofClearance);
+    let worldDepthBiasClip = (p32 * segRoofClearance) / safeW;
+    out.clipPos.z = max(0.0, out.clipPos.z - max(0.0012 * out.clipPos.w, worldDepthBiasClip));
 
     // Interpolated Shading Coordinates
     out.uv = vec2<f32>(baseU, in.corner.y);
@@ -559,6 +692,7 @@ fn vs_main(in: VertexInput) -> VertexOutput {
     let orbitAlphaFade = 1.0 - smoothstep(25.0, 45.0, camDist);
     out.alphaPeak = min(1.0, 2.0 * nominalHalfWidthPhys) * orbitAlphaFade * tierVisibility;
     out.alphaPeak = out.alphaPeak * riverLODVisibility;
+    out.alphaPeak = min(1.0, out.alphaPeak * riverCloseBoost);
 
     // 8. Surface Facing & Horizon Culling
     out.facing = facingEnd;
@@ -617,7 +751,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         if (in.pointType < 0.75) {
             // Major Hydrological Arteries: Mineral cyan/slate-blue
             strokeColor = vec3<f32>(0.38, 0.58, 0.78);
-            nominalAlpha = 0.65;
+            nominalAlpha = 0.78;
         } else {
             // Continental Coastlines: High-contrast soft parchment ivory
             strokeColor = vec3<f32>(0.94, 0.92, 0.88);
@@ -628,8 +762,8 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         // STRICTLY MONOCHROMATIC — only Prussian blue + white
         if (in.pointType < 0.75) {
             // Major Hydrological Arteries: Washed cerulean (#4F79A3)
-            strokeColor = vec3<f32>(0.31, 0.475, 0.64);
-            nominalAlpha = 0.60;
+            strokeColor = vec3<f32>(0.36, 0.54, 0.74);
+            nominalAlpha = 0.76;
         } else {
             // Continental Coastlines: Chalk ruling pen white (#E8EDF2 / unexposed resist)
             strokeColor = vec3<f32>(0.91, 0.93, 0.95);
@@ -639,8 +773,8 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         // Theme 1: Light Monochrome Architectural / Swiss Relief (Cream Rag)
         if (in.pointType < 0.75) {
             // Hydrology: Washed mineral lapis/celadon glaze
-            strokeColor = vec3<f32>(0.24, 0.38, 0.50);
-            nominalAlpha = 0.50;
+            strokeColor = vec3<f32>(0.20, 0.36, 0.50);
+            nominalAlpha = 0.74;
         } else {
             // Coastlines: Archival bistre / sepia-charcoal technical drafting ink (#261E18)
             strokeColor = vec3<f32>(0.15, 0.12, 0.10);

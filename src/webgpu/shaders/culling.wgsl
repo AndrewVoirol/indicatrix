@@ -10,6 +10,16 @@ struct DrawIndexedIndirect {
     firstIndex: u32,
     baseVertex: i32,
     firstInstance: u32,
+    crustIndexCount: u32,
+    crustInstanceCount: atomic<u32>,
+    crustFirstIndex: u32,
+    crustBaseVertex: i32,
+    crustFirstInstance: u32,
+    hydroIndexCount: u32,
+    hydroInstanceCount: atomic<u32>,
+    hydroFirstIndex: u32,
+    hydroBaseVertex: i32,
+    hydroFirstInstance: u32,
 };
 
 struct QuadtreeNode {
@@ -59,16 +69,62 @@ fn cs_reset() {
     indirectCmd.firstIndex = 0u;
     indirectCmd.baseVertex = 0;
     indirectCmd.firstInstance = 0u;
+
+    // Strata Pass 1A (byte offset 20): Lithosphere Crust + Skirts (Surface 0, indices 0..26111)
+    atomicStore(&indirectCmd.crustInstanceCount, 0u);
+    indirectCmd.crustIndexCount = 26112u;
+    indirectCmd.crustFirstIndex = 0u;
+    indirectCmd.crustBaseVertex = 0;
+    indirectCmd.crustFirstInstance = 0u;
+
+    // Strata Pass 1B (byte offset 40): Liquid Hydrosphere Grid (Surface 1, indices 26112..50687)
+    atomicStore(&indirectCmd.hydroInstanceCount, 0u);
+    indirectCmd.hydroIndexCount = 24576u;
+    indirectCmd.hydroFirstIndex = 26112u;
+    indirectCmd.hydroBaseVertex = 0;
+    indirectCmd.hydroFirstInstance = 0u;
 }
+
+const USE_SUBGROUP_COMPACTION: bool = false;
+
+fn allocateInstanceSlotAtomic(passesCull: bool) -> u32 {
+    if (!passesCull) {
+        return uniforms.maxInstances;
+    }
+    let idx = atomicAdd(&indirectCmd.instanceCount, 1u);
+    if (idx < uniforms.maxInstances) {
+        atomicAdd(&indirectCmd.crustInstanceCount, 1u);
+        atomicAdd(&indirectCmd.hydroInstanceCount, 1u);
+    }
+    return idx;
+}
+
+// __SUBGROUP_COMPACTION_START__
+fn allocateInstanceSlotSubgroup(passesCull: bool) -> u32 {
+    let vote = select(0u, 1u, passesCull);
+    let localOffset = subgroupExclusiveAdd(vote);
+    let subgroupTotal = subgroupAdd(vote);
+    var subgroupBase = 0u;
+    if (subgroupElect() && subgroupTotal > 0u) {
+        subgroupBase = atomicAdd(&indirectCmd.instanceCount, subgroupTotal);
+        if (subgroupBase < uniforms.maxInstances) {
+            let clampedAdd = min(subgroupTotal, uniforms.maxInstances - subgroupBase);
+            atomicAdd(&indirectCmd.crustInstanceCount, clampedAdd);
+            atomicAdd(&indirectCmd.hydroInstanceCount, clampedAdd);
+        }
+    }
+    subgroupBase = subgroupBroadcastFirst(subgroupBase);
+    return subgroupBase + localOffset;
+}
+// __SUBGROUP_COMPACTION_END__
 
 @compute @workgroup_size(64)
 fn cs_main(@builtin(global_invocation_id) global_id: vec3<u32>) {
     let nodeIdx = global_id.x;
-    if (nodeIdx >= uniforms.nodeCount) {
-        return;
-    }
+    let inBounds = nodeIdx < uniforms.nodeCount;
+    let safeIdx = min(nodeIdx, max(1u, uniforms.nodeCount) - 1u);
 
-    let node = nodes[nodeIdx];
+    let node = nodes[safeIdx];
 
     // Fluid Advection (Mode 3) bounding sphere expansion:
     // Dynamically expand node bounding spheres by the maximum fluid displacement velocity
@@ -79,7 +135,7 @@ fn cs_main(@builtin(global_invocation_id) global_id: vec3<u32>) {
     }
 
     // View Frustum Culling against all 6 frustum planes
-    var visible = true;
+    var visible = inBounds;
     for (var i = 0u; i < 6u; i++) {
         let plane = uniforms.frustumPlanes[i];
         let dist = dot(plane.xyz, node.center) + plane.w;
@@ -98,15 +154,21 @@ fn cs_main(@builtin(global_invocation_id) global_id: vec3<u32>) {
         let cDotCam = dot(node.center, uniforms.cameraPos.xyz);
         let effectiveMargin = (1.0 - globeWeight) * camDistToOrigin * 10.0;
         if (cDotCam + (effectiveRadius + effectiveMargin) * camDistToOrigin < uniforms.R_squared_minus_disp) {
-            return;
+            visible = false;
         }
+    }
+
+    var instanceIdx = 0u;
+    if (USE_SUBGROUP_COMPACTION) {
+        instanceIdx = allocateInstanceSlotSubgroup(visible);
+    } else {
+        instanceIdx = allocateInstanceSlotAtomic(visible);
     }
 
     if (!visible) {
         return;
     }
 
-    let instanceIdx = atomicAdd(&indirectCmd.instanceCount, 1u);
     if (instanceIdx >= uniforms.maxInstances) {
         atomicStore(&indirectCmd.instanceCount, uniforms.maxInstances);
         return;
@@ -119,3 +181,4 @@ fn cs_main(@builtin(global_invocation_id) global_id: vec3<u32>) {
     instances[instanceIdx].invMorphRange = node.invMorphRange;
     instances[instanceIdx].lodFraction = f32(node.lod);
 }
+

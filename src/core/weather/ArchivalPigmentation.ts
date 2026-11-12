@@ -1,14 +1,14 @@
 /**
  * ArchivalPigmentation.ts
  *
- * Canonical weather pigmentation and spectral Doppler radar optical mode formulations
- * for the Indicatrix Engine (crust_hydrosphere.wgsl).
+ * Canonical spectral Doppler radar echo formulation for the Indicatrix Engine
+ * (`crust_hydrosphere.wgsl` 10 km WeatherNext 3 `total_precipitation_1hr_mean` overlay).
  *
  * Architecture Invariants:
- * - Exhaustive Multi-Medium Shader Parity (Zero Theme Collapsing)
- *   Theme 0: Marie Tharp 1977 — Lithographic stipple ink
- *   Theme 1: Cream Rag — Warm sepia-charcoal wash modulated by paper tooth
- *   Theme 2: Prussian Cyanotype 1842 — Actinic solarization to deep Prussian blue
+ *   monochrome blue stains never collide with hydrology ink or obscure terrain beneath 3D clouds.
+ * - Theme 2 (Prussian Cyanotype 1842) enforces strict cold actinic cyan-white echoes (B >= G >= R,
+ *   zero warm yellow/orange/gold bleed ), while Themes 0 & 1 render meteorological
+ *   spectral Doppler echoes.
  */
 
 /**
@@ -33,67 +33,65 @@ function clamp(x: number, lo: number, hi: number): number {
 }
 
 /**
- * Evaluates archival cartographic weather pigmentation for historical drafting mediums.
+ * Samples meteorological spectral Doppler radar echoes (Themes 0 & 1) or
+ * strictly monochromatic cold actinic cyan-white echoes on Prussian Cyanotype (Theme 2).
  *
  * @param precipRate - Precipitation intensity in mm/hr
- * @param theme - Cartographic medium (0: Marie Tharp, 1: Cream Rag, 2: Prussian Cyanotype)
- * @param mediumProps - Physical medium properties [inkAbsorption, fiberDensity/tooth, exposureGamma, stippleDensity]
- * @param baseColor - Underlying substrate color [r, g, b, a]
- * @returns RGBA pigmentation color [r, g, b, a]
- */
-export function apply_weather_pigmentation(
-  precipRate: number,
-  theme: number,
-  mediumProps: [number, number, number, number] = [0.8, 1.0, 1.0, 1.0],
-  baseColor: [number, number, number, number] = [0.0, 0.0, 0.0, 1.0]
-): [number, number, number, number] {
-  const intensity = clamp(precipRate / 50.0, 0.0, 1.0);
-  if (intensity <= 0.001) {
-    return [0.0, 0.0, 0.0, 0.0];
-  }
-
-  if (theme === 0) {
-    // Theme 0: Marie Tharp 1977 — Lithographic stipple density modulated by precipRate
-    const stippleProb = clamp(intensity * 0.85 * Math.max(0.1, mediumProps[3]), 0.05, 0.95);
-    const hashSeedX = baseColor[0] * 1337.1 + baseColor[2] * 3141.5;
-    const hashSeedY = baseColor[1] * 2718.2 + precipRate * 42.0;
-    const rng = hashPaper2D(hashSeedX, hashSeedY);
-    const hasDot = rng < stippleProb ? 1.0 : 0.0;
-    const alpha = clamp(hasDot * intensity * 0.65 + intensity * 0.15, 0.0, 0.85);
-    const cTharpIndigo: [number, number, number] = [0.118, 0.161, 0.231];
-    return [cTharpIndigo[0], cTharpIndigo[1], cTharpIndigo[2], alpha];
-  } else if (theme === 1) {
-    // Theme 1: Cream Rag — Warm sepia-charcoal wash modulated by paper tooth (mediumProps.y)
-    const paperTooth = mediumProps[1];
-    const toothSeedX = baseColor[1] * 1920.0 * Math.max(0.1, paperTooth);
-    const toothSeedY = baseColor[0] * 1080.0 * Math.max(0.1, paperTooth);
-    const toothNoise = (hashPaper2D(toothSeedX, toothSeedY) - 0.5) * 0.35;
-    const toothFactor = clamp(paperTooth * (1.0 + toothNoise), 0.5, 1.5);
-    const alpha = clamp(intensity * 0.6 * toothFactor, 0.0, 0.90);
-    return [0.220, 0.188, 0.165, alpha];
-  } else if (theme === 2) {
-    // Theme 2: Prussian Cyanotype 1842 — Actinic solarization to deep Prussian blue
-    const gamma = Math.max(0.1, mediumProps[2]);
-    const solarizedIntensity = Math.pow(intensity, 1.0 / gamma);
-    const alpha = clamp(solarizedIntensity * 0.8, 0.0, 0.95);
-    return [0.039, 0.098, 0.184, alpha];
-  } else {
-    // Defensive fallback for non-standard theme
-    return [0.220, 0.188, 0.165, intensity * 0.6];
-  }
-}
-
-export const applyWeatherPigmentation = apply_weather_pigmentation;
-
-/**
- * Samples modern meteorological spectral Doppler radar color palette.
- *
- * @param precipRate - Precipitation intensity in mm/hr
+ * @param theme - Active cartographic medium (0: Marie Tharp, 1: Cream Rag, 2: Prussian Cyanotype)
  * @returns RGBA Doppler color [r, g, b, a]
  */
-export function sample_spectral_doppler(precipRate: number): [number, number, number, number] {
+export function sample_spectral_doppler(
+  precipRate: number,
+  theme: number = 0
+): [number, number, number, number] {
   if (precipRate < 0.1) {
     return [0.0, 0.0, 0.0, 0.0];
+  }
+
+  const mix3 = (
+    c1: [number, number, number],
+    c2: [number, number, number],
+    t: number
+  ): [number, number, number] => [
+    c1[0] * (1.0 - t) + c2[0] * t,
+    c1[1] * (1.0 - t) + c2[1] * t,
+    c1[2] * (1.0 - t) + c2[2] * t,
+  ];
+
+  if (theme === 2) {
+    // Theme 2 (Prussian Cyanotype 1842): Strictly cold actinic cyan-to-chalk ramp (B >= G >= R)
+    const cCobalt: [number, number, number]   = [0.110, 0.306, 0.502]; // #1C4E80
+    const cCerulean: [number, number, number] = [0.220, 0.510, 0.769]; // #3882C4
+    const cCyan: [number, number, number]     = [0.416, 0.769, 0.941]; // #6AC4F0
+    const cBleached: [number, number, number] = [0.737, 0.910, 1.000]; // #BCE8FF
+    const cChalk: [number, number, number]    = [0.961, 0.980, 1.000]; // #F5FAFF
+
+    let color: [number, number, number];
+    let alpha = 0.72;
+
+    if (precipRate < 1.0) {
+      const t = (precipRate - 0.1) / 0.9;
+      color = mix3(cCobalt, cCerulean, t);
+      alpha = 0.36 * (1.0 - t) + 0.58 * t;
+    } else if (precipRate < 2.5) {
+      const t = (precipRate - 1.0) / 1.5;
+      color = mix3(cCerulean, cCyan, t);
+      alpha = 0.58 * (1.0 - t) + 0.72 * t;
+    } else if (precipRate < 7.5) {
+      const t = (precipRate - 2.5) / 5.0;
+      color = mix3(cCyan, cBleached, t);
+      alpha = 0.72 * (1.0 - t) + 0.82 * t;
+    } else if (precipRate < 15.0) {
+      const t = (precipRate - 7.5) / 7.5;
+      color = mix3(cBleached, cChalk, t * 0.65);
+      alpha = 0.82 * (1.0 - t) + 0.88 * t;
+    } else {
+      const t = clamp((precipRate - 15.0) / 35.0, 0.0, 1.0);
+      color = mix3(mix3(cBleached, cChalk, 0.65), cChalk, t);
+      alpha = 0.88 * (1.0 - t) + 0.94 * t;
+    }
+
+    return [color[0], color[1], color[2], alpha];
   }
 
   const cLightBlue: [number, number, number] = [0.25, 0.60, 1.00];
@@ -105,12 +103,6 @@ export function sample_spectral_doppler(precipRate: number): [number, number, nu
 
   let color: [number, number, number];
   let alpha = 0.75;
-
-  const mix3 = (c1: [number, number, number], c2: [number, number, number], t: number): [number, number, number] => [
-    c1[0] * (1.0 - t) + c2[0] * t,
-    c1[1] * (1.0 - t) + c2[1] * t,
-    c1[2] * (1.0 - t) + c2[2] * t,
-  ];
 
   if (precipRate < 1.0) {
     const t = (precipRate - 0.1) / 0.9;

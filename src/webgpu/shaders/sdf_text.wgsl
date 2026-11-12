@@ -164,10 +164,26 @@ fn getRegionalBlendWeight(uv: vec2<f32>) -> f32 {
     return max(bestTileWeight, smoothstep(0.0, marginU, distU) * smoothstep(0.0, marginV, distV));
 }
 
+fn unpackGlobalDemRG(s: vec4<f32>) -> vec4<f32> {
+    let bNorm = s.r;
+    let aNorm = s.g;
+    let elevM = aNorm * 19772.0 - 10924.0;
+    return vec4<f32>(clamp(elevM / 8848.0, 0.0, 1.0), clamp(-elevM / 10924.0, 0.0, 1.0), bNorm, aNorm);
+}
+
+fn unpackDemRG(s: vec4<f32>) -> vec4<f32> {
+    let bNorm = s.r;
+    let elevM = s.g;
+    let aNorm = clamp((elevM + 10924.0) / 19772.0, 0.0, 1.0);
+    return vec4<f32>(clamp(elevM / 8848.0, 0.0, 1.0), clamp(-elevM / 10924.0, 0.0, 1.0), bNorm, aNorm);
+}
+
 fn sampleRegionalComposite(uv: vec2<f32>, globalSample: vec4<f32>, lod: f32) -> vec4<f32> {
     let lon = uv.x * 360.0 - 180.0;
     let lat = 90.0 - uv.y * 180.0;
     var compositeSample = globalSample;
+    var activeRegWeight: f32 = 0.0;
+    var activeRegTsY: f32 = 1.0;
 
     if (u_regionalOverlay.u_regionalActive == 1u) {
         let bounds = u_regionalOverlay.u_regionalBounds;
@@ -178,9 +194,11 @@ fn sampleRegionalComposite(uv: vec2<f32>, globalSample: vec4<f32>, lod: f32) -> 
             let marginU = clamp(blendDeg / (bounds.z - bounds.x), 0.001, 0.49);
             let marginV = clamp(blendDeg / (bounds.w - bounds.y), 0.001, 0.49);
             let regW = smoothstep(0.0, marginU, min(regU, 1.0 - regU)) * smoothstep(0.0, marginV, min(regV, 1.0 - regV));
-            let regSample = textureSampleLevel(u_regionalDEMTexture, u_demSampler, vec2<f32>(regU, regV), lod);
+            let regSample = unpackDemRG(textureSampleLevel(u_regionalDEMTexture, u_demSampler, vec2<f32>(regU, regV), lod));
             compositeSample = mix(compositeSample, regSample, regW);
-            return compositeSample;
+            activeRegWeight = regW;
+            let regDims = vec2<f32>(textureDimensions(u_regionalDEMTexture, 0));
+            activeRegTsY = ((bounds.w - bounds.y) / 180.0) / max(1.0, regDims.y);
         }
     }
 
@@ -211,13 +229,18 @@ fn sampleRegionalComposite(uv: vec2<f32>, globalSample: vec4<f32>, lod: f32) -> 
             let wSouth = select(smoothstep(0.0, marginV, 1.0 - tileV), 1.0, (edgeMask & 2u) != 0u);
             let slotWeight = min(wWest, wEast) * min(wNorth, wSouth);
 
+            let isRegionalCogTile = (u32(slot.tileMeta.x) & 63u) == 14u;
             let effCols = max(1.0, slot.tileMeta.z * 256.0);
             let effRows = max(1.0, slot.tileMeta.w * 256.0);
-            let sampU = (0.5 + tileU * (effCols - 1.0)) / 256.0;
-            let sampV = (0.5 + tileV * (effRows - 1.0)) / 256.0;
-            let tileSample = textureSampleLevel(u_tileCacheArray, u_demSampler, vec2<f32>(sampU, sampV), i32(slot.tileMeta.y), 0.0);
-            let tileLandGate = smoothstep(0.35, 0.65, globalSample.b);
-            compositeSample = mix(compositeSample, tileSample, slotWeight * tileLandGate);
+            let sampU = select((0.5 + tileU * (effCols - 1.0)) / 256.0, clamp(tileU * effCols, 0.5, effCols - 0.5) / 256.0, isRegionalCogTile);
+            let sampV = select((0.5 + tileV * (effRows - 1.0)) / 256.0, clamp(tileV * effRows, 0.5, effRows - 0.5) / 256.0, isRegionalCogTile);
+            let tileSample = unpackDemRG(textureSampleLevel(u_tileCacheArray, u_demSampler, vec2<f32>(sampU, sampV), i32(slot.tileMeta.y), 0.0));
+            let tileAddLand = clamp((tileSample.b - 0.504) * 2.0, 0.0, 1.0);
+            let isOffshoreOcean = (globalSample.a * 19772.0 - 10924.0) < -15.0 && tileSample.b <= 0.504;
+            let tileLandGate = select(max(smoothstep(0.35, 0.65, globalSample.b), tileAddLand), 0.0, isOffshoreOcean);
+            let tileTsY = max(0.0001, b.w - b.y) / (180.0 * effRows);
+            let tileRefinesReg = select(1.0, 1.0 - activeRegWeight, activeRegWeight > 0.001 && tileTsY >= activeRegTsY * 0.85);
+            compositeSample = mix(compositeSample, tileSample, slotWeight * tileLandGate * tileRefinesReg);
             break;
         }
     }
@@ -241,15 +264,15 @@ fn applyTextDisplacement(
 
     let patchDist = length(sim.u_cameraPos.xyz - basePos);
     let patchLOD = clamp(log2(max(1.0, patchDist * 0.2)), 0.0, 4.0);
-    let demSampleGlobal = textureSampleLevel(u_demTexture, u_demSampler, demUv, patchLOD);
+    let demSampleGlobal = unpackGlobalDemRG(textureSampleLevel(u_demTexture, u_demSampler, demUv, patchLOD));
     let demSample = sampleRegionalComposite(demUv, demSampleGlobal, patchLOD);
 
     // 5-tap neighborhood envelope so canyon/valley anchors sit at local rim height
     let uvStep = vec2<f32>(0.0025, 0.0025);
-    let sampE = sampleRegionalComposite(vec2<f32>(fract(demUv.x + uvStep.x), demUv.y), textureSampleLevel(u_demTexture, u_demSampler, vec2<f32>(fract(demUv.x + uvStep.x), demUv.y), patchLOD), patchLOD);
-    let sampW = sampleRegionalComposite(vec2<f32>(fract(demUv.x - uvStep.x + 1.0), demUv.y), textureSampleLevel(u_demTexture, u_demSampler, vec2<f32>(fract(demUv.x - uvStep.x + 1.0), demUv.y), patchLOD), patchLOD);
-    let sampN = sampleRegionalComposite(vec2<f32>(demUv.x, clamp(demUv.y - uvStep.y, 0.001, 0.999)), textureSampleLevel(u_demTexture, u_demSampler, vec2<f32>(demUv.x, clamp(demUv.y - uvStep.y, 0.001, 0.999)), patchLOD), patchLOD);
-    let sampS = sampleRegionalComposite(vec2<f32>(demUv.x, clamp(demUv.y + uvStep.y, 0.001, 0.999)), textureSampleLevel(u_demTexture, u_demSampler, vec2<f32>(demUv.x, clamp(demUv.y + uvStep.y, 0.001, 0.999)), patchLOD), patchLOD);
+    let sampE = sampleRegionalComposite(vec2<f32>(fract(demUv.x + uvStep.x), demUv.y), unpackGlobalDemRG(textureSampleLevel(u_demTexture, u_demSampler, vec2<f32>(fract(demUv.x + uvStep.x), demUv.y), patchLOD)), patchLOD);
+    let sampW = sampleRegionalComposite(vec2<f32>(fract(demUv.x - uvStep.x + 1.0), demUv.y), unpackGlobalDemRG(textureSampleLevel(u_demTexture, u_demSampler, vec2<f32>(fract(demUv.x - uvStep.x + 1.0), demUv.y), patchLOD)), patchLOD);
+    let sampN = sampleRegionalComposite(vec2<f32>(demUv.x, clamp(demUv.y - uvStep.y, 0.001, 0.999)), unpackGlobalDemRG(textureSampleLevel(u_demTexture, u_demSampler, vec2<f32>(demUv.x, clamp(demUv.y - uvStep.y, 0.001, 0.999)), patchLOD)), patchLOD);
+    let sampS = sampleRegionalComposite(vec2<f32>(demUv.x, clamp(demUv.y + uvStep.y, 0.001, 0.999)), unpackGlobalDemRG(textureSampleLevel(u_demTexture, u_demSampler, vec2<f32>(demUv.x, clamp(demUv.y + uvStep.y, 0.001, 0.999)), patchLOD)), patchLOD);
 
     // Identical geoid decoding formula as crust_hydrosphere.wgsl
     let rawElevMeters = demSample.a * 19772.0 - 10924.0;
@@ -272,7 +295,9 @@ fn applyTextDisplacement(
             normalDisplacement = expLogNormH * dispScale * poleAtten;
         } else {
             let logNormD = log(1.0 + (-elevMeters) / 1500.0) / log(1.0 + 10924.0 / 1500.0);
-            normalDisplacement = -logNormD * dispScale * poleAtten;
+            let clampedLogD = clamp(logNormD, 0.0, 1.0);
+            let shelfLogD = clampedLogD / (1.0 + 2.25 * (1.0 - clampedLogD));
+            normalDisplacement = -shelfLogD * (dispScale * 0.78) * poleAtten;
         }
     } else {
         if (elevMeters >= 0.0) {

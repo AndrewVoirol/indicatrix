@@ -337,6 +337,105 @@ export const CAPE_COD_WAYPOINTS = buildSubdividedPath(CAPE_COD_KEYFRAMES, 20);
 export const GRAND_CANYON_WAYPOINTS = buildSubdividedPath(GRAND_CANYON_KEYFRAMES, 20);
 export const FUJI_WAYPOINTS = buildSubdividedPath(FUJI_KEYFRAMES, 20);
 
+export const YELLOWSTONE_KEYFRAMES: LitmusKeyframe[] = [
+  {
+    lonDeg: -112.5,
+    latDeg: 43.2,
+    radius: 13.0,
+    targetLonDeg: -110.5,
+    targetLatDeg: 44.6,
+    targetRadius: 5.0,
+    fov: 52,
+  },
+  {
+    lonDeg: -111.5,
+    latDeg: 43.8,
+    radius: 9.0,
+    targetLonDeg: -110.5,
+    targetLatDeg: 44.6,
+    targetRadius: 5.0,
+    fov: 50,
+  },
+  {
+    lonDeg: -110.9,
+    latDeg: 44.2,
+    radius: 7.2,
+    targetLonDeg: -110.5,
+    targetLatDeg: 44.6,
+    targetRadius: 5.0,
+    fov: 48,
+  },
+  {
+    lonDeg: -110.65,
+    latDeg: 44.45,
+    radius: 6.2,
+    targetLonDeg: -110.5,
+    targetLatDeg: 44.6,
+    targetRadius: 5.0,
+    fov: 46,
+  },
+  {
+    lonDeg: -110.5,
+    latDeg: 44.6,
+    radius: 5.8,
+    targetLonDeg: -110.5,
+    targetLatDeg: 44.6,
+    targetRadius: 5.0,
+    fov: 45,
+  },
+];
+
+export const FLATIRONS_KEYFRAMES: LitmusKeyframe[] = [
+  {
+    lonDeg: -103.5,
+    latDeg: 38.8,
+    radius: 13.0,
+    targetLonDeg: -105.30,
+    targetLatDeg: 40.00,
+    targetRadius: 5.0,
+    fov: 52,
+  },
+  {
+    lonDeg: -104.3,
+    latDeg: 39.3,
+    radius: 9.0,
+    targetLonDeg: -105.30,
+    targetLatDeg: 40.00,
+    targetRadius: 5.0,
+    fov: 50,
+  },
+  {
+    lonDeg: -104.8,
+    latDeg: 39.65,
+    radius: 7.2,
+    targetLonDeg: -105.30,
+    targetLatDeg: 40.00,
+    targetRadius: 5.0,
+    fov: 48,
+  },
+  {
+    lonDeg: -105.10,
+    latDeg: 39.88,
+    radius: 6.2,
+    targetLonDeg: -105.30,
+    targetLatDeg: 40.00,
+    targetRadius: 5.0,
+    fov: 46,
+  },
+  {
+    lonDeg: -105.30,
+    latDeg: 40.00,
+    radius: 5.8,
+    targetLonDeg: -105.30,
+    targetLatDeg: 40.00,
+    targetRadius: 5.0,
+    fov: 45,
+  },
+];
+
+export const YELLOWSTONE_WAYPOINTS = buildSubdividedPath(YELLOWSTONE_KEYFRAMES, 20);
+export const FLATIRONS_WAYPOINTS = buildSubdividedPath(FLATIRONS_KEYFRAMES, 20);
+
 export interface LitmusSequenceConfig {
   id: string;
   name: string;
@@ -373,6 +472,20 @@ export const LITMUS_SEQUENCES: Record<string, LitmusSequenceConfig> = {
     keyframes: FUJI_KEYFRAMES,
     waypoints: FUJI_WAYPOINTS,
     focus: { lon: 138.73, lat: 35.36, radius: 5.8 },
+  },
+  yellowstone: {
+    id: 'yellowstone',
+    name: 'Yellowstone Caldera',
+    keyframes: YELLOWSTONE_KEYFRAMES,
+    waypoints: YELLOWSTONE_WAYPOINTS,
+    focus: { lon: -110.5, lat: 44.6, radius: 5.8 },
+  },
+  'flatirons-chautauqua': {
+    id: 'flatirons-chautauqua',
+    name: 'Front Range & Flatirons',
+    keyframes: FLATIRONS_KEYFRAMES,
+    waypoints: FLATIRONS_WAYPOINTS,
+    focus: { lon: -105.30, lat: 40.00, radius: 5.8 },
   },
 };
 
@@ -412,8 +525,8 @@ export const SAMPLE_REGIONAL_INSETS: RegionalInsetMetadata[] = [
     id: 'grand-canyon',
     name: 'Grand Canyon',
     bounds: { minLon: -112.5, maxLon: -111.5, minLat: 35.9, maxLat: 36.5 },
-    width: 900,
-    height: 540,
+    width: 2400,
+    height: 1440,
     binUrl: '/regional/dem-grand-canyon-30m.bin',
     webpUrl: '/regional/dem-grand-canyon-30m.webp',
     cogUrl: '/regional/dem-grand-canyon-30m.cog.tif',
@@ -422,10 +535,30 @@ export const SAMPLE_REGIONAL_INSETS: RegionalInsetMetadata[] = [
     id: 'fuji',
     name: 'Mount Fuji',
     bounds: { minLon: 138.5, maxLon: 139.0, minLat: 35.2, maxLat: 35.5 },
-    width: 900,
-    height: 540,
+    width: 2400,
+    height: 1440,
     binUrl: '/regional/dem-fuji-30m.bin',
     webpUrl: '/regional/dem-fuji-30m.webp',
     cogUrl: '/regional/dem-fuji-30m.cog.tif',
+  },
+  {
+    id: 'yellowstone',
+    name: 'Yellowstone National Park & Caldera',
+    bounds: { minLon: -111.15, maxLon: -109.8, minLat: 44.1, maxLat: 45.1 },
+    width: 2400,
+    height: 1800,
+    binUrl: '/regional/yellowstone-dem-u16.bin',
+    webpUrl: '/regional/yellowstone-dem.webp',
+    cogUrl: '/regional/yellowstone.cog.tif',
+  },
+  {
+    id: 'flatirons-chautauqua',
+    name: 'Chautauqua Park & The Flatirons (Boulder, CO)',
+    bounds: { minLon: -105.75, maxLon: -105.15, minLat: 39.85, maxLat: 40.35 },
+    width: 2400,
+    height: 2000,
+    binUrl: '/regional/flatirons-chautauqua-dem-u16.bin',
+    webpUrl: '/regional/flatirons-chautauqua-dem.webp',
+    cogUrl: '/regional/flatirons-chautauqua.cog.tif',
   },
 ];

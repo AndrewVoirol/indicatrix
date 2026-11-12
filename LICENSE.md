@@ -80,15 +80,12 @@ This repository includes compact baseline elevation/vector assets and provides o
 3. **NOAA NCEP Global Forecast System (GFS)**
    - Synoptic wind, cloud cover, and jet stream grids fetched via `scripts/fetch-or-generate-gfs-wind.ts` and `scripts/fetch-or-generate-gfs-clouds.ts` originate from NOAA NCEP/NOMADS public domain meteorological feeds.
 
-4. **RainViewer Live Doppler Radar API (`scripts/fetch-live-radar.ts`)**
-   - Composite precipitation radar mosaics are fetched on demand from the public RainViewer API (`api.rainviewer.com`) and are subject to RainViewer's API terms of use.
-
-5. **CelesTrak / NORAD Orbital Ephemeris (`scripts/fetch-or-generate-tle-starlink.ts`)**
+4. **CelesTrak / NORAD Orbital Ephemeris (`scripts/fetch-or-generate-tle-starlink.ts`)**
    - Two-Line Element (TLE) and GP orbital element sets are retrieved from CelesTrak (`celestrak.org`) for non-commercial SGP4 orbital propagation visualization.
 
-6. **Natural Earth, HydroSHEDS & Copernicus GLO-30**
+5. **Natural Earth, HydroSHEDS & Copernicus GLO-30**
    - Vector coastlines, rivers, graticules, and toponymy are derived from **Natural Earth** (public domain) and **WWF HydroSHEDS / HydroLAKES** (licensed for non-commercial/academic use with attribution).
    - Regional 30m alpine overlays (Matterhorn, Mount Fuji, Grand Canyon) are derived from Copernicus DEM GLO-30 / USGS 3DEP public elevation datasets.
 
-7. **Historical Cartographic Homage**
+6. **Historical Cartographic Homage**
    - The three rendering mediums in Indicatrix are original procedural WGSL shader interpretations paying homage to historical landmarks of physical cartography: **Marie Tharp and Bruce Heezen's** *World Ocean Floor* panorama (1977), **Eduard Imhof's** *Cartographic Relief Presentation* (1965 / Swiss Federal Office of Topography tradition), and **Sir John Herschel's** 1842 ferroprussiate cyanotype process. No affiliation with or endorsement by these estates or institutions is claimed.

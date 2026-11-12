@@ -20,7 +20,6 @@ Supports direct OPeNDAP DODS streaming, local NetCDF ingestion, or high-precisio
 Outputs:
 - public/earth-etopo2022-dem-u16.bin (8192 x 4096 x 4 x 2 bytes = 268,435,456 bytes)
 - public/earth-etopo2022-dem.webp (8192 x 4096 lossless WebP fallback)
-- public/earth-etopo2022-dem.png
 """
 
 import os
@@ -144,13 +143,10 @@ def pack_dem_arrays(z_grid: np.ndarray, output_prefix: str = "public/earth-etopo
 
     os.makedirs(os.path.dirname(output_prefix) or '.', exist_ok=True)
     webp_path = f"{output_prefix}.webp"
-    png_path = f"{output_prefix}.png"
 
     print(f"[ETOPO-PACK] Encoding lossless WebP: {webp_path}...")
     out_img.save(webp_path, lossless=True, quality=100, method=6)
-    print(f"[ETOPO-PACK] Encoding PNG: {png_path}...")
-    out_img.save(png_path, optimize=True)
-    print(f"[ETOPO-PACK] Successfully saved {webp_path} and {png_path}")
+    print(f"[ETOPO-PACK] Successfully saved {webp_path}")
 
     # Also save raw uint16 binary buffer if 16-bit texture is desired
     bin_path = f"{output_prefix}-u16.bin"
@@ -164,11 +160,21 @@ def pack_dem_arrays(z_grid: np.ndarray, output_prefix: str = "public/earth-etopo
 
 def load_from_existing_or_generate(cols=8192, rows=4096) -> np.ndarray:
     """
-    Loads baseline from public/earth-elevation-dem.webp or public/earth-etopo2022-dem.webp, or generates analytical spherical harmonic relief.
+    Loads baseline from public/earth-etopo2022.cog.tif, public/earth-etopo2022-dem.webp, or public/earth-elevation-dem.webp.
     """
+    cog_path = "public/earth-etopo2022.cog.tif"
+    if os.path.exists(cog_path):
+        try:
+            import rasterio
+            print(f"[ETOPO-PACK] Ingesting 32-bit float baseline from {cog_path}...")
+            with rasterio.open(cog_path) as src:
+                z = src.read(1, out_shape=(rows, cols), resampling=rasterio.enums.Resampling.bilinear).astype(np.float32)
+                return np.nan_to_num(z, nan=0.0)
+        except Exception as e:
+            print(f"[ETOPO-PACK] rasterio read of {cog_path} failed ({e}), falling back to WebP...")
+
     candidates = [
         "public/earth-etopo2022-dem.webp",
-        "public/earth-etopo2022-dem.png",
         "public/earth-elevation-dem.webp",
         "public/earth-elevation-dem.png",
     ]
@@ -214,7 +220,18 @@ def main():
     elif os.path.exists("/tmp/ETOPO_2022_v1_60s_N90W180_surface.nc"):
         input_path = "/tmp/ETOPO_2022_v1_60s_N90W180_surface.nc"
 
-    if input_path:
+    if input_path and (input_path.endswith(".tif") or input_path.endswith(".tiff")):
+        print(f"[ETOPO-PACK] Reading GeoTIFF from {input_path}...")
+        try:
+            import rasterio
+            with rasterio.open(input_path) as src:
+                z = src.read(1, out_shape=(4096, 8192), resampling=rasterio.enums.Resampling.average).astype(np.float32)
+                z = np.nan_to_num(z, nan=0.0)
+                print(f"[ETOPO-PACK] GeoTIFF ingestion complete: elev [{z.min():.1f}m to {z.max():.1f}m]")
+        except Exception as e:
+            print(f"[ETOPO-PACK] GeoTIFF loading failed ({e})...")
+
+    if z is None and input_path and input_path.endswith(".nc"):
         print(f"[ETOPO-PACK] Reading NetCDF from {input_path}...")
         try:
             import netCDF4 as nc
@@ -233,9 +250,9 @@ def main():
             else:
                 z_raw = z_raw[::-1, :]
 
-            print(f"[ETOPO-PACK] Resampling NetCDF grid ({z_raw.shape[1]}x{z_raw.shape[0]}) to 8192x4096 via Lanczos...")
+            print(f"[ETOPO-PACK] Resampling NetCDF grid ({z_raw.shape[1]}x{z_raw.shape[0]}) to 8192x4096 via BOX area-averaging...")
             img = Image.fromarray(z_raw)
-            img_resized = img.resize((8192, 4096), resample=Image.Resampling.LANCZOS)
+            img_resized = img.resize((8192, 4096), resample=Image.Resampling.BOX)
             z = np.array(img_resized, dtype=np.float32)
             print(f"[ETOPO-PACK] Ingestion complete: elev [{z.min():.1f}m to {z.max():.1f}m]")
         except Exception as e:

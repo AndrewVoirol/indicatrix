@@ -97,17 +97,14 @@ export async function runComprehensiveProfilingSuite(
   };
 
   const executeState = async (suiteName: string, stateName: string, config: any) => {
-    // 1. Mesh tier configuration
+    // 1. CDLOD mesh tier configuration
     if (config.meshTier) {
-      const tiers: Record<string, { lat: number; lon: number }> = {
-        '100k': { lat: 256, lon: 512 },
-        '1M': { lat: 512, lon: 1024 },
-        '4M': { lat: 1024, lon: 2048 },
+      const sseTiers: Record<string, number> = {
+        '100k': 2.0,
+        '1M': 1.1,
+        '4M': 0.55,
       };
-      const t = tiers[config.meshTier] || tiers['1M'];
-      if (typeof engine.rebuildSphereMesh === 'function') {
-        engine.rebuildSphereMesh(t.lat, t.lon);
-      }
+      (engine as any).cdlodSseTolerance = sseTiers[config.meshTier] ?? 1.1;
     }
 
     if (config.substrateHaptics !== undefined) {
@@ -137,7 +134,6 @@ export async function runComprehensiveProfilingSuite(
       showCloudLow: config.showCloudLow ?? false,
       showCloudMid: config.showCloudMid ?? false,
       showCloudHigh: config.showCloudHigh ?? false,
-      showAtmosphere: config.showAtmosphere ?? false,
       substrateHaptics: config.substrateHaptics ?? false,
       paperSubstrate: config.paperSubstrate ?? false,
       cloudAdvection: config.cloudAdvection ?? false,
@@ -367,7 +363,6 @@ export async function runComprehensiveProfilingSuite(
         theme: 0,
         showClouds: false,
         volumetricClouds: false,
-        showAtmosphere: false,
         meshTier: '1M',
       });
 
@@ -413,22 +408,6 @@ export async function runComprehensiveProfilingSuite(
 
       await executeState('weather', 'Volumetric Cloud Raymarcher (Pass 2 + Proxy)', {
         theme: 0,
-        showClouds: true,
-        volumetricClouds: true,
-        meshTier: '1M',
-      });
-
-      await executeState('weather', 'Atmospheric Limb Scattering Alone', {
-        theme: 0,
-        showAtmosphere: true,
-        showClouds: false,
-        volumetricClouds: false,
-        meshTier: '1M',
-      });
-
-      await executeState('weather', 'Full Atmosphere Stack (Volumetric + Scatter)', {
-        theme: 0,
-        showAtmosphere: true,
         showClouds: true,
         volumetricClouds: true,
         meshTier: '1M',
@@ -520,10 +499,8 @@ export async function runComprehensiveProfilingSuite(
       });
     }
   } finally {
-    // Restore default baseline mesh & resume background render loop
-    if (typeof engine.rebuildSphereMesh === 'function') {
-      engine.rebuildSphereMesh(512, 1024);
-    }
+    // Restore default baseline CDLOD SSE tolerance & resume background render loop
+    (engine as any).cdlodSseTolerance = 1.1;
     engine.paperSubstrateEnabled = false;
     (window as any).__INDICATRIX_PAUSE_RENDER_LOOP__ = false;
   }
@@ -555,7 +532,6 @@ export async function runComprehensiveProfilingSuite(
     const base = sWeather['Baseline Clean (No Weather Strata)'];
     const raster = sWeather['All 3 Raster Cloud Shells (Low+Mid+High)'];
     const volumetric = sWeather['Volumetric Cloud Raymarcher (Pass 2 + Proxy)'];
-    const atmo = sWeather['Atmospheric Limb Scattering Alone'];
 
     results.summary.weatherHypothesis = {
       baselineGpuMs: base?.gpuMs.mean,
@@ -563,8 +539,6 @@ export async function runComprehensiveProfilingSuite(
         raster && base ? parseFloat((raster.gpuMs.mean - base.gpuMs.mean).toFixed(3)) : 'N/A',
       volumetricDeltaMs:
         volumetric && base ? parseFloat((volumetric.gpuMs.mean - base.gpuMs.mean).toFixed(3)) : 'N/A',
-      atmoScatterDeltaMs:
-        atmo && base ? parseFloat((atmo.gpuMs.mean - base.gpuMs.mean).toFixed(3)) : 'N/A',
     };
   }
 

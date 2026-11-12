@@ -37,7 +37,7 @@ Under the hood, a zero-copy WebGPU compute and multi-pass render pipeline drives
 The repository ships with compact baseline elevation, hydrology, and vector assets so it runs immediately on clone. You can pull live meteorological forecasts, orbital ephemeris, or build custom high-resolution binary slices locally using the included CLI pipelines:
 
 ```bash
-# Pull live NOAA GFS wind & cloud strata, RainViewer Doppler radar, and Starlink TLEs
+# Pull live NOAA GFS wind & cloud strata and Starlink TLEs
 npm run refresh:planetary
 
 # Stream 0.1° (10km) Google DeepMind WeatherNext 3 Zarr v3 forecast slices (requires Python + uv)
@@ -70,5 +70,5 @@ All bathymetric soundings, terrain elevations, weather forecasts, and orbital tr
 ## Data Sources & License
 
 - **Source Code & Shaders**: Licensed for personal, academic, and non-commercial use under the **[PolyForm Noncommercial License 1.0.0](LICENSE.md)**. Commercial use or redistribution requires separate written permission.
-- **Planetary & Meteorological Datasets**: Upstream datasets ingested via the CLI pipelines remain governed by their respective providers and licenses, including **GEBCO 2024** (GEBCO Compilation Group), **ETOPO 2022 & CUDEM** (NOAA NCEI), **WeatherNext** (Google DeepMind / Google Research, CC BY 4.0), **NOAA NCEP GFS**, **RainViewer API**, **CelesTrak**, **Natural Earth**, and **WWF HydroSHEDS**. See **[LICENSE.md](LICENSE.md)** for full attributions and terms.
+- **Planetary & Meteorological Datasets**: Upstream datasets ingested via the CLI pipelines remain governed by their respective providers and licenses, including **GEBCO 2024** (GEBCO Compilation Group), **ETOPO 2022 & CUDEM** (NOAA NCEI), **WeatherNext** (Google DeepMind / Google Research, CC BY 4.0), **NOAA NCEP GFS**, **CelesTrak**, **Natural Earth**, and **WWF HydroSHEDS**. See **[LICENSE.md](LICENSE.md)** for full attributions and terms.
 

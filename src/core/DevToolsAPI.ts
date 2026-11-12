@@ -21,6 +21,7 @@ export interface IndicatrixEngineDevTools {
   setBackend: (backend: any) => void;
   setTheme: (theme: any) => void;
   setShowVectors: (show: boolean) => void;
+  setShowClouds: (show: boolean | ((prev: boolean) => boolean)) => void;
   setCursorPhysicsEnabled: (enabled: boolean) => void;
   getActiveRegionalDEM?: () => string | null;
   getProvenanceTelemetry?: () => ProvenanceTelemetryData;
@@ -30,7 +31,8 @@ export interface IndicatrixEngineDevTools {
 
 export interface IndicatrixCameraDevTools {
   snapHorizonCrossSection?: (altitude?: number) => void;
-  setObliqueView?: (lonDeg: number, latDeg: number, altitudeRadius: number, pitchDeg: number, headingDeg: number) => void;
+  setObliqueView?: (lonDeg: number, latDeg: number, altitudeRadius: number, pitchDeg: number, headingDeg: number, centerTarget?: boolean) => void;
+  lookAtOblique?: (targetLonDeg: number, targetLatDeg: number, altitudeRadius?: number, pitchDeg?: number, headingDeg?: number) => void;
   lookAtCoordinates?: (lonDeg: number, latDeg: number, zoomRadius?: number, target?: [number, number, number]) => void;
   easeToCoordinates?: (lonDeg: number, latDeg: number, zoomRadius?: number, durationSec?: number) => void;
   [key: string]: any;
@@ -41,7 +43,6 @@ export interface IndicatrixWeatherDiagnostics {
   prognosticVariable?: string;
   timelineMinutes?: number;
   weatherNext?: any;
-  radar?: any;
   engine?: any;
   [key: string]: any;
 }
@@ -58,8 +59,6 @@ declare global {
     __INDICATRIX_WEATHERNEXT_DATA_SOURCE__?: any;
     __INDICATRIX_WEATHERNEXT_SOURCE__?: any;
     __INDICATRIX_WEATHERNEXT_RING_BUFFER__?: any;
-    __INDICATRIX_LIVE_RADAR_DATA_SOURCE__?: any;
-    __INDICATRIX_RADAR_RING_BUFFER__?: any;
     __INDICATRIX_WEATHER_DIAGNOSTICS__?: IndicatrixWeatherDiagnostics;
     __INDICATRIX_CAMERA__?: IndicatrixCameraDevTools;
     __INDICATRIX_CAMERA_OBJECT__?: any;
@@ -78,7 +77,6 @@ declare global {
     __INDICATRIX_SET_VERTICAL_SCALE_MODE__?: (valOrFn: any) => void;
     __INDICATRIX_SET_RAIN_SHADOW_FEEDBACK__?: (valOrFn: any) => void;
     __INDICATRIX_SET_PLUVIAL_GAMMA__?: (valOrFn: any) => void;
-    __INDICATRIX_SET_WEATHER_OPTICAL_MODE__?: (valOrFn: any) => void;
     __INDICATRIX_SET_TIMELINE_MINUTES__?: (valOrFn: any) => void;
     __INDICATRIX_SET_PROGNOSTIC_VARIABLE__?: (variable: string) => void;
     __INDICATRIX_SET_PROGNOSTIC_MODEL__?: (model: any) => void;
@@ -103,6 +101,7 @@ declare global {
     setTheme?: (theme: any) => void;
     theme?: number;
     setShowVectors?: (show: boolean) => void;
+    setShowClouds?: (show: boolean | ((prev: boolean) => boolean)) => void;
     setCursorPhysicsEnabled?: (enabled: boolean) => void;
     setCdlodDiagnosticMode?: (mode: number | ((prev: number) => number)) => void;
     backend?: string;
@@ -165,8 +164,8 @@ export function registerDevToolsAPI(state: EngineStateHook): void {
       backend: state.backend,
       theme: state.theme,
       resolution: state.resolution,
-      activeOverlay: state.activeOverlay,
       showVectors: state.showVectors,
+      showClouds: state.showClouds,
       cursorPhysicsEnabled: state.cursorPhysicsEnabled,
     }),
     setAlpha: state.setAlpha,
@@ -176,6 +175,7 @@ export function registerDevToolsAPI(state: EngineStateHook): void {
     setBackend: state.setBackend,
     setTheme: state.setTheme,
     setShowVectors: state.setShowVectors,
+    setShowClouds: state.setShowClouds,
     setCursorPhysicsEnabled: state.setCursorPhysicsEnabled,
     getProvenanceTelemetry,
     updateProvenanceTelemetry,
@@ -194,6 +194,7 @@ export function registerDevToolsAPI(state: EngineStateHook): void {
   window.setTheme = state.setTheme;
   window.theme = state.theme;
   window.setShowVectors = state.setShowVectors;
+  window.setShowClouds = state.setShowClouds;
   window.setCursorPhysicsEnabled = state.setCursorPhysicsEnabled;
   window.setCdlodDiagnosticMode = state.setCdlodDiagnosticMode;
   window.backend = state.backend;

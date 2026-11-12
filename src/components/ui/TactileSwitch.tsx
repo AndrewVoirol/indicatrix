@@ -15,7 +15,6 @@ export interface TactileSwitchProps {
   disabled?: boolean;
   id?: string;
   className?: string;
-  indicatorColor?: string;
 }
 
 export const TactileSwitch: React.FC<TactileSwitchProps> = ({
@@ -27,7 +26,6 @@ export const TactileSwitch: React.FC<TactileSwitchProps> = ({
   disabled = false,
   id,
   className = '',
-  indicatorColor,
 }) => {
   const handleToggle = () => {
     if (!disabled && onChange) {
@@ -50,7 +48,7 @@ export const TactileSwitch: React.FC<TactileSwitchProps> = ({
       onKeyDown={handleKeyDown}
       title={title || label}
       role="switch"
-      aria-label={sublabel ? undefined : label}
+      aria-label={sublabel ? `${label} ${sublabel}` : label}
       aria-checked={checked}
       aria-disabled={disabled}
       tabIndex={disabled ? -1 : 0}
@@ -63,16 +61,6 @@ export const TactileSwitch: React.FC<TactileSwitchProps> = ({
       } ${className}`}
     >
       <div className="flex items-center gap-2 min-w-0 pr-2">
-        {indicatorColor && (
-          <span
-            className="w-2 h-2 rounded-[1px] border shrink-0 transition-all shadow-2xs"
-            style={{
-              backgroundColor: checked ? indicatorColor : `${indicatorColor}26`,
-              borderColor: indicatorColor,
-              boxShadow: checked ? `0 0 6px ${indicatorColor}55` : 'none',
-            }}
-          />
-        )}
         <div className="flex flex-col min-w-0">
           <span className="font-bold text-body tracking-wide truncate transition-colors">
             {label}

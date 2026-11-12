@@ -20,6 +20,7 @@ export interface AtmosphericColumnInstrumentProps {
   onToggleFalseColor?: (active: boolean) => void;
   onAtmosphericScaleChange: (scale: number) => void;
   onCloudOpacityChange?: (opacity: number) => void;
+  isActive?: boolean;
   className?: string;
 }
 
@@ -35,6 +36,7 @@ export const AtmosphericColumnInstrument: React.FC<AtmosphericColumnInstrumentPr
   onToggleFalseColor,
   onAtmosphericScaleChange,
   onCloudOpacityChange,
+  isActive = true,
   className = '',
 }) => {
   const viewportRef = useRef<HTMLDivElement>(null);
@@ -195,6 +197,7 @@ export const AtmosphericColumnInstrument: React.FC<AtmosphericColumnInstrumentPr
         title="Drag altitude caliper vertically to adjust scale (1.0–12.0x) • Click stratum to toggle layer • Double-click to reset"
         className={`relative w-full h-36 sm:h-40 rounded-[2px] overflow-hidden cursor-crosshair select-none touch-none shadow-inner transition-all duration-200 hover:shadow-[0_0_12px_var(--theme-focus-ring)] hover:border-[var(--theme-card-border-hover)] focus-visible:ring-2 focus-visible:ring-[var(--theme-focus-ring)] focus-visible:outline-none bg-[var(--theme-instrument-viewport-bg)] border-[var(--theme-instrument-viewport-border)]`}
       >
+        {isActive ? (
         <svg
           className="w-full h-full pointer-events-none"
           viewBox="0 0 280 130"
@@ -379,6 +382,15 @@ export const AtmosphericColumnInstrument: React.FC<AtmosphericColumnInstrumentPr
             </g>
           )}
         </svg>
+        ) : (
+          <span className="sr-only">
+            {theme === 1
+              ? 'Cirrus (10–12 km) · Alto-cumulus (4–6 km) · Stratus (1–2 km)'
+              : theme === 2
+              ? 'JET / CIRRUS [250 hPa] · ALTOSTRATUS [500 hPa] · STRATUS [850 hPa]'
+              : 'CIRRUS (10–12 km) · ALTOCUMULUS (4–6 km) · MARINE LAYER (1–2 km)'}
+          </span>
+        )}
       </div>
 
       {/* Strata Diagnostic False-Color Toggle */}

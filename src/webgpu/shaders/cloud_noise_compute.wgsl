@@ -83,17 +83,16 @@ fn periodicWorley3D(p: vec3<f32>, period: u32) -> f32 {
     let f0 = fract(scaled);
 
     var minDistSq: f32 = 100.0;
-    let p_i = i32(period);
+    let p_vec = vec3<i32>(i32(period));
+    // Hoist periodic modulo outside the 27-neighbor loop so inner cells wrap via branchless select
+    let baseCell = ((i0 % p_vec) + p_vec) % p_vec;
 
     for (var dz: i32 = -1; dz <= 1; dz++) {
         for (var dy: i32 = -1; dy <= 1; dy++) {
             for (var dx: i32 = -1; dx <= 1; dx++) {
-                let cell = i0 + vec3<i32>(dx, dy, dz);
-                let wrapped = vec3<u32>(
-                    u32((cell.x % p_i + p_i) % p_i),
-                    u32((cell.y % p_i + p_i) % p_i),
-                    u32((cell.z % p_i + p_i) % p_i)
-                );
+                let rawCell = baseCell + vec3<i32>(dx, dy, dz);
+                let posCell = select(rawCell, rawCell + p_vec, rawCell < vec3<i32>(0));
+                let wrapped = vec3<u32>(select(posCell, posCell - p_vec, posCell >= p_vec));
                 let featureOffset = pcg3d(wrapped);
                 let diff = (vec3<f32>(f32(dx), f32(dy), f32(dz)) + featureOffset) - f0;
                 let distSq = dot(diff, diff);

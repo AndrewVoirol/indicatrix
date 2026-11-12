@@ -45,7 +45,7 @@
       "webpUrl": "/regional/capecod-dem.webp",
       "cogUrl": "/regional/capecod.cog.tif",
       "minElevationMeters": -286.0087890625,
-      "maxElevationMeters": 97.7548828125
+      "maxElevationMeters": 117.96875
     },
     {
       "id": "grand-canyon",
@@ -56,13 +56,13 @@
         "minLat": 35.9,
         "maxLat": 36.5
       },
-      "width": 900,
-      "height": 540,
+      "width": 2400,
+      "height": 1440,
       "binUrl": "/regional/dem-grand-canyon-30m.bin",
       "webpUrl": "/regional/dem-grand-canyon-30m.webp",
-      "cogUrl": "/regional/grand-canyon.cog.tif",
-      "minElevationMeters": 605.517578125,
-      "maxElevationMeters": 2805.8271484375
+      "cogUrl": "/regional/dem-grand-canyon-30m.cog.tif",
+      "minElevationMeters": 598.27734375,
+      "maxElevationMeters": 2806.7314453125
     },
     {
       "id": "fuji",
@@ -73,13 +73,13 @@
         "minLat": 35.2,
         "maxLat": 35.5
       },
-      "width": 900,
-      "height": 540,
+      "width": 2400,
+      "height": 1440,
       "binUrl": "/regional/dem-fuji-30m.bin",
       "webpUrl": "/regional/dem-fuji-30m.webp",
       "cogUrl": "/regional/dem-fuji-30m.cog.tif",
-      "minElevationMeters": 51.896484375,
-      "maxElevationMeters": 3756.4873046875
+      "minElevationMeters": 48.87890625,
+      "maxElevationMeters": 3766.1416015625
     },
     {
       "id": "matterhorn",
@@ -90,13 +90,115 @@
         "minLat": 45.6,
         "maxLat": 46.4
       },
-      "width": 900,
-      "height": 540,
+      "width": 2400,
+      "height": 1440,
       "binUrl": "/regional/dem-matterhorn-30m.bin",
       "webpUrl": "/regional/dem-matterhorn-30m.webp",
       "cogUrl": "/regional/dem-matterhorn-30m.cog.tif",
-      "minElevationMeters": 280.41973876953125,
-      "maxElevationMeters": 4504.11376953125
+      "minElevationMeters": 280.2841796875,
+      "maxElevationMeters": 4537.591796875
+    },
+    {
+      "id": "monterey-canyon",
+      "name": "Monterey Bay & Submarine Canyon",
+      "bounds": {
+        "minLon": -123.0,
+        "maxLon": -120.5,
+        "minLat": 35.4,
+        "maxLat": 37.8
+      },
+      "width": 1250,
+      "height": 1200,
+      "binUrl": "/regional/monterey-canyon-dem-u16.bin",
+      "webpUrl": "/regional/monterey-canyon-dem.webp",
+      "cogUrl": "/regional/monterey-canyon.cog.tif",
+      "minElevationMeters": -3820.13916015625,
+      "maxElevationMeters": 1363.693359375
+    },
+    {
+      "id": "bahamas-tongue",
+      "name": "Bahamas & Tongue of the Ocean",
+      "bounds": {
+        "minLon": -79.2,
+        "maxLon": -76.0,
+        "minLat": 23.2,
+        "maxLat": 26.0
+      },
+      "width": 1280,
+      "height": 1120,
+      "binUrl": "/regional/bahamas-tongue-dem-u16.bin",
+      "webpUrl": "/regional/bahamas-tongue-dem.webp",
+      "cogUrl": "/regional/bahamas-tongue.cog.tif",
+      "minElevationMeters": -4892.9892578125,
+      "maxElevationMeters": 565.392578125
+    },
+    {
+      "id": "mid-atlantic-ridge",
+      "name": "Mid-Atlantic Ridge (Charlie-Gibbs)",
+      "bounds": {
+        "minLon": -33.0,
+        "maxLon": -29.0,
+        "minLat": 51.2,
+        "maxLat": 53.8
+      },
+      "width": 1200,
+      "height": 800,
+      "binUrl": "/regional/mid-atlantic-ridge-dem-u16.bin",
+      "webpUrl": "/regional/mid-atlantic-ridge-dem.webp",
+      "cogUrl": "/regional/mid-atlantic-ridge.cog.tif",
+      "minElevationMeters": -4836.57080078125,
+      "maxElevationMeters": -581.0732421875
+    },
+    {
+      "id": "mariana-trench",
+      "name": "Mariana Trench & Challenger Deep",
+      "bounds": {
+        "minLon": 141.2,
+        "maxLon": 143.8,
+        "minLat": 10.6,
+        "maxLat": 12.4
+      },
+      "width": 1300,
+      "height": 900,
+      "binUrl": "/regional/mariana-trench-dem-u16.bin",
+      "webpUrl": "/regional/mariana-trench-dem.webp",
+      "cogUrl": "/regional/mariana-trench.cog.tif",
+      "minElevationMeters": -10924.0,
+      "maxElevationMeters": -1372.134765625
+    },
+    {
+      "id": "yellowstone",
+      "name": "Yellowstone National Park & Caldera",
+      "bounds": {
+        "minLon": -111.15,
+        "maxLon": -109.8,
+        "minLat": 44.1,
+        "maxLat": 45.1
+      },
+      "width": 2400,
+      "height": 1800,
+      "binUrl": "/regional/yellowstone-dem-u16.bin",
+      "webpUrl": "/regional/yellowstone-dem.webp",
+      "cogUrl": "/regional/yellowstone.cog.tif",
+      "minElevationMeters": 1551.4713134765625,
+      "maxElevationMeters": 3635.675537109375
+    },
+    {
+      "id": "flatirons-chautauqua",
+      "name": "Chautauqua Park & The Flatirons (Boulder, CO)",
+      "bounds": {
+        "minLon": -105.75,
+        "maxLon": -105.15,
+        "minLat": 39.85,
+        "maxLat": 40.35
+      },
+      "width": 2400,
+      "height": 2000,
+      "binUrl": "/regional/flatirons-chautauqua-dem-u16.bin",
+      "webpUrl": "/regional/flatirons-chautauqua-dem.webp",
+      "cogUrl": "/regional/flatirons-chautauqua.cog.tif",
+      "minElevationMeters": 1527.3145751953125,
+      "maxElevationMeters": 4342.1044921875
     }
   ]
 }

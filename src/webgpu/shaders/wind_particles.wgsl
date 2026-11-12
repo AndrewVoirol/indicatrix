@@ -154,10 +154,26 @@ fn getRegionalBlendWeight(uv: vec2<f32>) -> f32 {
     return max(bestTileWeight, weightU * weightV);
 }
 
+fn unpackGlobalDemRG(s: vec4<f32>) -> vec4<f32> {
+    let bNorm = s.r;
+    let aNorm = s.g;
+    let elevM = aNorm * 19772.0 - 10924.0;
+    return vec4<f32>(clamp(elevM / 8848.0, 0.0, 1.0), clamp(-elevM / 10924.0, 0.0, 1.0), bNorm, aNorm);
+}
+
+fn unpackDemRG(s: vec4<f32>) -> vec4<f32> {
+    let bNorm = s.r;
+    let elevM = s.g;
+    let aNorm = clamp((elevM + 10924.0) / 19772.0, 0.0, 1.0);
+    return vec4<f32>(clamp(elevM / 8848.0, 0.0, 1.0), clamp(-elevM / 10924.0, 0.0, 1.0), bNorm, aNorm);
+}
+
 fn sampleRegionalComposite(uv: vec2<f32>, globalSample: vec4<f32>, lod: f32) -> vec4<f32> {
     let lon = uv.x * 360.0 - 180.0;
     let lat = 90.0 - uv.y * 180.0;
     var compositeSample = globalSample;
+    var activeRegWeight: f32 = 0.0;
+    var activeRegTsY: f32 = 1.0;
 
     if (u_regionalOverlay.u_regionalActive == 1u) {
         let bounds = u_regionalOverlay.u_regionalBounds;
@@ -172,9 +188,11 @@ fn sampleRegionalComposite(uv: vec2<f32>, globalSample: vec4<f32>, lod: f32) -> 
             let marginU = clamp(blendDeg / (maxLon - minLon), 0.001, 0.49);
             let marginV = clamp(blendDeg / (maxLat - minLat), 0.001, 0.49);
             let regW = smoothstep(0.0, marginU, min(regU, 1.0 - regU)) * smoothstep(0.0, marginV, min(regV, 1.0 - regV));
-            let regSample = textureSampleLevel(u_regionalDEMTexture, u_demSampler, vec2<f32>(regU, regV), 0.0);
+            let regSample = unpackDemRG(textureSampleLevel(u_regionalDEMTexture, u_demSampler, vec2<f32>(regU, regV), 0.0));
             compositeSample = mix(compositeSample, regSample, regW);
-            return compositeSample;
+            activeRegWeight = regW;
+            let regDims = vec2<f32>(textureDimensions(u_regionalDEMTexture, 0));
+            activeRegTsY = ((maxLat - minLat) / 180.0) / max(1.0, regDims.y);
         }
     }
 
@@ -205,12 +223,18 @@ fn sampleRegionalComposite(uv: vec2<f32>, globalSample: vec4<f32>, lod: f32) -> 
             let wSouth = select(smoothstep(0.0, marginV, 1.0 - tileV), 1.0, (edgeMask & 2u) != 0u);
             let slotWeight = min(wWest, wEast) * min(wNorth, wSouth);
 
+            let isRegionalCogTile = (u32(slot.tileMeta.x) & 63u) == 14u;
             let effCols = max(1.0, slot.tileMeta.z * 256.0);
             let effRows = max(1.0, slot.tileMeta.w * 256.0);
-            let sampU = (0.5 + tileU * (effCols - 1.0)) / 256.0;
-            let sampV = (0.5 + tileV * (effRows - 1.0)) / 256.0;
-            let tileSample = textureSampleLevel(u_tileCacheArray, u_demSampler, vec2<f32>(sampU, sampV), i32(slot.tileMeta.y), 0.0);
-            compositeSample = mix(compositeSample, tileSample, slotWeight);
+            let sampU = select((0.5 + tileU * (effCols - 1.0)) / 256.0, clamp(tileU * effCols, 0.5, effCols - 0.5) / 256.0, isRegionalCogTile);
+            let sampV = select((0.5 + tileV * (effRows - 1.0)) / 256.0, clamp(tileV * effRows, 0.5, effRows - 0.5) / 256.0, isRegionalCogTile);
+            let tileSample = unpackDemRG(textureSampleLevel(u_tileCacheArray, u_demSampler, vec2<f32>(sampU, sampV), i32(slot.tileMeta.y), 0.0));
+            let tileAddLand = clamp((tileSample.b - 0.504) * 2.0, 0.0, 1.0);
+            let isOffshoreOcean = (globalSample.a * 19772.0 - 10924.0) < -15.0 && tileSample.b <= 0.504;
+            let tileLandGate = select(max(smoothstep(0.35, 0.65, globalSample.b), tileAddLand), 0.0, isOffshoreOcean);
+            let tileTsY = max(0.0001, b.w - b.y) / (180.0 * effRows);
+            let tileRefinesReg = select(1.0, 1.0 - activeRegWeight, activeRegWeight > 0.001 && tileTsY >= activeRegTsY * 0.85);
+            compositeSample = mix(compositeSample, tileSample, slotWeight * tileLandGate * tileRefinesReg);
             break;
         }
     }
@@ -222,7 +246,7 @@ fn sampleRegionalComposite(uv: vec2<f32>, globalSample: vec4<f32>, lod: f32) -> 
 fn sampleTerrainElevation(lonRad: f32, latRad: f32) -> f32 {
     let u = fract(lonRad / TWO_PI + 0.5);
     let v = clamp(0.5 - latRad / PI, 0.001, 0.999);
-    let demSampleGlobal = textureSampleLevel(u_demTexture, u_demSampler, vec2<f32>(u, v), 0.0);
+    let demSampleGlobal = unpackGlobalDemRG(textureSampleLevel(u_demTexture, u_demSampler, vec2<f32>(u, v), 0.0));
     let sample = sampleRegionalComposite(vec2<f32>(u, v), demSampleGlobal, 0.0);
     // Cross-Pipeline DEM Mathematical Parity
     let elevMeters = sample.a * 19772.0 - 10924.0;
@@ -320,6 +344,7 @@ fn computeLiftedAltitude(lonRad: f32, latRad: f32, vel: vec2<f32>, isJet: bool) 
     let camDist = mix(length(sim.u_cameraPos.xyz), 5.0 + abs(sim.u_cameraPos.z), clamp(sim.u_unfurl, 0.0, 1.0));
     let orbitT = clamp((camDist - 8.0) / (25.0 - 8.0), 0.0, 1.0);
     let dynamicExp = clamp(mix(0.95, 1.25, orbitT) * (sim.u_peakExponent / 1.4), 0.85, 1.30);
+    let crustExp = select(1.0, clamp(sim.u_peakExponent, 0.2, 4.0), sim.u_peakExponent > 0.01);
     let shapedH = (1.0 - exp(-2.2 * normH)) / (1.0 - exp(-2.2));
     
     let poleDist = abs(clamp(0.5 - latRad / PI, 0.001, 0.999) - 0.5) * 2.0;
@@ -330,10 +355,14 @@ fn computeLiftedAltitude(lonRad: f32, latRad: f32, vel: vec2<f32>, isJet: bool) 
     if (sim.u_verticalScaleMode == 1u) {
         if (t.elevation > 0.0) {
             let logNormH = log(1.0 + t.elevation / 1200.0) / log(1.0 + 8848.0 / 1200.0);
-            terrainDisp = pow(clamp(logNormH, 0.0, 1.0), dynamicExp) * dispScale * poleAtten;
+            let surfDisp = pow(clamp(logNormH, 0.0, 1.0), dynamicExp) * dispScale * poleAtten;
+            let crustDisp = pow(clamp(logNormH, 0.0, 1.0), crustExp) * dispScale * poleAtten;
+            terrainDisp = max(surfDisp, crustDisp);
         }
     } else {
-        terrainDisp = pow(clamp(normH, 0.0, 1.0), dynamicExp) * dispScale * poleAtten;
+        let surfDisp = pow(clamp(normH, 0.0, 1.0), dynamicExp) * dispScale * poleAtten;
+        let crustDisp = pow(clamp(normH, 0.0, 1.0), crustExp) * dispScale * poleAtten;
+        terrainDisp = max(surfDisp, crustDisp);
     }
     
     // Pitch-adaptive horizon standoff exaggeration for Jet Stream (RFC Mechanic 2)
@@ -345,12 +374,14 @@ fn computeLiftedAltitude(lonRad: f32, latRad: f32, vel: vec2<f32>, isJet: bool) 
     let basePos = normal * RADIUS;
     let vCam = normalize(sim.u_cameraPos.xyz - basePos);
     let NdotV = clamp(dot(normal, vCam) / 0.35, 0.0, 1.0);
-    let k_exagg = 1.0 + 9.0 * ((1.0 - NdotV) * (1.0 - NdotV));
+    let k_exagg = 1.0 + 0.5 * ((1.0 - NdotV) * (1.0 - NdotV));
 
+    // Upper troposphere (250 hPa, ~10.5 km) clears synoptic mountain chains
+    let jetTroposphereFloor = max(terrainDisp + 0.0045, dispScale * 0.58 * poleAtten * smoothstep(0.02, 0.35, normH));
     let baseAlt = select(0.0005, 0.0065 * k_exagg, isJet);
     let lift = select(
-        terrainDisp + clamp(wOrographic * 0.005, 0.0, 0.035),
-        terrainDisp + clamp(wOrographic * 0.002, -0.005, 0.010),
+        terrainDisp + 0.0012 + clamp(wOrographic * 0.005, 0.0, 0.035),
+        jetTroposphereFloor + clamp(wOrographic * 0.002, -0.005, 0.010),
         isJet
     );
     return baseAlt + lift;
@@ -408,7 +439,24 @@ fn geodeticToManifold(lonRad: f32, latRad: f32, altOffset: f32, mode: u32, unfur
 // Blends planetary GFS wind with manifold solenoidal curl noise during liquefaction
 // ============================================================================
 fn sampleEffectiveVelocity(lonRad: f32, latRad: f32, isJet: bool) -> vec2<f32> {
-    let u_GFS = sampleVelocity(lonRad, latRad, isJet);
+    let u_GFS_deflected = sampleVelocity(lonRad, latRad, isJet);
+    var u_GFS = u_GFS_deflected;
+    if (!isJet) {
+        // Smoothstep topographic barrier deflection by physical slope steepness (0.5 m/km to 12 m/km)
+        // so gentle plains flow smoothly while steep cordilleras channel and deflect at full strength.
+        let uCoord = fract(lonRad / TWO_PI + 0.5);
+        let vCoord = clamp((PI * 0.5 - latRad) / PI, 0.001, 0.999);
+        let uv = vec2<f32>(uCoord, vCoord);
+        let w0 = textureSampleLevel(u_windTexture0, u_windSampler, uv, 0.0).xy;
+        let w1 = textureSampleLevel(u_windTexture1, u_windSampler, uv, 0.0).xy;
+        let rawSynoptic = mix(w0, w1, clamp(sim.u_tau, 0.0, 1.0));
+        let gradMag = length(sampleTerrain(lonRad, latRad).gradient);
+        let slopeRamp = smoothstep(0.0005, 0.012, gradMag);
+        let blended = mix(rawSynoptic, u_GFS_deflected, slopeRamp);
+        let rawSpd = length(rawSynoptic);
+        let blendSpd = length(blended);
+        u_GFS = select(blended, blended * (rawSpd / max(blendSpd, 1e-6)), rawSpd > 1e-5 && blendSpd > 1e-6);
+    }
     let alpha_clamped = clamp(sim.u_unfurl, 0.0, 1.0);
     let alpha_fluid = select(0.0, sin(PI * alpha_clamped) * (1.0 - 0.35 * alpha_clamped), sim.u_mode == 3u);
     if (alpha_fluid <= 0.0001) {
@@ -528,7 +576,8 @@ fn cs_advect_wind(@builtin(global_invocation_id) global_id: vec3<u32>) {
     } else {
         // 2nd-Order Runge-Kutta (RK2) Geodesic Advection forward on S^2
         let v0 = sampleEffectiveVelocity(lon, lat, isJetStream);
-        let simScale = select(6000.0, 10000.0, isJetStream);
+        // 1.8x calibrated advection cadence so particles traverse multiple streamline lengths per lifetime
+        let simScale = select(10800.0, 16000.0, isJetStream);
         let dtStep = dt * simScale;
 
         // Midpoint geodesic step
@@ -549,15 +598,13 @@ fn cs_advect_wind(@builtin(global_invocation_id) global_id: vec3<u32>) {
     // Orographic vertical velocity w = u_h · ∇h (in m/s) and terrain-lifted altitude
     let t0 = sampleTerrain(lon, lat);
     let wOrographic = dot(currentVel, t0.gradient);
-    let alt0 = computeLiftedAltitude(lon, lat, currentVel, isJetStream);
+    let rawAlt0 = computeLiftedAltitude(lon, lat, currentVel, isJetStream);
 
     // Calculate fade alpha: smooth fade in at birth, fade out at end of life
     let fadeIn = smoothstep(0.0, 0.12, age);
     let fadeOut = 1.0 - smoothstep(0.85, 1.0, age);
     let polarFade = 1.0 - smoothstep(PI * 0.472, PI * 0.497, abs(lat));
     let alpha = fadeIn * fadeOut * polarFade;
-
-    let worldPos0 = geodeticToManifold(lon, lat, alt0, sim.u_mode, sim.u_unfurl);
 
     // Dynamic physical streamline step length (in geographic radians) scaled with wind velocity
     // Surface winds: fine filament steps (0.020 rad) for crisp streamline continuity
@@ -566,35 +613,51 @@ fn cs_advect_wind(@builtin(global_invocation_id) global_id: vec3<u32>) {
     let speedNorm = select(10.0, 32.0, isJetStream);
     let speedFactor = clamp(speed / speedNorm, select(0.5, 0.8, isJetStream), select(1.7, 2.6, isJetStream));
     let stepLen = baseStep * speedFactor;
+    // Spherical chord sag compensation: R * (1 - cos(stepLen * 0.5)) ≈ R * stepLen^2 / 8
+    let chordSag = RADIUS * 0.16 * stepLen * stepLen * (1.0 - clamp(sim.u_unfurl, 0.0, 1.0));
 
     // Backward streamline integration (instantaneous streamline curve along great-circle geodesics)
-    // Step 0 -> 1
+    // Step 0 -> 1 with midpoint DEM sub-stepping so chords arc cleanly over convex mountain ridges
     let dir0 = currentVel / max(speed, 0.01);
+    let posMid01 = geodesicDisplacement(lon, lat, -dir0.x * stepLen * 0.5, -dir0.y * stepLen * 0.5);
+    let altMid01 = computeLiftedAltitude(posMid01.x, clamp(posMid01.y, -PI * 0.499, PI * 0.499), currentVel, isJetStream);
     let pos1 = geodesicDisplacement(lon, lat, -dir0.x * stepLen, -dir0.y * stepLen);
     let lon1 = pos1.x;
     let lat1 = clamp(pos1.y, -PI * 0.499, PI * 0.499);
     let v1 = sampleEffectiveVelocity(lon1, lat1, isJetStream);
-    let alt1 = computeLiftedAltitude(lon1, lat1, v1, isJetStream);
-    let worldPos1 = geodeticToManifold(lon1, lat1, alt1, sim.u_mode, sim.u_unfurl);
+    let rawAlt1 = computeLiftedAltitude(lon1, lat1, v1, isJetStream);
 
-    // Step 1 -> 2
+    // Step 1 -> 2 with midpoint DEM sub-stepping
     let s1 = max(length(v1), 0.01);
     let dir1 = v1 / s1;
+    let posMid12 = geodesicDisplacement(lon1, lat1, -dir1.x * stepLen * 0.5, -dir1.y * stepLen * 0.5);
+    let altMid12 = computeLiftedAltitude(posMid12.x, clamp(posMid12.y, -PI * 0.499, PI * 0.499), v1, isJetStream);
     let pos2 = geodesicDisplacement(lon1, lat1, -dir1.x * stepLen, -dir1.y * stepLen);
     let lon2 = pos2.x;
     let lat2 = clamp(pos2.y, -PI * 0.499, PI * 0.499);
     let v2 = sampleEffectiveVelocity(lon2, lat2, isJetStream);
-    let alt2 = computeLiftedAltitude(lon2, lat2, v2, isJetStream);
-    let worldPos2 = geodeticToManifold(lon2, lat2, alt2, sim.u_mode, sim.u_unfurl);
+    let rawAlt2 = computeLiftedAltitude(lon2, lat2, v2, isJetStream);
 
-    // Step 2 -> 3
+    // Step 2 -> 3 with midpoint DEM sub-stepping
     let s2 = max(length(v2), 0.01);
     let dir2 = v2 / s2;
+    let posMid23 = geodesicDisplacement(lon2, lat2, -dir2.x * stepLen * 0.5, -dir2.y * stepLen * 0.5);
+    let altMid23 = computeLiftedAltitude(posMid23.x, clamp(posMid23.y, -PI * 0.499, PI * 0.499), v2, isJetStream);
     let pos3 = geodesicDisplacement(lon2, lat2, -dir2.x * stepLen, -dir2.y * stepLen);
     let lon3 = pos3.x;
     let lat3 = clamp(pos3.y, -PI * 0.499, PI * 0.499);
     let v3 = sampleEffectiveVelocity(lon3, lat3, isJetStream);
-    let alt3 = computeLiftedAltitude(lon3, lat3, v3, isJetStream);
+    let rawAlt3 = computeLiftedAltitude(lon3, lat3, v3, isJetStream);
+
+    // Envelope altitudes over intermediate ridge midpoints + spherical chord sag
+    let alt0 = max(rawAlt0, altMid01) + chordSag;
+    let alt1 = max(rawAlt1, max(altMid01, altMid12)) + chordSag;
+    let alt2 = max(rawAlt2, max(altMid12, altMid23)) + chordSag;
+    let alt3 = max(rawAlt3, altMid23) + chordSag;
+
+    let worldPos0 = geodeticToManifold(lon, lat, alt0, sim.u_mode, sim.u_unfurl);
+    let worldPos1 = geodeticToManifold(lon1, lat1, alt1, sim.u_mode, sim.u_unfurl);
+    let worldPos2 = geodeticToManifold(lon2, lat2, alt2, sim.u_mode, sim.u_unfurl);
     let worldPos3 = geodeticToManifold(lon3, lat3, alt3, sim.u_mode, sim.u_unfurl);
 
     // Jet stream retains high segment alpha to form continuous fluid ribbons;
@@ -606,17 +669,20 @@ fn cs_advect_wind(@builtin(global_invocation_id) global_id: vec3<u32>) {
     // Analytic antimeridian seam segmentation:
     // If consecutive history points cross the +/-180 deg boundary (|lambda_A - lambda_B| > pi),
     // set segment alpha to 0.0 to eliminate cross-canvas horizontal streak artifacts on flat and unrolled maps.
-    if (abs(lon - lon1) > PI) {
+    if (sim.u_unfurl > 0.01 && abs(lon - lon1) > PI) {
         a1 = 0.0;
     }
-    if (abs(lon1 - lon2) > PI) {
+    if (sim.u_unfurl > 0.01 && abs(lon1 - lon2) > PI) {
         a2 = 0.0;
     }
-    if (abs(lon2 - lon3) > PI) {
+    if (sim.u_unfurl > 0.01 && abs(lon2 - lon3) > PI) {
         a3 = 0.0;
     }
 
-    pOut.pos = vec4<f32>(lon, lat, alt0, age);
+    // Store invariant stratum base standoff (0.0005 surface vs 0.0065 jet) in pos.z so p.pos.z > 0.003
+    // in wind_ribbon_render.wgsl cleanly distinguishes strata over elevated continents.
+    let stratumBaseZ = select(0.0005, 0.0065, isJetStream);
+    pOut.pos = vec4<f32>(lon, lat, stratumBaseZ, age);
     pOut.vel = vec4<f32>(currentVel.x, currentVel.y, wOrographic, speed);
     pOut.history0 = vec4<f32>(worldPos0, alpha * 1.00);
     pOut.history1 = vec4<f32>(worldPos1, alpha * a1);

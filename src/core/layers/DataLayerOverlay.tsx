@@ -22,7 +22,7 @@ export interface DataLayerOverlayProps {
   sunAzimuth?: number;
   sunAltitude?: number;
   hillshadeIntensity?: number;
-  renderStyle?: 'architectural' | 'hybrid' | 'photoreal';
+  renderStyle?: 'architectural' | 'hybrid';
   resolution?: '100k' | '1M';
   seaLevelOffset?: number;
   waterClarity?: number;

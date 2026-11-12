@@ -542,9 +542,19 @@ export class ThemeManager {
     this.notifyListeners();
   }
 
-  public setMode(mode: ThemeMode): void {
-    if (this.currentMode !== mode) {
-      this.currentMode = mode;
+  public setMode(mode: ThemeMode | ArchivalMediumId | string | number): void {
+    let normalizedMode: ThemeMode = 0;
+    if (mode === 1 || mode === '1' || mode === 'cream' || mode === 'Cream Rag' || mode === 'Cotton Rag') {
+      normalizedMode = 1;
+    } else if (mode === 2 || mode === '2' || mode === 'cyanotype' || mode === 'Prussian' || mode === 'Prussian Cyanotype' || mode === 'Cyanotype') {
+      normalizedMode = 2;
+    } else if (mode === 0 || mode === '0' || mode === 'tharp' || mode === 'Marie Tharp' || mode === 'Tharp') {
+      normalizedMode = 0;
+    } else if (typeof mode === 'number' && Number.isFinite(mode)) {
+      normalizedMode = (((Math.floor(mode) % 3) + 3) % 3) as ThemeMode;
+    }
+    if (this.currentMode !== normalizedMode) {
+      this.currentMode = normalizedMode;
       this.isolatedStratum = null;
       this.activePigment = null;
       this.notifyListeners();
@@ -623,6 +633,12 @@ export class ThemeManager {
     target.style.setProperty('--theme-status-sage', ui.statusSage);
     target.style.setProperty('--theme-status-slate', ui.statusSlate);
     target.style.setProperty('--theme-status-amber', ui.statusAmber);
+    const statusInfo = palette.mediumId === 'cream' ? '#1A4457' : palette.mediumId === 'cyanotype' ? '#A5D5FF' : '#4FD1C5';
+    const statusError = palette.mediumId === 'cream' ? '#9B2C2C' : palette.mediumId === 'cyanotype' ? '#7BA8C4' : '#F87171';
+    const statusAlert = palette.mediumId === 'cream' ? '#7B1E1E' : palette.mediumId === 'cyanotype' ? '#4FA3E3' : '#EF4444';
+    target.style.setProperty('--theme-status-info', statusInfo);
+    target.style.setProperty('--theme-status-error', statusError);
+    target.style.setProperty('--theme-status-alert', statusAlert);
 
     target.style.setProperty('--theme-switch-track-bg', ui.switchTrackBg);
     target.style.setProperty('--theme-switch-track-border', ui.switchTrackBorder);

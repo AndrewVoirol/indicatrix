@@ -182,6 +182,24 @@ function checkStagedDataset() {
       recordCheck('Metadata', 'Grid Dimensions', validDims, `Dimensions: ${meta.gridDimensions?.width}x${meta.gridDimensions?.height} (0.1° resolution)`);
       recordCheck('Metadata', 'Time Horizon', validHours, `Total hours: ${meta.timeHorizon?.totalHours} (valid: 0..${(meta.timeHorizon?.totalHours || 1) - 1})`);
       recordCheck('Metadata', 'Vector Encoding Info', hasVectorEncoding, hasVectorEncoding ? 'rg16float vector encoding documented' : 'vectorTextureEncoding section missing');
+
+      const sampleSlicePath = path.join(WEATHERNEXT_DATA_DIR, 'low_cloud_cover_mean-0.bin');
+      if (meta.ingestedAtUTC && fs.existsSync(sampleSlicePath)) {
+        const metaIngestMs = Date.parse(meta.ingestedAtUTC);
+        const sliceMtimeMs = fs.statSync(sampleSlicePath).mtimeMs;
+        if (!Number.isNaN(metaIngestMs)) {
+          const driftHours = Math.abs(sliceMtimeMs - metaIngestMs) / 3600000;
+          const parityOk = driftHours <= 1.0;
+          recordCheck(
+            'Metadata',
+            'Metadata / Slice Timestamp Parity',
+            parityOk,
+            parityOk
+              ? `meta.json (${meta.forecastRunCycle || meta.ingestedAtUTC}) matches binary slice mtime (Δ=${(driftHours * 60).toFixed(1)}m)`
+              : `Split-brain mismatch: meta.json ingestedAtUTC (${meta.ingestedAtUTC}) differs from binary slice mtime (${new Date(sliceMtimeMs).toISOString()}) by ${driftHours.toFixed(1)}h`
+          );
+        }
+      }
     } catch (err: any) {
       recordCheck('Metadata', 'meta.json Parse', false, `JSON parse error: ${err.message}`);
     }
@@ -191,16 +209,15 @@ function checkStagedDataset() {
   const targetVars: string[] = meta?.variables && Array.isArray(meta.variables) && meta.variables.length > 0
     ? meta.variables
     : [
-        'u_component_of_wind_10m_mean',
-        'v_component_of_wind_10m_mean',
         'total_precipitation_1hr_mean',
         'temperature_2m_mean',
         'dewpoint_temperature_2m_mean',
-        'total_cloud_cover_mean',
         'low_cloud_cover_mean',
         'medium_cloud_cover_mean',
         'high_cloud_cover_mean',
         'wind_10m_vector',
+        'sea_surface_temperature_mean',
+        'radiative_optical_depth',
       ];
 
   const hoursToCheck = meta?.timeHorizon?.totalHours || 24;
@@ -210,7 +227,7 @@ function checkStagedDataset() {
   const corruptFiles: string[] = [];
 
   for (const v of targetVars) {
-    const isVector = v === 'wind_10m_vector';
+    const isVector = v === 'wind_10m_vector' || v.endsWith('_vector');
     const expectedPadded = isVector ? VECTOR_PADDED_SLICE_BYTES : SCALAR_PADDED_SLICE_BYTES;
     const expectedRaw = isVector ? VECTOR_UNPADDED_SLICE_BYTES : SCALAR_UNPADDED_SLICE_BYTES;
 
@@ -361,17 +378,248 @@ function checkWebGPUStrideInvariants() {
 }
 
 // ---------------------------------------------------------------------------
+// 5. Live Satellite Dataset & Stride Parity (satellite-meta.json + 4 Strata)
+// ---------------------------------------------------------------------------
+export const SATELLITE_SLICE_SPECS: Array<{ key: string; filename: string }> = [
+  { key: 'low', filename: 'satellite-cloud-low-latest.bin' },
+  { key: 'mid', filename: 'satellite-cloud-mid-latest.bin' },
+  { key: 'high', filename: 'satellite-cloud-high-latest.bin' },
+  { key: 'radiative_optical_depth', filename: 'satellite-radiative-optical-depth-latest.bin' },
+];
+
+export function checkSatelliteDataset(
+  dataDir: string = path.join(PROJECT_ROOT, 'public', 'data'),
+  sink: CheckResult[] = results
+): CheckResult[] {
+  const localChecks: CheckResult[] = [];
+  const push = (
+    category: string,
+    name: string,
+    passed: boolean,
+    message: string,
+    details?: string,
+    warning: boolean = false
+  ) => {
+    const item: CheckResult = { category, name, passed, warning, message, details };
+    localChecks.push(item);
+    sink.push(item);
+  };
+
+  const metaPath = path.join(dataDir, 'satellite-meta.json');
+  const metaExists = fs.existsSync(metaPath);
+  push(
+    'Satellite',
+    'satellite-meta.json Sidecar',
+    metaExists,
+    metaExists ? 'satellite-meta.json present' : `Missing ${metaPath}`
+  );
+  if (!metaExists) return localChecks;
+
+  let meta: any = null;
+  try {
+    meta = JSON.parse(fs.readFileSync(metaPath, 'utf-8'));
+  } catch (err: any) {
+    push('Satellite', 'satellite-meta.json Parse', false, `JSON parse error: ${err.message}`);
+    return localChecks;
+  }
+
+  const validSource = typeof meta.source === 'string' && meta.source.includes('NASA EOSDIS GIBS');
+  const validDims =
+    meta.gridDimensions?.width === SCALAR_WIDTH &&
+    meta.gridDimensions?.height === SCALAR_HEIGHT &&
+    meta.gridDimensions?.resolutionDeg === 0.1;
+  const validEncoding =
+    meta.textureEncoding?.format === 'r16float' &&
+    meta.textureEncoding?.paddedRowBytes === SCALAR_PADDED_ROW_BYTES &&
+    meta.textureEncoding?.sliceByteLength === SCALAR_PADDED_SLICE_BYTES;
+  const obsMs = Date.parse(meta.observationTimestampUTC || '');
+  const ingestMs = Date.parse(meta.ingestedAtUTC || '');
+  const validTimestamps = !Number.isNaN(obsMs) && !Number.isNaN(ingestMs);
+
+  push('Satellite', 'Source & Constellation', validSource, `Source: ${meta.source || 'N/A'}`);
+  push(
+    'Satellite',
+    'Grid & R16Float Stride Spec',
+    validDims && validEncoding,
+    `Grid ${meta.gridDimensions?.width}×${meta.gridDimensions?.height} (${meta.gridDimensions?.resolutionDeg}°) · ${meta.textureEncoding?.format} (${meta.textureEncoding?.sliceByteLength}B)`
+  );
+  push(
+    'Satellite',
+    'Observation & Ingest Timestamps',
+    validTimestamps,
+    validTimestamps
+      ? `Observed ${meta.observationTimestampUTC} · Ingested ${meta.ingestedAtUTC}`
+      : 'Invalid or missing observationTimestampUTC / ingestedAtUTC'
+  );
+
+  const scalarPadding = SCALAR_PADDED_ROW_BYTES - SCALAR_RAW_ROW_BYTES; // 224B
+  const missing: string[] = [];
+  const sizeMismatch: string[] = [];
+  let padViolations = 0;
+  let allZeroSlices = 0;
+
+  for (const spec of SATELLITE_SLICE_SPECS) {
+    const slicePath = path.join(dataDir, spec.filename);
+    if (!fs.existsSync(slicePath)) {
+      missing.push(spec.filename);
+      continue;
+    }
+    const stat = fs.statSync(slicePath);
+    const metaExpectedBytes = meta.strata?.[spec.key]?.byteLength ?? SCALAR_PADDED_SLICE_BYTES;
+    if (stat.size !== SCALAR_PADDED_SLICE_BYTES || metaExpectedBytes !== SCALAR_PADDED_SLICE_BYTES) {
+      sizeMismatch.push(`${spec.filename} (${stat.size}B, meta=${metaExpectedBytes}B, expected ${SCALAR_PADDED_SLICE_BYTES}B)`);
+      continue;
+    }
+
+    const fd = fs.openSync(slicePath, 'r');
+    try {
+      const padBuf = Buffer.alloc(scalarPadding);
+      const dataBuf = Buffer.alloc(256);
+      let nonZeroData = 0;
+      for (let r = 0; r < SCALAR_HEIGHT; r += Math.floor(SCALAR_HEIGHT / 10)) {
+        const rowStart = r * SCALAR_PADDED_ROW_BYTES;
+        fs.readSync(fd, dataBuf, 0, dataBuf.length, rowStart);
+        for (let b = 0; b < dataBuf.length; b++) {
+          if (dataBuf[b] !== 0) nonZeroData++;
+        }
+        const padOffset = rowStart + SCALAR_RAW_ROW_BYTES;
+        fs.readSync(fd, padBuf, 0, scalarPadding, padOffset);
+        for (let b = 0; b < scalarPadding; b++) {
+          if (padBuf[b] !== 0) padViolations++;
+        }
+      }
+      if (nonZeroData === 0) {
+        allZeroSlices++;
+      }
+    } finally {
+      fs.closeSync(fd);
+    }
+  }
+
+  const slicesPresent = missing.length === 0;
+  const slicesValid = slicesPresent && sizeMismatch.length === 0 && padViolations === 0 && allZeroSlices === 0;
+
+  push(
+    'Satellite',
+    'Live Satellite Binary Slices (4×FP16)',
+    slicesValid,
+    slicesValid
+      ? `All 4/4 Live Satellite slices validated (13,370,624B, 224B zero-pad, non-zero payload)`
+      : !slicesPresent
+      ? `Missing Live Satellite binaries (${missing.length}/4): run 'npm run satellite:fetch' or 'npm run satellite:mock'`
+      : `Size mismatch: ${sizeMismatch.length}, Pad violations: ${padViolations}, Empty slices: ${allZeroSlices}`,
+    sizeMismatch.length > 0 ? sizeMismatch.join('; ') : missing.length > 0 ? missing.join(', ') : undefined,
+    !slicesPresent && sizeMismatch.length === 0 // Missing gitignored .bin on fresh clone warns unless corrupt
+  );
+
+  const lowSlicePath = path.join(dataDir, 'satellite-cloud-low-latest.bin');
+  if (!Number.isNaN(ingestMs) && fs.existsSync(lowSlicePath)) {
+    const sliceMtimeMs = fs.statSync(lowSlicePath).mtimeMs;
+    const driftHours = Math.abs(sliceMtimeMs - ingestMs) / 3600000;
+    const parityOk = driftHours <= 1.0;
+    push(
+      'Satellite',
+      'Metadata / Binary Timestamp Parity',
+      parityOk,
+      parityOk
+        ? `satellite-meta.json matches binary mtime (Δ=${(driftHours * 60).toFixed(1)}m)`
+        : `Split-brain mismatch: satellite-meta.json (${meta.ingestedAtUTC}) differs from binary mtime (${new Date(sliceMtimeMs).toISOString()}) by ${driftHours.toFixed(1)}h`
+    );
+  }
+
+  return localChecks;
+}
+
+// ---------------------------------------------------------------------------
+// 6. NOAA GFS Operational Snapshot Parity (gfs-wind-meta.json + GFS Slices)
+// ---------------------------------------------------------------------------
+export function checkGfsDataset(
+  dataDir: string = path.join(PROJECT_ROOT, 'public', 'data'),
+  sink: CheckResult[] = results
+): CheckResult[] {
+  const localChecks: CheckResult[] = [];
+  const push = (
+    category: string,
+    name: string,
+    passed: boolean,
+    message: string,
+    details?: string,
+    warning: boolean = false
+  ) => {
+    const item: CheckResult = { category, name, passed, warning, message, details };
+    localChecks.push(item);
+    sink.push(item);
+  };
+
+  const metaPath = path.join(dataDir, 'gfs-wind-meta.json');
+  const metaExists = fs.existsSync(metaPath);
+  push('NOAA GFS', 'gfs-wind-meta.json Sidecar', metaExists, metaExists ? 'gfs-wind-meta.json present' : `Missing ${metaPath}`);
+  if (!metaExists) return localChecks;
+
+  let meta: any = null;
+  try {
+    meta = JSON.parse(fs.readFileSync(metaPath, 'utf-8'));
+  } catch (err: any) {
+    push('NOAA GFS', 'gfs-wind-meta.json Parse', false, `JSON parse error: ${err.message}`);
+    return localChecks;
+  }
+
+  const validGrid =
+    meta.gridDimensions?.lonPoints === 1440 &&
+    meta.gridDimensions?.latPoints === 721 &&
+    meta.gridDimensions?.resolutionDeg === 0.25;
+  const hasRunInfo = Boolean(meta.modelRunDate && meta.modelRunCycle);
+
+  push(
+    'NOAA GFS',
+    'Grid & Operational Cycle',
+    validGrid && hasRunInfo,
+    `Run ${meta.modelRunDate || 'N/A'} ${meta.modelRunCycle || ''} · ${meta.gridDimensions?.lonPoints}×${meta.gridDimensions?.latPoints} (${meta.gridDimensions?.resolutionDeg}°)`
+  );
+
+  const gfsFiles = [
+    'gfs-wind-latest.bin',
+    'gfs-wind-500hpa-latest.bin',
+    'gfs-jetstream-latest.bin',
+    'gfs-cloud-low-latest.bin',
+    'gfs-cloud-mid-latest.bin',
+    'gfs-cloud-high-latest.bin',
+  ];
+  const missing = gfsFiles.filter((f) => !fs.existsSync(path.join(dataDir, f)));
+  const empty = gfsFiles.filter((f) => {
+    const p = path.join(dataDir, f);
+    return fs.existsSync(p) && fs.statSync(p).size === 0;
+  });
+  const slicesOk = missing.length === 0 && empty.length === 0;
+  push(
+    'NOAA GFS',
+    'Staged GFS Wind & Cloud Binaries',
+    slicesOk,
+    slicesOk
+      ? `All ${gfsFiles.length}/${gfsFiles.length} GFS 0.25° wind & cloud slices present`
+      : `Missing: ${missing.length}, Empty: ${empty.length} (run 'npm run refresh:planetary')`,
+    missing.length > 0 ? missing.join(', ') : undefined,
+    missing.length > 0 && empty.length === 0
+  );
+
+  return localChecks;
+}
+
+// ---------------------------------------------------------------------------
 // Main Diagnostics Runner
 // ---------------------------------------------------------------------------
 export async function runDiagnostics(): Promise<number> {
+  results.length = 0;
   console.log('='.repeat(80));
-  console.log('INDICATRIX ENGINE: GOOGLE DEEPMIND WEATHERNEXT 3 DOCTOR & HEALTH AUDIT');
+  console.log('INDICATRIX ENGINE: WEATHERNEXT 3 · LIVE SATELLITE · NOAA GFS HEALTH AUDIT');
   console.log('='.repeat(80));
 
   checkCredentials();
   checkGCSConnectivity();
   checkStagedDataset();
   checkWebGPUStrideInvariants();
+  checkSatelliteDataset();
+  checkGfsDataset();
 
   console.log(`\n${'CATEGORY'.padEnd(12)} ${'CHECK'.padEnd(36)} ${'STATUS'.padEnd(10)} ${'DETAILS'}`);
   console.log('-'.repeat(96));

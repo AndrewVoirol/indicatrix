@@ -184,20 +184,26 @@ export function classifyRiverStrahlerOrders(segFloats: Float32Array): Float32Arr
   const totalSegs = Math.floor(segFloats.length / 16);
   if (totalSegs === 0) return segFloats;
 
-  // 1. Gather river segments and count coastline vertices
-  const riverSegs: number[] = [];
+  // 1. Gather river segments and count coastline vertices (zero-GC typed array pass)
+  let riverCount = 0;
   let coastCount = 0;
   for (let k = 0; k < totalSegs; k++) {
-    const base = k * 16;
-    if (segFloats[base + 3] < 0.75) {
-      riverSegs.push(k);
+    if (segFloats[k * 16 + 3] < 0.75) {
+      riverCount++;
     } else {
       coastCount++;
     }
   }
 
-  const riverCount = riverSegs.length;
   if (riverCount === 0) return segFloats;
+
+  const riverSegs = new Int32Array(riverCount);
+  let rPtr = 0;
+  for (let k = 0; k < totalSegs; k++) {
+    if (segFloats[k * 16 + 3] < 0.75) {
+      riverSegs[rPtr++] = k;
+    }
+  }
 
   // 2. Spatial hashing to assign compact integer node IDs (12.7m precision on R ~ 5.0)
   // Uses zero-string open-addressed Int32Array hash table for <30ms execution on 120k segments
@@ -283,75 +289,122 @@ export function classifyRiverStrahlerOrders(segFloats: Float32Array): Float32Arr
     adjNbr[curHead[v]++] = u;
   }
 
-  // 4. Connected components
+  // 4. Connected components (flat CSR array in q/compNodesFlat to avoid per-component JS Array allocations)
   const compOf = new Int32Array(numNodes).fill(-1);
-  const compNodes: number[][] = [];
+  const compOffsets = new Int32Array(numNodes + 1);
   const q = new Int32Array(numNodes);
+  let numComps = 0;
+  let writePos = 0;
 
   for (let i = 0; i < numNodes; i++) {
     if (compOf[i] === -1) {
-      const cId = compNodes.length;
-      let qHead = 0;
-      let qTail = 0;
-      q[qTail++] = i;
+      const cId = numComps++;
+      compOffsets[cId] = writePos;
+      let qHead = writePos;
+      q[writePos++] = i;
       compOf[i] = cId;
-      const nodes: number[] = [];
 
-      while (qHead < qTail) {
+      while (qHead < writePos) {
         const curr = q[qHead++];
-        nodes.push(curr);
         const start = head[curr];
         const end = head[curr + 1];
         for (let e = start; e < end; e++) {
           const nbr = adjNbr[e];
           if (compOf[nbr] === -1) {
             compOf[nbr] = cId;
-            q[qTail++] = nbr;
+            q[writePos++] = nbr;
           }
         }
       }
-      compNodes.push(nodes);
     }
   }
+  compOffsets[numComps] = writePos;
+  const compNodesFlat = new Int32Array(q);
 
   // 5. Spatial indexing for robust ocean outlet and inland confluence detection
-  // 5a. Coastline spatial grid (if coastlines are available)
-  let coastGrid: Map<number, number[]> | null = null;
+  // 5a. Coastline spatial CSR grid (open-addressed Int32Array cell table -> contiguous Float32Array)
+  let coastHashKey: Int32Array | null = null;
+  let coastHashCell: Int32Array | null = null;
+  let coastCellOffsets: Int32Array | null = null;
+  let coastXYZ: Float32Array | null = null;
+  let coastHashMask = 0;
+
   if (coastCount > 0) {
-    coastGrid = new Map<number, number[]>();
+    let coastHashCap = 16384;
+    while (coastHashCap < Math.min(65536, coastCount * 2 + 1)) {
+      coastHashCap <<= 1;
+    }
+    coastHashMask = coastHashCap - 1;
+    coastHashKey = new Int32Array(coastHashCap).fill(-1);
+    coastHashCell = new Int32Array(coastHashCap).fill(-1);
+    const pointCell = new Int32Array(coastCount);
+    const cellCounts = new Int32Array(coastHashCap);
+    let numCells = 0;
+    let cIdx = 0;
     for (let k = 0; k < totalSegs; k++) {
       const base = k * 16;
       if (segFloats[base + 3] >= 0.75) {
         const cx = segFloats[base + 0];
         const cy = segFloats[base + 1];
         const cz = segFloats[base + 2];
-        const gk = ((Math.floor(cx * 5) + 512) & 1023) | (((Math.floor(cy * 5) + 512) & 1023) << 10) | (((Math.floor(cz * 5) + 512) & 1023) << 20);
-        let list = coastGrid.get(gk);
-        if (!list) {
-          list = [];
-          coastGrid.set(gk, list);
+        const gk = ((Math.floor(cx * 20) + 512) & 1023) | (((Math.floor(cy * 20) + 512) & 1023) << 10) | (((Math.floor(cz * 20) + 512) & 1023) << 20);
+        let slot = (Math.imul(gk, 0x9e3779b1) >>> 0) & coastHashMask;
+        while (coastHashKey[slot] !== -1 && coastHashKey[slot] !== gk) {
+          slot = (slot + 1) & coastHashMask;
         }
-        list.push(cx, cy, cz);
+        let cellId = coastHashCell[slot];
+        if (cellId === -1) {
+          cellId = numCells++;
+          coastHashKey[slot] = gk;
+          coastHashCell[slot] = cellId;
+        }
+        pointCell[cIdx++] = cellId;
+        cellCounts[cellId]++;
+      }
+    }
+    coastCellOffsets = new Int32Array(numCells + 1);
+    for (let c = 0; c < numCells; c++) {
+      coastCellOffsets[c + 1] = coastCellOffsets[c] + cellCounts[c];
+    }
+    const writeHead = new Int32Array(coastCellOffsets);
+    coastXYZ = new Float32Array(coastCount * 3);
+    cIdx = 0;
+    for (let k = 0; k < totalSegs; k++) {
+      const base = k * 16;
+      if (segFloats[base + 3] >= 0.75) {
+        const cellId = pointCell[cIdx++];
+        const dst = writeHead[cellId] * 3;
+        writeHead[cellId]++;
+        coastXYZ[dst] = segFloats[base + 0];
+        coastXYZ[dst + 1] = segFloats[base + 1];
+        coastXYZ[dst + 2] = segFloats[base + 2];
       }
     }
   }
 
   function distToCoast(x: number, y: number, z: number): number {
-    if (!coastGrid) return Infinity;
-    const gx = Math.floor(x * 5);
-    const gy = Math.floor(y * 5);
-    const gz = Math.floor(z * 5);
+    if (!coastHashKey || !coastHashCell || !coastCellOffsets || !coastXYZ) return Infinity;
+    const gx = Math.floor(x * 20);
+    const gy = Math.floor(y * 20);
+    const gz = Math.floor(z * 20);
     let minD2 = Infinity;
     for (let dx = -1; dx <= 1; dx++) {
       for (let dy = -1; dy <= 1; dy++) {
         for (let dz = -1; dz <= 1; dz++) {
           const gk = ((gx + dx + 512) & 1023) | (((gy + dy + 512) & 1023) << 10) | (((gz + dz + 512) & 1023) << 20);
-          const list = coastGrid.get(gk);
-          if (list) {
-            for (let p = 0; p < list.length; p += 3) {
-              const d2 = (list[p] - x) ** 2 + (list[p + 1] - y) ** 2 + (list[p + 2] - z) ** 2;
-              if (d2 < minD2) minD2 = d2;
+          let slot = (Math.imul(gk, 0x9e3779b1) >>> 0) & coastHashMask;
+          while (coastHashKey[slot] !== -1) {
+            if (coastHashKey[slot] === gk) {
+              const cellId = coastHashCell[slot];
+              const start = coastCellOffsets[cellId] * 3;
+              const end = coastCellOffsets[cellId + 1] * 3;
+              for (let p = start; p < end; p += 3) {
+                const d2 = (coastXYZ[p] - x) ** 2 + (coastXYZ[p + 1] - y) ** 2 + (coastXYZ[p + 2] - z) ** 2;
+                if (d2 < minD2) minD2 = d2;
+              }
+              break;
             }
+            slot = (slot + 1) & coastHashMask;
           }
         }
       }
@@ -359,20 +412,53 @@ export function classifyRiverStrahlerOrders(segFloats: Float32Array): Float32Arr
     return Math.sqrt(minD2);
   }
 
-  // 5b. River leaves spatial grid to detect inland confluence endpoints
-  const leafGrid = new Map<number, number[]>();
+  // 5b. River leaves spatial CSR grid to detect inland confluence endpoints
+  let leafCount = 0;
+  for (let i = 0; i < numNodes; i++) {
+    if (deg[i] === 1) leafCount++;
+  }
+  let leafHashCap = 16384;
+  while (leafHashCap < Math.min(65536, leafCount * 2 + 1)) {
+    leafHashCap <<= 1;
+  }
+  const leafHashMask = leafHashCap - 1;
+  const leafHashKey = new Int32Array(leafHashCap).fill(-1);
+  const leafHashCell = new Int32Array(leafHashCap).fill(-1);
+  const leafCellOf = new Int32Array(leafCount);
+  const leafCellCounts = new Int32Array(leafHashCap);
+  let numLeafCells = 0;
+  let lIdx = 0;
   for (let i = 0; i < numNodes; i++) {
     if (deg[i] === 1) {
       const lx = nodeX[i];
       const ly = nodeY[i];
       const lz = nodeZ[i];
       const gk = ((Math.floor(lx * 10) + 512) & 1023) | (((Math.floor(ly * 10) + 512) & 1023) << 10) | (((Math.floor(lz * 10) + 512) & 1023) << 20);
-      let list = leafGrid.get(gk);
-      if (!list) {
-        list = [];
-        leafGrid.set(gk, list);
+      let slot = (Math.imul(gk, 0x9e3779b1) >>> 0) & leafHashMask;
+      while (leafHashKey[slot] !== -1 && leafHashKey[slot] !== gk) {
+        slot = (slot + 1) & leafHashMask;
       }
-      list.push(i, compOf[i], lx, ly, lz);
+      let cellId = leafHashCell[slot];
+      if (cellId === -1) {
+        cellId = numLeafCells++;
+        leafHashKey[slot] = gk;
+        leafHashCell[slot] = cellId;
+      }
+      leafCellOf[lIdx++] = cellId;
+      leafCellCounts[cellId]++;
+    }
+  }
+  const leafCellOffsets = new Int32Array(numLeafCells + 1);
+  for (let c = 0; c < numLeafCells; c++) {
+    leafCellOffsets[c + 1] = leafCellOffsets[c] + leafCellCounts[c];
+  }
+  const leafWriteHead = new Int32Array(leafCellOffsets);
+  const leafNodesCSR = new Int32Array(leafCount);
+  lIdx = 0;
+  for (let i = 0; i < numNodes; i++) {
+    if (deg[i] === 1) {
+      const cellId = leafCellOf[lIdx++];
+      leafNodesCSR[leafWriteHead[cellId]++] = i;
     }
   }
 
@@ -388,14 +474,22 @@ export function classifyRiverStrahlerOrders(segFloats: Float32Array): Float32Arr
       for (let dy = -1; dy <= 1; dy++) {
         for (let dz = -1; dz <= 1; dz++) {
           const gk = ((gx + dx + 512) & 1023) | (((gy + dy + 512) & 1023) << 10) | (((gz + dz + 512) & 1023) << 20);
-          const list = leafGrid.get(gk);
-          if (list) {
-            for (let p = 0; p < list.length; p += 5) {
-              if (list[p + 1] !== cId) {
-                const d2 = (list[p + 2] - x) ** 2 + (list[p + 3] - y) ** 2 + (list[p + 4] - z) ** 2;
-                if (d2 < minD2) minD2 = d2;
+          let slot = (Math.imul(gk, 0x9e3779b1) >>> 0) & leafHashMask;
+          while (leafHashKey[slot] !== -1) {
+            if (leafHashKey[slot] === gk) {
+              const cellId = leafHashCell[slot];
+              const start = leafCellOffsets[cellId];
+              const end = leafCellOffsets[cellId + 1];
+              for (let p = start; p < end; p++) {
+                const ln = leafNodesCSR[p];
+                if (compOf[ln] !== cId) {
+                  const d2 = (nodeX[ln] - x) ** 2 + (nodeY[ln] - y) ** 2 + (nodeZ[ln] - z) ** 2;
+                  if (d2 < minD2) minD2 = d2;
+                }
               }
+              break;
             }
+            slot = (slot + 1) & leafHashMask;
           }
         }
       }
@@ -413,21 +507,23 @@ export function classifyRiverStrahlerOrders(segFloats: Float32Array): Float32Arr
   const maxChildOrder = new Uint8Array(numNodes);
   const maxChildCount = new Uint8Array(numNodes);
 
-  for (let c = 0; c < compNodes.length; c++) {
-    const cNodes = compNodes[c];
-    if (cNodes.length === 1) continue;
+  for (let c = 0; c < numComps; c++) {
+    const cStart = compOffsets[c];
+    const cEnd = compOffsets[c + 1];
+    if (cEnd - cStart === 1) continue;
 
     // Pick root (river mouth / outlet / confluence)
     let bestRoot = -1;
 
-    // 1. Check proximity to coastline (ocean estuary)
+    // 1. Check proximity to coastline (ocean estuary), preferring downstream sink leaves (inDeg > outDeg)
     let minCoast = Infinity;
-    for (let j = 0; j < cNodes.length; j++) {
-      const u = cNodes[j];
+    for (let j = cStart; j < cEnd; j++) {
+      const u = compNodesFlat[j];
       if (deg[u] === 1) {
         const dC = distToCoast(nodeX[u], nodeY[u], nodeZ[u]);
-        if (dC < minCoast) {
-          minCoast = dC;
+        const effDC = inDeg[u] > outDeg[u] ? dC : dC + 0.08;
+        if (effDC < minCoast) {
+          minCoast = effDC;
           bestRoot = u;
         }
       }
@@ -437,8 +533,8 @@ export function classifyRiverStrahlerOrders(segFloats: Float32Array): Float32Arr
     if (minCoast > 0.05) {
       let minOther = Infinity;
       let bestOther = -1;
-      for (let j = 0; j < cNodes.length; j++) {
-        const u = cNodes[j];
+      for (let j = cStart; j < cEnd; j++) {
+        const u = compNodesFlat[j];
         if (deg[u] === 1) {
           const dO = distToOtherComp(u, c);
           if (dO < minOther) {
@@ -455,8 +551,8 @@ export function classifyRiverStrahlerOrders(segFloats: Float32Array): Float32Arr
     // 3. Fallback for synthetic trees or isolated inland basins:
     // Look for a sink node where inDeg > outDeg (terminal downstream point)
     if (bestRoot === -1 || (minCoast > 0.05 && coastCount === 0)) {
-      for (let j = 0; j < cNodes.length; j++) {
-        const u = cNodes[j];
+      for (let j = cStart; j < cEnd; j++) {
+        const u = compNodesFlat[j];
         if (deg[u] === 1 && inDeg[u] > outDeg[u]) {
           bestRoot = u;
           break;
@@ -466,18 +562,18 @@ export function classifyRiverStrahlerOrders(segFloats: Float32Array): Float32Arr
 
     // 4. Ultimate fallback: pick any leaf or first node
     if (bestRoot === -1) {
-      bestRoot = cNodes[0];
-      for (let j = 0; j < cNodes.length; j++) {
-        if (deg[cNodes[j]] === 1) {
-          bestRoot = cNodes[j];
+      bestRoot = compNodesFlat[cStart];
+      for (let j = cStart; j < cEnd; j++) {
+        if (deg[compNodesFlat[j]] === 1) {
+          bestRoot = compNodesFlat[j];
           break;
         }
       }
     }
 
     // BFS tree rooted at bestRoot (so root has distance 0, headwaters are at the leaves)
-    for (let j = 0; j < cNodes.length; j++) {
-      const n = cNodes[j];
+    for (let j = cStart; j < cEnd; j++) {
+      const n = compNodesFlat[j];
       dist[n] = -1;
       parentNode[n] = -1;
       subSize[n] = 1;
@@ -531,8 +627,8 @@ export function classifyRiverStrahlerOrders(segFloats: Float32Array): Float32Arr
     }
 
     // Assign final stream order combining Strahler order and Horton accumulated reach law
-    for (let j = 0; j < cNodes.length; j++) {
-      const u = cNodes[j];
+    for (let j = cStart; j < cEnd; j++) {
+      const u = compNodesFlat[j];
       const hortonOrder = Math.min(8, 1 + Math.floor(Math.log2(Math.max(1, subSize[u])) * 0.75));
       nodeOrder[u] = Math.max(strahler[u], hortonOrder);
     }
@@ -570,14 +666,51 @@ export function densifySegmentsToLocalTier(
   const inSegCount = Math.floor(sourceFloats.length / 16);
   if (inSegCount === 0) return new Float32Array(0);
 
-  const subsegments: Array<{
-    xA: number; yA: number; zA: number; wA: number;
-    uA: number; vA: number; orderA: number;
-    xB: number; yB: number; zB: number; wB: number;
-    uB: number; vB: number; orderB: number;
-  }> = [];
+  // Pass 1: Compute subdivision counts per segment without allocating JS heap objects
+  const subCounts = new Uint8Array(inSegCount);
+  let totalOutSegs = 0;
+  const seamThreshold = Math.PI * RADIUS * 0.95;
 
   for (let k = 0; k < inSegCount; k++) {
+    const base = k * 16;
+    const xA = sourceFloats[base + 0];
+    const yA = sourceFloats[base + 1];
+    const zA = sourceFloats[base + 2];
+    const uA = sourceFloats[base + 4];
+
+    const xB = sourceFloats[base + 8];
+    const yB = sourceFloats[base + 9];
+    const zB = sourceFloats[base + 10];
+    const uB = sourceFloats[base + 12];
+
+    const lenA = Math.hypot(xA, yA, zA);
+    const lenB = Math.hypot(xB, yB, zB);
+    if (lenA < 0.001 || lenB < 0.001) continue;
+
+    const isCrossSeam = Math.abs(uA - uB) > seamThreshold;
+    const dot = (xA * xB + yA * yB + zA * zB) / (lenA * lenB);
+    const clampedDot = Math.max(-1.0, Math.min(1.0, dot));
+    const theta = Math.acos(clampedDot);
+    const chordKm = theta * EARTH_RADIUS_KM;
+
+    if (chordKm <= maxChordKm || theta < 0.0001 || isCrossSeam) {
+      subCounts[k] = 1;
+      totalOutSegs += 1;
+    } else {
+      const N = Math.min(maxSubdivisions, Math.max(2, Math.ceil(chordKm / maxChordKm)));
+      subCounts[k] = N;
+      totalOutSegs += N;
+    }
+  }
+
+  // Pass 2: Write subsegments directly into preallocated Float32Array
+  const outFloats = new Float32Array(totalOutSegs * 16);
+  let outBase = 0;
+
+  for (let k = 0; k < inSegCount; k++) {
+    const N = subCounts[k];
+    if (N === 0) continue;
+
     const base = k * 16;
     const xA = sourceFloats[base + 0];
     const yA = sourceFloats[base + 1];
@@ -595,28 +728,39 @@ export function densifySegmentsToLocalTier(
     const vB = sourceFloats[base + 13];
     const orderB = sourceFloats[base + 15];
 
-    // Compute angular span theta between endpoints
-    const lenA = Math.hypot(xA, yA, zA);
-    const lenB = Math.hypot(xB, yB, zB);
-    if (lenA < 0.001 || lenB < 0.001) continue;
+    if (N === 1) {
+      outFloats[outBase + 0] = xA;
+      outFloats[outBase + 1] = yA;
+      outFloats[outBase + 2] = zA;
+      outFloats[outBase + 3] = wA;
+      outFloats[outBase + 4] = uA;
+      outFloats[outBase + 5] = vA;
+      outFloats[outBase + 6] = TIER_TAG_LOCAL;
+      outFloats[outBase + 7] = orderA;
 
-    // Detect antimeridian cross-seam chord in 2D Mercator space (|du| > pi * RADIUS * 0.95)
-    const isCrossSeam = Math.abs(uA - uB) > Math.PI * RADIUS * 0.95;
-
-    const dot = (xA * xB + yA * yB + zA * zB) / (lenA * lenB);
-    const clampedDot = Math.max(-1.0, Math.min(1.0, dot));
-    const theta = Math.acos(clampedDot);
-    const chordKm = theta * EARTH_RADIUS_KM;
-
-    if (chordKm <= maxChordKm || theta < 0.0001 || isCrossSeam) {
-      // Retain segment as-is (cross-seam preserved intact so WGSL antimeridian severance culls it)
-      subsegments.push({ xA, yA, zA, wA, uA, vA, orderA, xB, yB, zB, wB, uB, vB, orderB });
+      outFloats[outBase + 8] = xB;
+      outFloats[outBase + 9] = yB;
+      outFloats[outBase + 10] = zB;
+      outFloats[outBase + 11] = wB;
+      outFloats[outBase + 12] = uB;
+      outFloats[outBase + 13] = vB;
+      outFloats[outBase + 14] = TIER_TAG_LOCAL;
+      outFloats[outBase + 15] = orderB;
+      outBase += 16;
     } else {
-      // Subdivide into N geodesic segments
-      const N = Math.min(maxSubdivisions, Math.max(2, Math.ceil(chordKm / maxChordKm)));
+      const lenA = Math.hypot(xA, yA, zA);
+      const lenB = Math.hypot(xB, yB, zB);
+      const dot = (xA * xB + yA * yB + zA * zB) / (lenA * lenB);
+      const clampedDot = Math.max(-1.0, Math.min(1.0, dot));
+      const theta = Math.acos(clampedDot);
       const sinTheta = Math.sqrt(Math.max(1e-12, 1.0 - clampedDot * clampedDot));
 
       const invLenA = RADIUS / lenA;
+      const lonARad = Math.atan2(xA, zA);
+      const mercRadius =
+        Math.abs(uA) > 0.05 && Math.abs(lonARad) > 0.01
+          ? Math.abs(uA / lonARad)
+          : RADIUS;
       let prevX = xA * invLenA;
       let prevY = yA * invLenA;
       let prevZ = zA * invLenA;
@@ -666,17 +810,29 @@ export function densifySegmentsToLocalTier(
           // Project slerped spherical point to 2D Mercator to prevent Greenwich distortion
           const currLon = Math.atan2(currX, currZ);
           const currLat = Math.asin(Math.max(-0.9998, Math.min(0.9998, currY / RADIUS)));
-          const [projU, projV] = projectToMercator(currLon * RAD2DEG, currLat * RAD2DEG, RADIUS);
+          const [projU, projV] = projectToMercator(currLon * RAD2DEG, currLat * RAD2DEG, mercRadius);
           currU = projU;
           currV = projV;
         }
 
-        subsegments.push({
-          xA: prevX, yA: prevY, zA: prevZ, wA: prevW,
-          uA: prevU, vA: prevV, orderA: prevOrder,
-          xB: currX, yB: currY, zB: currZ, wB: currW,
-          uB: currU, vB: currV, orderB: currOrder,
-        });
+        outFloats[outBase + 0] = prevX;
+        outFloats[outBase + 1] = prevY;
+        outFloats[outBase + 2] = prevZ;
+        outFloats[outBase + 3] = prevW;
+        outFloats[outBase + 4] = prevU;
+        outFloats[outBase + 5] = prevV;
+        outFloats[outBase + 6] = TIER_TAG_LOCAL;
+        outFloats[outBase + 7] = prevOrder;
+
+        outFloats[outBase + 8] = currX;
+        outFloats[outBase + 9] = currY;
+        outFloats[outBase + 10] = currZ;
+        outFloats[outBase + 11] = currW;
+        outFloats[outBase + 12] = currU;
+        outFloats[outBase + 13] = currV;
+        outFloats[outBase + 14] = TIER_TAG_LOCAL;
+        outFloats[outBase + 15] = currOrder;
+        outBase += 16;
 
         prevX = currX;
         prevY = currY;
@@ -687,31 +843,6 @@ export function densifySegmentsToLocalTier(
         prevOrder = currOrder;
       }
     }
-  }
-
-  const outCount = subsegments.length;
-  const outFloats = new Float32Array(outCount * 16);
-
-  for (let k = 0; k < outCount; k++) {
-    const s = subsegments[k];
-    const base = k * 16;
-    outFloats[base + 0] = s.xA;
-    outFloats[base + 1] = s.yA;
-    outFloats[base + 2] = s.zA;
-    outFloats[base + 3] = s.wA;
-    outFloats[base + 4] = s.uA;
-    outFloats[base + 5] = s.vA;
-    outFloats[base + 6] = TIER_TAG_LOCAL;
-    outFloats[base + 7] = s.orderA;
-
-    outFloats[base + 8] = s.xB;
-    outFloats[base + 9] = s.yB;
-    outFloats[base + 10] = s.zB;
-    outFloats[base + 11] = s.wB;
-    outFloats[base + 12] = s.uB;
-    outFloats[base + 13] = s.vB;
-    outFloats[base + 14] = TIER_TAG_LOCAL;
-    outFloats[base + 15] = s.orderB;
   }
 
   return outFloats;
@@ -750,3 +881,374 @@ export function buildUnifiedTieredVectorBuffer(
   unified.set(localSegments, offset);
   return unified;
 }
+
+// ============================================================================
+// Dynamic Slippy-Tile Vector Chunk Loader (Option 2B)
+// ============================================================================
+
+export interface SlippyVectorChunk {
+  key: string;
+  zoom: number;
+  tileX: number;
+  tileY: number;
+  minLon: number;
+  maxLon: number;
+  minLat: number;
+  maxLat: number;
+  segments: Float32Array;
+  segmentCount: number;
+  lastUsedTime: number;
+}
+
+function packSlippyVectorSegment(
+  out: number[],
+  lonA: number,
+  latA: number,
+  lonB: number,
+  latB: number,
+  vType: number,
+  order: number
+): void {
+  const phiA = latA * DEG2RAD;
+  const lamA = lonA * DEG2RAD;
+  const cosPhiA = Math.cos(phiA);
+  const xA = RADIUS * cosPhiA * Math.sin(lamA);
+  const yA = RADIUS * Math.sin(phiA);
+  const zA = RADIUS * cosPhiA * Math.cos(lamA);
+  const [uA, vA] = projectToMercator(lonA, latA, 5.0);
+
+  const phiB = latB * DEG2RAD;
+  const lamB = lonB * DEG2RAD;
+  const cosPhiB = Math.cos(phiB);
+  const xB = RADIUS * cosPhiB * Math.sin(lamB);
+  const yB = RADIUS * Math.sin(phiB);
+  const zB = RADIUS * cosPhiB * Math.cos(lamB);
+  const [uB, vB] = projectToMercator(lonB, latB, 5.0);
+
+  out.push(
+    xA, yA, zA, vType,
+    uA, vA, TIER_TAG_LOCAL, order,
+    xB, yB, zB, vType,
+    uB, vB, TIER_TAG_LOCAL, order
+  );
+}
+
+/**
+ * Extracts high-resolution sub-pixel shoreline (Marching Squares contour aligned
+ * with GPUTileCache / crust_hydrosphere.wgsl isLand = 0.50 datum)
+ * directly from a 256x256 equirectangular-reprojected
+ * slippy DEM tile grid, producing zero-chord-artifact TIER_TAG_LOCAL vector segments.
+ */
+export function extractSlippyTileVectorChunk(
+  zoom: number,
+  tileX: number,
+  tileY: number,
+  bounds: { minLon: number; maxLon: number; minLat: number; maxLat: number },
+  demGrid: Float32Array,
+  gridSize: number = 256
+): SlippyVectorChunk {
+  const key = `${zoom}/${tileX}/${tileY}`;
+  const { minLon, maxLon, minLat, maxLat } = bounds;
+  const lonSpan = maxLon - minLon;
+  const latSpan = maxLat - minLat;
+  const outFloats: number[] = [];
+
+  if (demGrid && demGrid.length >= gridSize * gridSize && lonSpan > 0 && latSpan > 0) {
+    const invMax = 1.0 / (gridSize - 1);
+    const iso = 0.85;
+
+    // 1. Sub-pixel Marching Squares shoreline contour extraction across full welded tile grid
+    for (let r = 0; r < gridSize - 1; r++) {
+      const lat0 = maxLat - r * invMax * latSpan;
+      const lat1 = maxLat - (r + 1) * invMax * latSpan;
+      const row0 = r * gridSize;
+      const row1 = (r + 1) * gridSize;
+
+      for (let c = 0; c < gridSize - 1; c++) {
+        const v00 = demGrid[row0 + c];
+        const v10 = demGrid[row0 + c + 1];
+        const v11 = demGrid[row1 + c + 1];
+        const v01 = demGrid[row1 + c];
+
+        let mask = 0;
+        if (v00 >= iso) mask |= 1;
+        if (v10 >= iso) mask |= 2;
+        if (v11 >= iso) mask |= 4;
+        if (v01 >= iso) mask |= 8;
+        if (mask === 0 || mask === 15) continue;
+
+        // Guard against artificial open-water 0.0m tile cutouts and submerged intertidal flats
+        const maxCorner = Math.max(v00, v10, v11, v01);
+        const minCorner = Math.min(v00, v10, v11, v01);
+        if (maxCorner < 1.50 || minCorner > 0.15) continue;
+
+        const lon0 = minLon + c * invMax * lonSpan;
+        const lon1 = minLon + (c + 1) * invMax * lonSpan;
+
+        const interp = (a: number, b: number) => {
+          const denom = a - b;
+          return Math.abs(denom) > 1e-5 ? Math.max(0.0, Math.min(1.0, (a - iso) / denom)) : 0.5;
+        };
+
+        // Edges: 0 = top (v00..v10), 1 = right (v10..v11), 2 = bottom (v01..v11), 3 = left (v00..v01)
+        const edgeLon = [
+          lon0 + interp(v00, v10) * (lon1 - lon0),
+          lon1,
+          lon0 + interp(v01, v11) * (lon1 - lon0),
+          lon0,
+        ];
+        const edgeLat = [
+          lat0,
+          lat0 + interp(v10, v11) * (lat1 - lat0),
+          lat1,
+          lat0 + interp(v00, v01) * (lat1 - lat0),
+        ];
+
+        const emitEdgePair = (eA: number, eB: number) => {
+          packSlippyVectorSegment(
+            outFloats,
+            edgeLon[eA],
+            edgeLat[eA],
+            edgeLon[eB],
+            edgeLat[eB],
+            1.0,
+            1.0
+          );
+        };
+
+        switch (mask) {
+          case 1:
+          case 14:
+            emitEdgePair(3, 0);
+            break;
+          case 2:
+          case 13:
+            emitEdgePair(0, 1);
+            break;
+          case 3:
+          case 12:
+            emitEdgePair(3, 1);
+            break;
+          case 4:
+          case 11:
+            emitEdgePair(1, 2);
+            break;
+          case 6:
+          case 9:
+            emitEdgePair(0, 2);
+            break;
+          case 7:
+          case 8:
+            emitEdgePair(3, 2);
+            break;
+          case 5:
+            emitEdgePair(3, 2);
+            emitEdgePair(0, 1);
+            break;
+          case 10:
+            emitEdgePair(3, 0);
+            emitEdgePair(2, 1);
+            break;
+        }
+      }
+    }
+  }
+
+  const segments = new Float32Array(outFloats);
+  return {
+    key,
+    zoom,
+    tileX,
+    tileY,
+    minLon,
+    maxLon,
+    minLat,
+    maxLat,
+    segments,
+    segmentCount: Math.floor(segments.length / 16),
+    lastUsedTime: Date.now(),
+  };
+}
+
+export class SlippyVectorChunkLoader {
+  private cache: Map<string, SlippyVectorChunk> = new Map();
+  private inFlight: Map<string, Promise<SlippyVectorChunk | null>> = new Map();
+  private maxChunks: number;
+
+  constructor(maxChunks: number = 64) {
+    this.maxChunks = Math.max(4, maxChunks);
+  }
+
+  public getCachedChunk(key: string): SlippyVectorChunk | undefined {
+    const chunk = this.cache.get(key);
+    if (chunk) {
+      chunk.lastUsedTime = Date.now();
+    }
+    return chunk;
+  }
+
+  public getCachedChunkCount(): number {
+    return this.cache.size;
+  }
+
+  public getInFlightCount(): number {
+    return this.inFlight.size;
+  }
+
+  public clear(): void {
+    this.cache.clear();
+    this.inFlight.clear();
+  }
+
+  private evictIfNeeded(): void {
+    while (this.cache.size > this.maxChunks) {
+      let oldestKey: string | null = null;
+      let oldestTime = Infinity;
+      for (const [k, v] of this.cache.entries()) {
+        if (v.lastUsedTime < oldestTime) {
+          oldestTime = v.lastUsedTime;
+          oldestKey = k;
+        }
+      }
+      if (oldestKey !== null) {
+        this.cache.delete(oldestKey);
+      } else {
+        break;
+      }
+    }
+  }
+
+  /**
+   * Loads a slippy-tile vector chunk from cache, remote vector-tile endpoint (if enabled),
+   * or extracts sub-pixel shoreline & hydrographic vectors directly from the tile's DEM grid.
+   */
+  public async loadOrExtractTileChunk(
+    zoom: number,
+    tileX: number,
+    tileY: number,
+    bounds: { minLon: number; maxLon: number; minLat: number; maxLat: number },
+    demGrid?: Float32Array,
+    remoteUrlTemplate?: string
+  ): Promise<SlippyVectorChunk | null> {
+    const key = `${zoom}/${tileX}/${tileY}`;
+    const existing = this.cache.get(key);
+    if (existing) {
+      existing.lastUsedTime = Date.now();
+      return existing;
+    }
+
+    const pending = this.inFlight.get(key);
+    if (pending) {
+      return pending;
+    }
+
+    const task = (async (): Promise<SlippyVectorChunk | null> => {
+      try {
+        if (remoteUrlTemplate && typeof fetch === 'function') {
+          const url = remoteUrlTemplate
+            .replace('{z}', String(zoom))
+            .replace('{x}', String(tileX))
+            .replace('{y}', String(tileY));
+          try {
+            const resp = await fetch(url);
+            if (resp.ok) {
+              const buf = await resp.arrayBuffer();
+              if (buf.byteLength >= 64 && buf.byteLength % 64 === 0) {
+                const segs = new Float32Array(buf);
+                const chunk: SlippyVectorChunk = {
+                  key,
+                  zoom,
+                  tileX,
+                  tileY,
+                  minLon: bounds.minLon,
+                  maxLon: bounds.maxLon,
+                  minLat: bounds.minLat,
+                  maxLat: bounds.maxLat,
+                  segments: segs,
+                  segmentCount: Math.floor(segs.length / 16),
+                  lastUsedTime: Date.now(),
+                };
+                this.cache.set(key, chunk);
+                this.evictIfNeeded();
+                return chunk;
+              }
+            }
+          } catch {
+            // Fall through to DEM contour extraction
+          }
+        }
+
+        if (demGrid && demGrid.length > 0) {
+          const chunk = extractSlippyTileVectorChunk(zoom, tileX, tileY, bounds, demGrid);
+          this.cache.set(key, chunk);
+          this.evictIfNeeded();
+          return chunk;
+        }
+        return null;
+      } finally {
+        this.inFlight.delete(key);
+      }
+    })();
+
+    this.inFlight.set(key, task);
+    return task;
+  }
+
+  /**
+   * Synchronously ingests a slippy DEM tile grid and updates the LRU vector chunk cache.
+   */
+  public ingestDemTileSync(
+    zoom: number,
+    tileX: number,
+    tileY: number,
+    bounds: { minLon: number; maxLon: number; minLat: number; maxLat: number },
+    demGrid: Float32Array,
+    gridSize: number = 256
+  ): SlippyVectorChunk {
+    const key = `${zoom}/${tileX}/${tileY}`;
+    const existing = this.cache.get(key);
+    if (existing) {
+      existing.lastUsedTime = Date.now();
+      return existing;
+    }
+    const chunk = extractSlippyTileVectorChunk(zoom, tileX, tileY, bounds, demGrid, gridSize);
+    this.cache.set(key, chunk);
+    this.evictIfNeeded();
+    return chunk;
+  }
+
+  /**
+   * Packs active cached slippy-tile vector chunks into a single contiguous Float32Array
+   * ready for zero-GC GPU vertex buffer upload.
+   */
+  public assembleActiveChunkBuffer(activeKeys?: Iterable<string>): Float32Array {
+    const chunks: SlippyVectorChunk[] = [];
+    let totalFloats = 0;
+
+    if (activeKeys) {
+      for (const k of activeKeys) {
+        const c = this.cache.get(k);
+        if (c && c.segments.length > 0) {
+          chunks.push(c);
+          totalFloats += c.segments.length;
+        }
+      }
+    } else {
+      for (const c of this.cache.values()) {
+        if (c.segments.length > 0) {
+          chunks.push(c);
+          totalFloats += c.segments.length;
+        }
+      }
+    }
+
+    const out = new Float32Array(totalFloats);
+    let offset = 0;
+    for (const c of chunks) {
+      out.set(c.segments, offset);
+      offset += c.segments.length;
+    }
+    return out;
+  }
+}
+

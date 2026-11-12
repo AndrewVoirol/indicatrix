@@ -5,11 +5,10 @@ Ingests live operational NOAA GFS 0.25° high-resolution global atmospheric fiel
 Extracts:
   1. 10m Surface Wind (UGRD, VGRD) -> public/data/gfs-wind-latest.bin (4,152,960 bytes, 1440x721)
   2. 250 hPa Jet Stream Wind (UGRD, VGRD) -> public/data/gfs-jetstream-latest.bin (4,152,960 bytes, 1440x721)
-  3. Multi-stratum Composite -> public/data/gfs-multistratum-latest.bin (8,305,920 bytes, 1440x721x4)
-  4. Low Cloud Cover (LCDC) -> public/data/gfs-cloud-low-latest.bin (2,076,480 bytes, 1440x721, float16)
-  5. Mid Cloud Cover (MCDC) -> public/data/gfs-cloud-mid-latest.bin (2,076,480 bytes, 1440x721, float16)
-  6. High Cloud Cover (HCDC) -> public/data/gfs-cloud-high-latest.bin (2,076,480 bytes, 1440x721, float16)
-  7. Provenance Metadata -> public/data/gfs-wind-meta.json
+  3. Low Cloud Cover (LCDC) -> public/data/gfs-cloud-low-latest.bin (2,076,480 bytes, 1440x721, float16)
+  4. Mid Cloud Cover (MCDC) -> public/data/gfs-cloud-mid-latest.bin (2,076,480 bytes, 1440x721, float16)
+  5. High Cloud Cover (HCDC) -> public/data/gfs-cloud-high-latest.bin (2,076,480 bytes, 1440x721, float16)
+  6. Provenance Metadata -> public/data/gfs-wind-meta.json
 """
 
 import sys
@@ -182,22 +181,42 @@ def parse_clouds_from_grib(grib_path: str):
     return low_field, mid_field, high_field
 
 def fetch_wind(date_str: str, cycle: str):
-    """Fetches, packs, and writes surface, jetstream, and multistratum wind fields."""
+    """Fetches, packs, and writes surface (10m), mid-tropospheric (500 hPa), and jetstream (250 hPa) wind fields."""
     surf_grib = "/tmp/gfs_surf_0p25_latest.grib2"
+    mid_grib = "/tmp/gfs_mid_500mb_0p25_latest.grib2"
     jet_grib = "/tmp/gfs_jet_0p25_latest.grib2"
 
     # 1. Download Surface Wind (10m above ground)
     download_grib(date_str, cycle, "lev_10_m_above_ground=on", surf_grib)
     u_surf, v_surf = parse_uv_from_grib(surf_grib)
 
-    # 2. Download Jet Stream (250 hPa)
+    # 2. Download Mid-Tropospheric Steering Wind (500 hPa)
+    u_mid, v_mid = None, None
+    try:
+        download_grib(date_str, cycle, "lev_500_mb=on", mid_grib)
+        u_mid, v_mid = parse_uv_from_grib(mid_grib)
+    except Exception as e:
+        print(f"[WARN] 500 hPa wind fetch failed ({e}); synthesizing Ekman mid-troposphere fallback.")
+
+    # 3. Download Jet Stream (250 hPa)
     download_grib(date_str, cycle, "lev_250_mb=on", jet_grib)
     u_jet, v_jet = parse_uv_from_grib(jet_grib)
 
     # Dimensions: 721 latitudes (90 to -90 at 0.25°), 1440 longitudes (0 to 359.75 at 0.25°)
     nj, ni = u_surf.shape
+    half_lon = ni // 2
+    u_surf = np.roll(u_surf, half_lon, axis=1)
+    v_surf = np.roll(v_surf, half_lon, axis=1)
+    u_jet = np.roll(u_jet, half_lon, axis=1)
+    v_jet = np.roll(v_jet, half_lon, axis=1)
+    if u_mid is not None and v_mid is not None:
+        u_mid = np.roll(u_mid, half_lon, axis=1)
+        v_mid = np.roll(v_mid, half_lon, axis=1)
+    else:
+        u_mid = 0.65 * u_surf + 0.35 * u_jet
+        v_mid = 0.65 * v_surf + 0.35 * v_jet
 
-    # 3. Pack Surface Grid (u, v in float16) -> 1440x721x2 = 1,038,240 pairs = 4,152,960 bytes
+    # 4. Pack Surface Grid (u, v in float16) -> 1440x721x2 = 1,038,240 pairs = 4,152,960 bytes
     surf_packed = np.zeros((nj, ni, 2), dtype="<f2")
     surf_packed[:, :, 0] = u_surf.astype("<f2")
     surf_packed[:, :, 1] = v_surf.astype("<f2")
@@ -207,7 +226,17 @@ def fetch_wind(date_str: str, cycle: str):
         f.write(surf_packed.tobytes())
     print(f"[OK] Wrote 0.25° surface wind grid: {os.path.getsize(surf_bin_path):,} bytes to {surf_bin_path}")
 
-    # 4. Pack Jet Stream Grid (u, v in float16) -> 4,152,960 bytes
+    # 5. Pack Mid-Troposphere 500 hPa Grid (u, v in float16) -> 4,152,960 bytes
+    mid_packed = np.zeros((nj, ni, 2), dtype="<f2")
+    mid_packed[:, :, 0] = u_mid.astype("<f2")
+    mid_packed[:, :, 1] = v_mid.astype("<f2")
+
+    mid_bin_path = os.path.join(OUTPUT_DIR, "gfs-wind-500hpa-latest.bin")
+    with open(mid_bin_path, "wb") as f:
+        f.write(mid_packed.tobytes())
+    print(f"[OK] Wrote 0.25° 500 hPa mid-troposphere wind grid: {os.path.getsize(mid_bin_path):,} bytes to {mid_bin_path}")
+
+    # 6. Pack Jet Stream Grid (u, v in float16) -> 4,152,960 bytes
     jet_packed = np.zeros((nj, ni, 2), dtype="<f2")
     jet_packed[:, :, 0] = u_jet.astype("<f2")
     jet_packed[:, :, 1] = v_jet.astype("<f2")
@@ -217,25 +246,14 @@ def fetch_wind(date_str: str, cycle: str):
         f.write(jet_packed.tobytes())
     print(f"[OK] Wrote 0.25° jet stream grid: {os.path.getsize(jet_bin_path):,} bytes to {jet_bin_path}")
 
-    # 5. Pack Multi-Stratum Grid (u_surf, v_surf, u_jet, v_jet) -> 8,305,920 bytes
-    multi_packed = np.zeros((nj, ni, 4), dtype="<f2")
-    multi_packed[:, :, 0] = u_surf.astype("<f2")
-    multi_packed[:, :, 1] = v_surf.astype("<f2")
-    multi_packed[:, :, 2] = u_jet.astype("<f2")
-    multi_packed[:, :, 3] = v_jet.astype("<f2")
-
-    multi_bin_path = os.path.join(OUTPUT_DIR, "gfs-multistratum-latest.bin")
-    with open(multi_bin_path, "wb") as f:
-        f.write(multi_packed.tobytes())
-    print(f"[OK] Wrote 0.25° multi-stratum grid: {os.path.getsize(multi_bin_path):,} bytes to {multi_bin_path}")
-
     # Calculate statistics
     speed_surf = np.hypot(u_surf, v_surf)
+    speed_mid = np.hypot(u_mid, v_mid)
     speed_jet = np.hypot(u_jet, v_jet)
 
     meta = {
         "source": "NOAA NCEP Global Forecast System (GFS) 0.25° Operational Grid",
-        "provenance": "Live NOMADS 0.25° Ingestion",
+        "provenance": "Live NOMADS 0.25° Ingestion (10m, 500 hPa, 250 hPa)",
         "modelRunDate": date_str,
         "modelRunCycle": f"{cycle}Z",
         "forecastHour": "f000 (Analysis / Real-Time Initialization)",
@@ -248,6 +266,14 @@ def fetch_wind(date_str: str, cycle: str):
             "uMax": float(np.max(u_surf)),
             "vMin": float(np.min(v_surf)),
             "vMax": float(np.max(v_surf)),
+        },
+        "midTroposphere500hPaStats": {
+            "maxSpeedMps": float(np.max(speed_mid)),
+            "meanSpeedMps": float(np.mean(speed_mid)),
+            "uMin": float(np.min(u_mid)),
+            "uMax": float(np.max(u_mid)),
+            "vMin": float(np.min(v_mid)),
+            "vMax": float(np.max(v_mid)),
         },
         "jetStreamStats": {
             "maxSpeedMps": float(np.max(speed_jet)),
@@ -271,6 +297,10 @@ def fetch_clouds(date_str: str, cycle: str):
     clouds_grib = "/tmp/gfs_clouds_0p25_latest.grib2"
     download_clouds_grib(date_str, cycle, clouds_grib)
     low, mid, high = parse_clouds_from_grib(clouds_grib)
+    half_lon = low.shape[1] // 2
+    low = np.roll(low, half_lon, axis=1)
+    mid = np.roll(mid, half_lon, axis=1)
+    high = np.roll(high, half_lon, axis=1)
 
     # Pack as float16 little-endian arrays (<f2)
     # Total size per file: 1440 * 721 * 1 * 2 = 2,076,480 bytes

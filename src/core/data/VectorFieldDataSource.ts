@@ -32,6 +32,8 @@ export class VectorFieldDataSource implements IDataSource<VectorFieldMetadata> {
   private u16Grid: Uint16Array | null = null;
   private jetGridBuffer: ArrayBuffer | null = null;
   private jetU16Grid: Uint16Array | null = null;
+  private surfaceRolled180 = false;
+  private jetRolled180 = false;
 
   public lonPoints = 360;
   public latPoints = 181;
@@ -62,6 +64,7 @@ export class VectorFieldDataSource implements IDataSource<VectorFieldMetadata> {
     if (urlOrBuffer instanceof ArrayBuffer) {
       this.rawGridBuffer = urlOrBuffer;
       this.u16Grid = new Uint16Array(this.rawGridBuffer);
+      this.surfaceRolled180 = true;
       this.updateGridDimensions();
       return;
     }
@@ -74,6 +77,7 @@ export class VectorFieldDataSource implements IDataSource<VectorFieldMetadata> {
       if (buf && buf.byteLength > 0) {
         this.rawGridBuffer = buf;
         this.u16Grid = new Uint16Array(this.rawGridBuffer);
+        this.surfaceRolled180 = true;
         this.updateGridDimensions();
         return;
       }
@@ -88,6 +92,7 @@ export class VectorFieldDataSource implements IDataSource<VectorFieldMetadata> {
           if (ab.byteLength > 0) {
             this.rawGridBuffer = ab;
             this.u16Grid = new Uint16Array(this.rawGridBuffer);
+            this.surfaceRolled180 = true;
             this.updateGridDimensions();
             return;
           }
@@ -113,6 +118,7 @@ export class VectorFieldDataSource implements IDataSource<VectorFieldMetadata> {
     if (urlOrBuffer instanceof ArrayBuffer) {
       this.jetGridBuffer = urlOrBuffer;
       this.jetU16Grid = new Uint16Array(this.jetGridBuffer);
+      this.jetRolled180 = true;
       return;
     }
 
@@ -123,6 +129,7 @@ export class VectorFieldDataSource implements IDataSource<VectorFieldMetadata> {
       if (buf && buf.byteLength > 0) {
         this.jetGridBuffer = buf;
         this.jetU16Grid = new Uint16Array(this.jetGridBuffer);
+        this.jetRolled180 = true;
         return;
       }
     }
@@ -135,6 +142,7 @@ export class VectorFieldDataSource implements IDataSource<VectorFieldMetadata> {
           if (ab.byteLength > 0) {
             this.jetGridBuffer = ab;
             this.jetU16Grid = new Uint16Array(this.jetGridBuffer);
+            this.jetRolled180 = true;
             return;
           }
         }
@@ -150,6 +158,7 @@ export class VectorFieldDataSource implements IDataSource<VectorFieldMetadata> {
    * Initializes high-fidelity physical circulation model if binary file is unavailable.
    */
   private initProceduralFallback(): void {
+    this.surfaceRolled180 = false;
     const totalElements = this.lonPoints * this.latPoints * 2;
     this.rawGridBuffer = new ArrayBuffer(totalElements * 2);
     this.u16Grid = new Uint16Array(this.rawGridBuffer);
@@ -185,6 +194,7 @@ export class VectorFieldDataSource implements IDataSource<VectorFieldMetadata> {
    * Initializes 250 hPa Jet Stream procedural model if binary file is unavailable.
    */
   private initJetStreamFallback(): void {
+    this.jetRolled180 = false;
     const totalElements = this.lonPoints * this.latPoints * 2;
     this.jetGridBuffer = new ArrayBuffer(totalElements * 2);
     this.jetU16Grid = new Uint16Array(this.jetGridBuffer);
@@ -246,8 +256,13 @@ export class VectorFieldDataSource implements IDataSource<VectorFieldMetadata> {
     const latPoints = is025 ? 721 : 181;
     const stepDeg = is025 ? 0.25 : 1.0;
 
-    // Normalized coordinates
-    const lonWrapped = ((lonDeg % 360) + 360) % 360;
+    // Normalized coordinates:
+    // Operational GFS binary grids are rolled by 180° (Column 0 = -180° Antimeridian)
+    // to match WebGPU shader UV coordinates, whereas in-memory 'procedural' fallback
+    // grids start at 0° (Prime Meridian).
+    const isRolled180 = is025 || (stratum === 'jetstream' ? this.jetRolled180 : this.surfaceRolled180);
+    const lonOffset = isRolled180 ? 180.0 : 0.0;
+    const lonWrapped = (((lonDeg + lonOffset) % 360) + 360) % 360;
     const latClamped = Math.max(-90.0, Math.min(90.0, latDeg));
 
     // Continuous indices

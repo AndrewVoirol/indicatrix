@@ -108,7 +108,15 @@ fn cs_main(@builtin(global_invocation_id) global_id: vec3<u32>) {
         metric = clamp(length(naturalVel) * 0.3 * rawSin, 0.0, 1.0);
     } else {
         finalVel = vTangent * 0.01;
-        metric = 0.0;
+        if (clampedUnfurl > 0.001 && clampedUnfurl < 0.999) {
+            let absNormLon = clamp(abs(pos2D.x) / (RADIUS * PI), 0.0, 1.0);
+            let absNormLat = clamp(abs(pos2D.y) / (RADIUS * PI * 0.5), 0.0, 1.0);
+            let cornerZone = smoothstep(0.64, 1.0, absNormLon) * smoothstep(0.54, 0.98, absNormLat);
+            let orthoFlexStrain = (0.28 + 0.72 * cornerZone) * sin(PI * clampedUnfurl);
+            metric = clamp(orthoFlexStrain, 0.0, 1.0);
+        } else {
+            metric = 0.0;
+        }
     }
 
     // Write computed state to output storage buffer (halved VRAM bandwidth write)

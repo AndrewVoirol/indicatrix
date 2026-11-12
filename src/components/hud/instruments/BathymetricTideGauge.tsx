@@ -27,11 +27,37 @@ export const BathymetricTideGauge: React.FC<BathymetricTideGaugeProps> = ({
   children,
 }) => {
   const boxRef = useRef<HTMLDivElement>(null);
+  const cachedRectRef = useRef<{ left: number; top: number; width: number; height: number } | null>(null);
   const isDraggingRef = useRef(false);
 
   // Local state for buttery smooth UI decoupling
   const [localSeaLevel, setLocalSeaLevel] = useState(seaLevelOffset);
   const [localClarity, setLocalClarity] = useState(waterClarity);
+
+  const refreshCachedRect = useCallback(() => {
+    const el = boxRef.current;
+    if (!el) return null;
+    const r = el.getBoundingClientRect();
+    if (r.height <= 0) {
+      cachedRectRef.current = null;
+      return null;
+    }
+    const snap = { left: r.left, top: r.top, width: r.width, height: r.height };
+    cachedRectRef.current = snap;
+    return snap;
+  }, []);
+
+  useEffect(() => {
+    const el = boxRef.current;
+    if (!el) return;
+    refreshCachedRect();
+    if (typeof ResizeObserver === 'undefined') return;
+    const ro = new ResizeObserver(() => {
+      refreshCachedRect();
+    });
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, [refreshCachedRect]);
 
   useEffect(() => {
     if (!isDraggingRef.current) {
@@ -45,8 +71,8 @@ export const BathymetricTideGauge: React.FC<BathymetricTideGaugeProps> = ({
 
   const updateFromPointer = useCallback(
     (clientY: number) => {
-      if (!boxRef.current) return;
-      const rect = boxRef.current.getBoundingClientRect();
+      const rect = cachedRectRef.current ?? refreshCachedRect();
+      if (!rect || rect.height <= 0) return;
       const normY = Math.max(0.04, Math.min(0.96, (clientY - rect.top) / rect.height));
       const bottomPct = (1 - normY) * 100;
 
@@ -58,11 +84,12 @@ export const BathymetricTideGauge: React.FC<BathymetricTideGaugeProps> = ({
       setLocalSeaLevel(clampedMeters);
       onSeaLevelChange(clampedMeters);
     },
-    [onSeaLevelChange]
+    [onSeaLevelChange, refreshCachedRect]
   );
 
   const handlePointerDown = (e: React.PointerEvent) => {
     isDraggingRef.current = true;
+    refreshCachedRect();
     try {
       (e.target as HTMLElement).setPointerCapture(e.pointerId);
     } catch {

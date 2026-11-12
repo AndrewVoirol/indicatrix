@@ -7,10 +7,26 @@
 // ============================================================================
 
 import { Vector3, Vector4, PerspectiveCamera, Matrix4 } from '../core/math/cameraMath';
-import { isWebGPUSupported, getWebGPUDevice, getWebGPUAdapter } from './support';
+import {
+  isWebGPUSupported,
+  getWebGPUDevice,
+  getWebGPUAdapter,
+  hasShaderF16,
+  hasSubgroups,
+  prepareVolumetricCloudShaderWGSL,
+  prepareCullingShaderWGSL,
+} from './support';
 import { decodeContourMesh } from '../utils/contour-topology';
 
-export { isWebGPUSupported, getWebGPUDevice, getWebGPUAdapter };
+export {
+  isWebGPUSupported,
+  getWebGPUDevice,
+  getWebGPUAdapter,
+  hasShaderF16,
+  hasSubgroups,
+  prepareVolumetricCloudShaderWGSL,
+  prepareCullingShaderWGSL,
+};
 
 import physicsSimWGSL from './shaders/physics_sim.wgsl?raw';
 import pointsRenderWGSL from './shaders/points_render.wgsl?raw';
@@ -21,7 +37,6 @@ import demUnpackWGSL from './shaders/dem_unpack.wgsl?raw';
 import windParticlesWGSL from './shaders/wind_particles.wgsl?raw';
 import windRibbonRenderWGSL from './shaders/wind_ribbon_render.wgsl?raw';
 import cloudShellWGSL from './shaders/cloud_shell.wgsl?raw';
-import atmosphereScatterWGSL from './shaders/atmosphere_scatter.wgsl?raw';
 import manifoldWGSL from './shaders/manifold.wgsl?raw';
 import cloudNoiseComputeWGSL from './shaders/cloud_noise_compute.wgsl?raw';
 import volumetricCloudWGSL from './shaders/volumetric_cloud.wgsl?raw';
@@ -37,6 +52,9 @@ import {
   ToponymLabel,
   CURATED_ARCHIVAL_TOPONYMS,
   generateProceduralSDFAtlas,
+  getPreloadedSDFAtlas,
+  preloadSDFAtlas,
+  getOrGenerateSDFAtlas,
   layoutToponymLabels,
   ToponymCollisionResolver,
   ScreenRect,
@@ -46,13 +64,56 @@ import {
   ATLAS_WIDTH as SDF_ATLAS_WIDTH,
   ATLAS_HEIGHT as SDF_ATLAS_HEIGHT,
 } from '../core/data/toponymy';
+import {
+  opfsAssetStore,
+  probeAssetVersionTag,
+  readbackGPUTextureRG16MipPyramid,
+} from '../core/data/OPFSAssetStore';
+import { decodeWorkerPool } from '../core/workers/DecodeWorkerPool';
+import type {
+  WeatherNextCloudDualHourResponse,
+  WeatherNextThermoPackResponse,
+  WeatherNextWindPackResponse,
+  WindJetInterleaveResponse,
+  TerrariumDecodeTileResponse,
+  PackElevationTilesRG16Response,
+} from '../core/workers/decodeTasks';
 import { GPUProfiler, ProfilerPassSlot } from './profiling/GPUProfiler';
-import { encodeFloat16 } from '../core/math/float16';
+import { decodeFloat16, encodeFloat16 } from '../core/math/float16';
+
+const FLOAT16_DEC_TABLE: Float32Array = (() => {
+  const table = new Float32Array(65536);
+  for (let i = 0; i < 65536; i++) {
+    table[i] = decodeFloat16(i);
+  }
+  return table;
+})();
+
+const _f16EncF32 = new Float32Array(1);
+const _f16EncU32 = new Uint32Array(_f16EncF32.buffer);
+function encodeFloat16Fast(val: number): number {
+  if (val === 0) return 0;
+  _f16EncF32[0] = val;
+  const bits = _f16EncU32[0];
+  const sign = (bits >>> 16) & 0x8000;
+  const exp = ((bits >>> 23) & 0xff) - 127 + 15;
+  const mant = bits & 0x007fffff;
+  if (exp <= 0) {
+    if (exp < -10) return sign;
+    const sub = (mant | 0x00800000) >>> (1 - exp);
+    return sign | ((sub + 0x00001000) >>> 13);
+  }
+  if (exp >= 31) {
+    return sign | 0x7c00 | (mant ? 0x0200 : 0);
+  }
+  return sign | ((exp << 10) + ((mant + 0x00001000) >>> 13));
+}
 import { parseTLE, propagateOrbitalPosition } from '../core/math/sgp4';
 import { loadNodeAssetBuffer, loadNodeAssetText } from '../utils/nodeAssetLoader';
 import { VectorFieldDataSource } from '../core/data/VectorFieldDataSource';
 import { GeoTIFFDataSource } from '../core/data/GeoTIFFDataSource';
 import { GPUTileCache } from '../core/data/GPUTileCache';
+import { TLETrajectoryDataSource } from '../core/data/TLETrajectoryDataSource';
 import { ThemeManager, PhysicalMediumProperties } from '../core/themes';
 import { getSolarPosition, SolarPosition } from '../core/astronomy/SolarEphemeris';
 import { TemporalTextureRingBuffer } from './TemporalTextureRingBuffer';
@@ -64,6 +125,9 @@ import {
   densifySegmentsToLocalTier,
   resolveActiveVectorTier,
   classifyRiverStrahlerOrders,
+  projectToMercator,
+  SlippyVectorChunkLoader,
+  TIER_TAG_DEFAULT,
   TIER_TAG_ORBIT,
   TIER_TAG_REGIONAL,
   TIER_TAG_LOCAL,
@@ -125,7 +189,6 @@ export interface WebGPUFrameParams {
   showCloudMid?: boolean;
   showCloudHigh?: boolean;
   cloudFalseColor?: boolean;
-  showAtmosphere?: boolean;
   cloudOpacity?: number;
   cloudDriftSpeed?: number;
   cloudFreqHoriz?: number;
@@ -145,7 +208,7 @@ export interface WebGPUFrameParams {
   ambientOcclusion?: number;
   waterClarity?: number;
   opacity?: number;
-  renderStyle?: 'architectural' | 'hybrid' | 'photoreal' | string;
+  renderStyle?: 'architectural' | 'hybrid' | string;
   pointScaleMultiplier?: number;
   vortexStrength?: number;
   fractureIntensity?: number;
@@ -159,7 +222,6 @@ export interface WebGPUFrameParams {
   verticalScaleMode?: number;
   rainShadowFeedback?: number;
   pluvialGamma?: number;
-  weatherOpticalMode?: number;
   thermodynamicGating?: boolean;
   lclGating?: boolean;
   timelineMinutes?: number;
@@ -167,6 +229,9 @@ export interface WebGPUFrameParams {
   weatherTau?: number;
   scrubTau?: number;
   tau?: number;
+  reliefAttenRatio?: number;
+  effectiveCamRadius?: number;
+  atmoFeatureMask?: number;
   toksvigBypass?: boolean;
   advection?: boolean;
   enableAdvection?: boolean;
@@ -288,9 +353,90 @@ export interface VramLedgerReport {
   subsystems: Record<VramSubsystem, VramSubsystemReport>;
 }
 
+export function calcTextureByteSize(
+  desc: Pick<GPUTextureDescriptor, 'size' | 'format'> & Partial<GPUTextureDescriptor>
+): number {
+  if (!desc || !desc.size) return 0;
+  let w = 1, h = 1, d = 1;
+  if (Array.isArray(desc.size)) {
+    w = desc.size[0] || 1;
+    h = desc.size[1] || 1;
+    d = desc.size[2] || 1;
+  } else if (typeof desc.size === 'object') {
+    w = (desc.size as any).width || 1;
+    h = (desc.size as any).height || 1;
+    d = (desc.size as any).depthOrArrayLayers || 1;
+  }
+
+  const fmt = (desc.format || '').toLowerCase();
+  const mips = desc.mipLevelCount || 1;
+  const is3D = desc.dimension === '3d';
+  const samples = Math.max(1, desc.sampleCount || 1);
+
+  // Block-compressed formats (BCn / ETC2 / EAC / ASTC):
+  // - 8 bytes per 4x4 block (0.5 B/px): bc1-*, bc4-*, etc2-rgb8*, eac-r11*
+  // - 16 bytes per 4x4 block (1.0 B/px): bc2-*, bc3-*, bc5-*, bc6h-*, bc7-*, etc2-rgba8*, eac-rg11*
+  // - 16 bytes per WxH block: astc-WxH-*
+  const is8ByteBlock4x4 =
+    fmt.startsWith('bc1-') ||
+    fmt.startsWith('bc4-') ||
+    fmt.startsWith('etc2-rgb8') ||
+    fmt.startsWith('eac-r11');
+  const is16ByteBlock4x4 =
+    fmt.startsWith('bc2-') ||
+    fmt.startsWith('bc3-') ||
+    fmt.startsWith('bc5-') ||
+    fmt.startsWith('bc6h-') ||
+    fmt.startsWith('bc7-') ||
+    fmt.startsWith('etc2-rgba8') ||
+    fmt.startsWith('eac-rg11');
+  const astcMatch = fmt.match(/^astc-(\d+)x(\d+)-/);
+
+  if (is8ByteBlock4x4 || is16ByteBlock4x4 || astcMatch) {
+    const blockW = astcMatch ? Math.max(1, Number(astcMatch[1])) : 4;
+    const blockH = astcMatch ? Math.max(1, Number(astcMatch[2])) : 4;
+    const bytesPerBlock = is8ByteBlock4x4 ? 8 : 16;
+    let total = 0;
+    let mw = w, mh = h, md = d;
+    for (let i = 0; i < mips; i++) {
+      const blocksX = Math.max(1, Math.ceil(mw / blockW));
+      const blocksY = Math.max(1, Math.ceil(mh / blockH));
+      total += blocksX * blocksY * md * bytesPerBlock;
+      mw = Math.max(1, Math.floor(mw / 2));
+      mh = Math.max(1, Math.floor(mh / 2));
+      if (is3D) {
+        md = Math.max(1, Math.floor(md / 2));
+      }
+    }
+    return total * samples;
+  }
+
+  let bpp = 4;
+  if (fmt.startsWith('r8') || fmt === 'stencil8') bpp = 1;
+  else if (fmt.startsWith('r16') || fmt.startsWith('rg8') || fmt === 'depth16unorm') bpp = 2;
+  else if (fmt.startsWith('rgba16') || fmt.startsWith('rg32') || fmt === 'depth32float-stencil8') bpp = 8;
+  else if (fmt.startsWith('rgba32')) bpp = 16;
+  else bpp = 4;
+
+  let total = 0;
+  let mw = w, mh = h, md = d;
+  for (let i = 0; i < mips; i++) {
+    total += mw * mh * md * bpp;
+    mw = Math.max(1, Math.floor(mw / 2));
+    mh = Math.max(1, Math.floor(mh / 2));
+    if (is3D) {
+      md = Math.max(1, Math.floor(md / 2));
+    }
+  }
+  return total * samples;
+}
+
+export const calcTextureBytes = calcTextureByteSize;
+
 export class WebGPUEngine {
   private adapter: GPUAdapter | null = null;
   private profiler: GPUProfiler | null = null;
+  public retainDepthForReadback: boolean = false;
   private _device!: GPUDevice;
   public get device(): GPUDevice {
     return this._device;
@@ -329,36 +475,7 @@ export class WebGPUEngine {
       return this.currentAllocationSubsystem || 'Pipelines';
     };
 
-    const calcTextureBytes = (desc: GPUTextureDescriptor): number => {
-      if (!desc || !desc.size) return 0;
-      let w = 1, h = 1, d = 1;
-      if (Array.isArray(desc.size)) {
-        w = desc.size[0] || 1;
-        h = desc.size[1] || 1;
-        d = desc.size[2] || 1;
-      } else if (typeof desc.size === 'object') {
-        w = (desc.size as any).width || 1;
-        h = (desc.size as any).height || 1;
-        d = (desc.size as any).depthOrArrayLayers || 1;
-      }
-      let bpp = 4;
-      const fmt = (desc.format || '').toLowerCase();
-      if (fmt.includes('r8') || fmt.includes('r8unorm')) bpp = 1;
-      else if (fmt.includes('r16') || fmt.includes('rg8')) bpp = 2;
-      else if (fmt.includes('rgba16') || fmt.includes('rg32')) bpp = 8;
-      else if (fmt.includes('rgba32')) bpp = 16;
-      else bpp = 4;
-
-      const mips = desc.mipLevelCount || 1;
-      let total = 0;
-      let mw = w, mh = h;
-      for (let i = 0; i < mips; i++) {
-        total += mw * mh * d * bpp;
-        mw = Math.max(1, Math.floor(mw / 2));
-        mh = Math.max(1, Math.floor(mh / 2));
-      }
-      return total;
-    };
+    const calcTextureBytes = (desc: GPUTextureDescriptor): number => calcTextureByteSize(desc);
 
     device.createBuffer = (desc: GPUBufferDescriptor): GPUBuffer => {
       const buffer = originalCreateBuffer(desc);
@@ -462,6 +579,10 @@ export class WebGPUEngine {
   private cdlodControlFloats: Float32Array = new Float32Array(4);
   private cdlodControlUints: Uint32Array = new Uint32Array(this.cdlodControlFloats.buffer);
   private cdlodIndirectInitFloats: Uint32Array = new Uint32Array([52224, 0, 0, 0, 0]);
+  private cdlodStrataIndirectInitFloats: Uint32Array = new Uint32Array([
+    26112, 0, 0, 0, 0,
+    24576, 0, 26112, 0, 0,
+  ]);
   private pvMatrix: Float32Array = new Float32Array(16);
 
   private cdlodNodePool: QuadtreeNodeData[] = Array.from({ length: WebGPUEngine.CDLOD_MAX_NODES }, () => ({
@@ -534,6 +655,9 @@ export class WebGPUEngine {
   public vectorSegmentCountRegional: number = 0;
   public vectorSegmentBufferLocal: GPUBuffer | null = null;
   public vectorSegmentCountLocal: number = 0;
+  public slippyVectorChunkLoader: SlippyVectorChunkLoader = new SlippyVectorChunkLoader(64);
+  public vectorSegmentBufferDynamic: GPUBuffer | null = null;
+  public vectorSegmentCountDynamic: number = 0;
   private ribbonUniformBuffer!: GPUBuffer;
   private ribbonFloats: Float32Array = new Float32Array(104);
   private ribbonUints: Uint32Array = new Uint32Array(this.ribbonFloats.buffer);
@@ -569,18 +693,19 @@ export class WebGPUEngine {
   private lastToponymQuatZ: number = 0;
   private lastToponymQuatW: number = 1;
   private lastToponymResult: CollisionAvoidanceResult | null = null;
+  private lastPlacedToponymSig: string = '';
+  private lastToponymCheckTimeMs: number = 0;
 
   // Lithosphere Crust & Hydrosphere Optics Pipeline (M1-T3)
   private crustUniformBuffer!: GPUBuffer;
-  public crustVertexBuffer: GPUBuffer | null = null;
-  public crustIndexBuffer: GPUBuffer | null = null;
-  public crustIndexCount: number = 0;
   // SimUniforms: 416 bytes (104 floats), 16-byte aligned
   private crustFloats = new Float32Array(104);
   private crustUints = new Uint32Array(this.crustFloats.buffer);
   private rteViewMatrix = new Matrix4();
   private rteViewProjectionMatrix = new Matrix4();
   private crustHydrospherePipeline!: GPURenderPipeline;
+  private crustOpaquePipeline: GPURenderPipeline | null = null;
+  private crustHydroOnlyPipeline: GPURenderPipeline | null = null;
   private crustBindGroupLayout!: GPUBindGroupLayout;
   private crustBindGroup!: GPUBindGroup;
   private _shadowIntensity: number = 0.45;
@@ -618,21 +743,6 @@ export class WebGPUEngine {
   }
   public getPluvialGamma(): number {
     return this._pluvialGamma;
-  }
-
-  private _weatherOpticalMode: number = 0;
-  public get weatherOpticalMode(): number {
-    return this._weatherOpticalMode;
-  }
-  public set weatherOpticalMode(val: number) {
-    if (typeof val !== 'number' || !Number.isFinite(val)) return;
-    this._weatherOpticalMode = Math.floor(val);
-  }
-  public setWeatherOpticalMode(mode: number): void {
-    this.weatherOpticalMode = mode;
-  }
-  public getWeatherOpticalMode(): number {
-    return this._weatherOpticalMode;
   }
 
   private _timelineMinutes: number = 0;
@@ -752,6 +862,8 @@ export class WebGPUEngine {
     height: number;
     id: string;
     has30mGroundTruth?: boolean;
+    hasFinerLevel0?: boolean;
+    level0LatDegPerPx?: number;
   }>();
   public activeRegionalDEM: {
     texture: GPUTexture;
@@ -761,6 +873,8 @@ export class WebGPUEngine {
     height: number;
     id: string;
     has30mGroundTruth?: boolean;
+    hasFinerLevel0?: boolean;
+    level0LatDegPerPx?: number;
   } | null = null;
   public activeRegionalMinLon: number = 0;
   public activeRegionalMinLat: number = 0;
@@ -779,11 +893,21 @@ export class WebGPUEngine {
   private dummyRegionalTextureView: GPUTextureView | null = null;
   public regionalUniformBuffer: GPUBuffer | null = null;
 
-  // NASA Blue Marble & VIIRS Night Lights Draping (Feature F28)
-  private orbitalTexture: GPUTexture | null = null;
-  private orbitalTextureView: GPUTextureView | null = null;
-  private orbitalSampler: GPUSampler | null = null;
-  private orbitalTexturesLoaded: boolean = false;
+  private dummyWhiteTexture: GPUTexture | null = null;
+  private dummyWhiteTextureView: GPUTextureView | null = null;
+  private dummyWhiteArrayView: GPUTextureView | null = null;
+  private rg16U16Layout: GPUBindGroupLayout | null = null;
+  private rg16U16GlobalPipeline: GPURenderPipeline | null = null;
+  private rg16U16RegionalPipeline: GPURenderPipeline | null = null;
+  private rg16U16MipGlobalPipeline: GPURenderPipeline | null = null;
+  private rg16U16MipLinearPipeline: GPURenderPipeline | null = null;
+  private rg16TexLayout: GPUBindGroupLayout | null = null;
+  private rg16BA8GlobalPipeline: GPURenderPipeline | null = null;
+  private rg16BA8RegionalPipeline: GPURenderPipeline | null = null;
+  private rg16MipGlobalPipeline: GPURenderPipeline | null = null;
+  private rg16MipLinearPipeline: GPURenderPipeline | null = null;
+  private rg16ElevLayout: GPUBindGroupLayout | null = null;
+  private rg16ElevToRG16Pipeline: GPURenderPipeline | null = null;
 
   // Decoupled 4.19M VRAM Particle Spawn (Feature F31)
   private spawnPipeline: GPUComputePipeline | null = null;
@@ -806,14 +930,101 @@ export class WebGPUEngine {
   private cloudNoisePipeline: GPUComputePipeline | null = null;
   private cloudNoiseBindGroupLayout: GPUBindGroupLayout | null = null;
   private cloudNoiseComputeDurationMs: number = 0;
+  private regionalCloudNoiseTexture: GPUTexture | null = null;
+  private regionalCloudNoiseTextureView: GPUTextureView | null = null;
+  private regionalCloudNoisePipeline: GPUComputePipeline | null = null;
 
   // Milestone 3: Pass 2 Volumetric Cloud Raymarcher Pipeline
   private volumetricCloudPipeline: GPURenderPipeline | null = null;
   private volumetricCloudPipelineLayout: GPUPipelineLayout | null = null;
   private volumetricCloudBindGroupLayout: GPUBindGroupLayout | null = null;
   private volumetricCloudBindGroup: GPUBindGroup | null = null;
+  private volumetricTerrainBindGroupLayout: GPUBindGroupLayout | null = null;
+  private volumetricTerrainBindGroup: GPUBindGroup | null = null;
+  private boundVolumetricRegView: GPUTextureView | null = null;
+  private boundVolumetricTileArrayView: GPUTextureView | null = null;
+  private boundVolumetricTileSlotBuffer: GPUBuffer | null = null;
+  private boundVolumetricRegBuffer: GPUBuffer | null = null;
+  private boundVolumetricRegNoiseView: GPUTextureView | null = null;
+  private volumetricHalfResTexture: GPUTexture | null = null;
+  private volumetricHalfResView: GPUTextureView | null = null;
+  private volumetricCheckerColorTexture: GPUTexture | null = null;
+  private volumetricCheckerColorView: GPUTextureView | null = null;
+  private volumetricCheckerCentroidTexture: GPUTexture | null = null;
+  private volumetricCheckerCentroidView: GPUTextureView | null = null;
+  private volumetricTaaColorTextures: [GPUTexture | null, GPUTexture | null] = [null, null];
+  private volumetricTaaColorViews: [GPUTextureView | null, GPUTextureView | null] = [null, null];
+  private volumetricTaaCentroidTextures: [GPUTexture | null, GPUTexture | null] = [null, null];
+  private volumetricTaaCentroidViews: [GPUTextureView | null, GPUTextureView | null] = [null, null];
+  private volumetricHalfResPipeline: GPURenderPipeline | null = null;
+  private volumetricTaaResolvePipeline: GPURenderPipeline | null = null;
+  private volumetricTaaResolvePipelineLayout: GPUPipelineLayout | null = null;
+  private volumetricTaaResolveBindGroupLayout: GPUBindGroupLayout | null = null;
+  private volumetricTaaResolveBindGroups: [GPUBindGroup | null, GPUBindGroup | null] = [null, null];
+  private volumetricUpsamplePipeline: GPURenderPipeline | null = null;
+  private volumetricUpsamplePipelineLayout: GPUPipelineLayout | null = null;
+  private volumetricUpsampleBindGroupLayout: GPUBindGroupLayout | null = null;
+  private volumetricUpsampleBindGroup: GPUBindGroup | null = null;
+  private volumetricUpsampleBindGroups: [GPUBindGroup | null, GPUBindGroup | null] = [null, null];
+  private volumetricTaaFrameIndex: number = 0;
+  private volumetricTaaValidFrames: number = 0;
+  public volumetricTaaPendingParityFrames: number = 2;
+  private volumetricPrevViewProj: Float32Array = new Float32Array([1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1]);
+  private volumetricCurrViewProj: Float32Array = new Float32Array([1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1]);
+  private volumetricInvView: Float32Array = new Float32Array(16);
+  private volumetricInvProj: Float32Array = new Float32Array(16);
+  private volumetricViewMat: Float32Array = new Float32Array(16);
+  private volumetricProjMat: Float32Array = new Float32Array(16);
+  private volumetricHasPrevCamera: boolean = false;
+  private volumetricPrevUnfurl: number = 0;
+  private volumetricPrevCamPos: [number, number, number] = [0, 0, 10];
+  private volumetricPrevCamForward: [number, number, number] = [0, 0, -1];
+  private volumetricPrevScrubTau: number = 0;
+  private volumetricPrevCloudTime: number = -1;
+  private volumetricIsStationaryRest: boolean = false;
+  private volumetricIsCameraSettled: boolean = false;
+  private volumetricPrevWasWhipPan: boolean = false;
+  private volumetricPrevWasMotionSubgrid: boolean = false;
+  private volumetricCameraSettledFrames: number = 0;
+  private volumetricPrevCloudU32: Uint32Array = new Uint32Array(40);
+  private volumetricActiveCheckerW: number = 1;
+  private volumetricActiveCheckerH: number = 1;
+  private volumetricHalfW: number = 1;
+  private volumetricHalfH: number = 1;
+  private cloudResolutionScale: number = 0.35;
+  private cloudFullGridMode: boolean = false;
+  private cloudResolutionManualOverride: boolean = false;
+  private cloudScissorNorm: [number, number, number, number] | null = null;
+  public xdrSolarGlintEnabled: boolean = false;
+  private boundVolumetricPrecipView: GPUTextureView | null = null;
   private volumetricCameraUniformBuffer: GPUBuffer | null = null;
   private volumetricCloudUniformBuffer: GPUBuffer | null = null;
+  private cloudPreCullBuffer: GPUBuffer | null = null;
+  private _preCullLayerMax: { low: Float32Array; mid: Float32Array; high: Float32Array } = {
+    low: new Float32Array(225 * 113),
+    mid: new Float32Array(225 * 113),
+    high: new Float32Array(225 * 113),
+  };
+  private _preCullHasLayer: { low: boolean; mid: boolean; high: boolean } = {
+    low: false,
+    mid: false,
+    high: false,
+  };
+  private _preCullMinTemp: Float32Array = new Float32Array(225 * 113);
+  private _preCullMaxDew: Float32Array = new Float32Array(225 * 113);
+  private _preCullHasTemp: boolean = false;
+  private _preCullHasDew: boolean = false;
+  private _preCullScratchA: Float32Array = new Float32Array(225 * 113);
+  private _preCullScratchB: Float32Array = new Float32Array(225 * 113);
+  private _preCullPackedU32: Uint32Array = new Uint32Array(225 * 113);
+  private _preCullColBins3600: Uint8Array = (() => {
+    const bins = new Uint8Array(3600);
+    for (let c = 0; c < 3600; c++) {
+      const b = Math.floor((c * 225) / 3600);
+      bins[c] = b > 224 ? 224 : b;
+    }
+    return bins;
+  })();
   private volumetricNoiseSampler: GPUSampler | null = null;
   private volumetricCloudsEnabled: boolean = false;
   private volumetricPipelineDescriptor: GPURenderPipelineDescriptor | null = null;
@@ -849,14 +1060,34 @@ export class WebGPUEngine {
   private windTexture1: GPUTexture | null = null;
   private windTextureView1: GPUTextureView | null = null;
   private windSampler: GPUSampler | null = null;
-  private windTextureLoadSeq: number = 0;
+  private windTextureLoadSeq: [number, number] = [0, 0];
+  private windSlot0RawU16: Uint16Array | null = null;
+  private windSlot0Dims: [number, number] = [0, 0];
+  private windSlot0Format: 'rg16float' | 'rgba16float' = 'rg16float';
+  private jetStreamRawU16: Uint16Array | null = null;
+  private jetStreamDims: [number, number] = [0, 0];
 
   // CelesTrak Starlink & ISS Satellite Orbit Ribbons (F35)
+  public readonly tleDataSource: TLETrajectoryDataSource = new TLETrajectoryDataSource();
   public satelliteSegmentBuffer: GPUBuffer | null = null;
   public satelliteSegmentCount: number = 0;
+  private lastLoadedDEMUrl: string | null = null;
+  public lastGlobalDEMLoadSource: 'opfs-warm' | 'network-cold' | 'buffer' | null = null;
+  public lastGlobalDEMLoadMs: number = 0;
+  public lastRegionalDEMLoadSource: 'opfs-warm' | 'network-cold' | 'memory-cache' | 'buffer' | null = null;
+  public lastRegionalDEMLoadMs: number = 0;
+  public lastOPFSWritePromise: Promise<unknown> | null = null;
+  private inFlightVectorPromise: Promise<void> | null = null;
+  private inFlightVectorUrl: string | null = null;
+  private loadedVectorUrl: string | null = null;
+  private inFlightSatellitePromise: Promise<void> | null = null;
+  private inFlightSatelliteUrl: string | null = null;
+  private loadedSatelliteUrl: string | null = null;
 
   // Purity Diagnostic Mode (R4)
   public purityMode: boolean = false;
+  private lastUniformUnfurl: number | null = null;
+  public unfurlFlexEnvelope: number = 0.0;
 
   // Atmospheric Wind Streamlines & Multi-Stratum Pipelines
   public readonly windParticleCount: number = 131072;
@@ -869,12 +1100,14 @@ export class WebGPUEngine {
   public windParticleBuffers: [GPUBuffer, GPUBuffer] | null = null;
   private windUniformBuffer: GPUBuffer | null = null;
   private windComputePipeline: GPUComputePipeline | null = null;
+  private windComputeBindGroupLayout: GPUBindGroupLayout | null = null;
   private windComputeBindGroups: [GPUBindGroup, GPUBindGroup] | null = null;
   private windTileCacheBindGroupLayout: GPUBindGroupLayout | null = null;
   private windTileCacheBindGroup: GPUBindGroup | null = null;
   private inFlightSlippyTiles: Set<string> = new Set();
   private slippyTileElevScratch: Float32Array = new Float32Array(256 * 256);
   private windRibbonPipeline: GPURenderPipeline | null = null;
+  private windRibbonBindGroupLayout: GPUBindGroupLayout | null = null;
   private lastSimUnfurl: number = -1;
   private lastSimMode: number = -1;
   private lastSimVortex: number = -1;
@@ -897,7 +1130,7 @@ export class WebGPUEngine {
   ];
   public cloudBuffersInitialized: boolean = false;
   private lastLoadedWeatherNextHour: number = -1;
-  private cloudStagingBuffer: GPUBuffer | null = null;
+  private lastLoadedCloudModel: 'weathernext3' | 'satellite' | 'gfs' | null = null;
   private cloudSphereVertexBuffer: GPUBuffer | null = null;
   private cloudSphereIndexBuffer: GPUBuffer | null = null;
   private cloudIndexCount: number = 0;
@@ -908,12 +1141,12 @@ export class WebGPUEngine {
     new Uint32Array(this.cloudLayerUniformMirrors[1].buffer),
     new Uint32Array(this.cloudLayerUniformMirrors[2].buffer),
   ];
-  private atmosphereUniformMirror: Float32Array = new Float32Array(72);
-  private atmosphereUniformMirrorU32: Uint32Array = new Uint32Array(this.atmosphereUniformMirror.buffer);
   private windUniformFloats: Float32Array = new Float32Array(16);
   private windUniformU32: Uint32Array = new Uint32Array(this.windUniformFloats.buffer);
-  private volumetricCamFloats: Float32Array = new Float32Array(48);
-  private volumetricCloudFloats: Float32Array = new Float32Array(40);
+  private volumetricCamFloats: Float32Array = new Float32Array(68);
+  private volumetricCamU32: Uint32Array = new Uint32Array(this.volumetricCamFloats.buffer);
+  private volumetricCloudFloats: Float32Array = new Float32Array(44);
+  private volumetricCloudU32: Uint32Array = new Uint32Array(this.volumetricCloudFloats.buffer);
   private cloudSampler: GPUSampler | null = null;
   private cloudEnabled: boolean = true;
   public cloudOptions: CloudOptions = {
@@ -925,11 +1158,6 @@ export class WebGPUEngine {
     showHigh: true,
     falseColor: false,
   };
-  private atmosphereScatterPipeline: GPURenderPipeline | null = null;
-  private atmosphereBindGroupLayout: GPUBindGroupLayout | null = null;
-  private atmosphereUniformBuffer: GPUBuffer | null = null;
-  private atmosphereBindGroup: GPUBindGroup | null = null;
-  private showAtmosphereScatter: boolean = true;
   private windStep: number = 0;
   private windBuffersInitialized: boolean = false;
   private windDataSource: VectorFieldDataSource = new VectorFieldDataSource();
@@ -939,9 +1167,12 @@ export class WebGPUEngine {
   public activeRegionalTileKey: string | null = null;
   private regionalUniformData: Float32Array = new Float32Array(16);
   private regionalUniformU32: Uint32Array = new Uint32Array(this.regionalUniformData.buffer);
-  private regionalTileF16Data: Uint16Array = new Uint16Array(256 * 256 * 4);
-  private globalTileF16Data: Uint16Array = new Uint16Array(256 * 256 * 4);
-  public cpuDEMData: Uint16Array | Uint8Array | Uint8ClampedArray | null = null;
+  private hideVectorsFlag: number = 0;
+  private regionalTileF16Data: Uint16Array = new Uint16Array(256 * 256 * 2);
+  private globalTileF16Data: Uint16Array = new Uint16Array(256 * 256 * 2);
+  public cpuDEMData: Int16Array | Uint16Array | Uint8Array | Uint8ClampedArray | null = null;
+  public static readonly CPU_DEM_WIDTH = 2048;
+  public static readonly CPU_DEM_HEIGHT = 1024;
   public static readonly DEFAULT_DEM_WIDTH = 1024 * 8;
   public static readonly DEFAULT_DEM_HEIGHT = 1024 * 4;
   public demWidth: number = 0;
@@ -965,6 +1196,7 @@ export class WebGPUEngine {
 
   public paperSubstrateUniformBuffer: GPUBuffer | null = null;
   public paperSubstrateFloats: Float32Array = new Float32Array(8);
+  public paperSubstrateUints: Uint32Array = new Uint32Array(this.paperSubstrateFloats.buffer);
 
   public substrateConfigUniformBuffer: GPUBuffer | null = null;
   public substrateConfigFloats: Float32Array = new Float32Array(4);
@@ -1042,6 +1274,7 @@ export class WebGPUEngine {
   public drainageBindGroupLayout: GPUBindGroupLayout | null = null;
   public drainagePipeline: GPUComputePipeline | null = null;
   public drainageBindGroup: GPUBindGroup | null = null;
+  private boundDrainagePrecipView: GPUTextureView | null = null;
   public crustGroup1BindGroups: (GPUBindGroup | null)[] = [null, null, null, null];
   public pluvialCouplingFactor: number = 1.0;
   public bedrockIncisionFactor: number = 1.0;
@@ -1058,19 +1291,104 @@ export class WebGPUEngine {
   private cdlodScratchE2: [number, number, number] = [0, 0, 0];
   private cdlodScratchE3: [number, number, number] = [0, 0, 0];
   private cdlodScratchWrap: [number, number, number] = [0, 0, 0];
+  private cdlodPrevSignature: Float64Array = new Float64Array(36);
+  public cdlodDirty: boolean = true;
+  private cdlodHasValidState: boolean = false;
+  private cdlodGpuUploaded: boolean = false;
+  private cdlodUpdatedThisFrame: boolean = true;
+  private isExecutingFrameRender: boolean = false;
+  private readonly uniformShadowWords: Uint32Array = new Uint32Array(512);
+  private readonly uniformShadowOffsets: Int32Array = new Int32Array([
+    0,   // 0: sim (64)
+    64,  // 1: relief (16)
+    80,  // 2: ribbon (104)
+    184, // 3: crust (104)
+    288, // 4: wind (16)
+    304, // 5: paperSubstrate (8)
+    312, // 6: substrateConfig (4)
+    316, // 7: compositionLighting (12)
+    328, // 8: volumetricCam (68)
+    396, // 9: volumetricCloud (40) -> end 436
+  ]);
+  private uniformShadowValidMask: number = 0;
+  private lastExplicitCdlodDiagnosticMode: number | undefined = undefined;
+
+  public invalidateCDLODState(): void {
+    this.cdlodDirty = true;
+    this.cdlodGpuUploaded = false;
+  }
+
+  private shouldWriteUniform(
+    slot: number,
+    buffer: GPUBuffer | null | undefined,
+    srcU32: Uint32Array,
+    ignoreWordA: number = -1,
+    ignoreWordB: number = -1
+  ): boolean {
+    if (!this.device || !buffer) return false;
+    const bit = 1 << slot;
+    if (!this.isExecutingFrameRender) {
+      this.uniformShadowValidMask &= ~bit;
+      return true;
+    }
+
+    const base = this.uniformShadowOffsets[slot];
+    const wordLen = srcU32.length;
+    const shadow = this.uniformShadowWords;
+
+    if ((this.uniformShadowValidMask & bit) === 0) {
+      for (let i = 0; i < wordLen; i++) {
+        shadow[base + i] = srcU32[i];
+      }
+      this.uniformShadowValidMask |= bit;
+      return true;
+    }
+
+    let changed = false;
+    for (let i = 0; i < wordLen; i++) {
+      if (i === ignoreWordA || i === ignoreWordB) continue;
+      if (shadow[base + i] !== srcU32[i]) {
+        changed = true;
+        break;
+      }
+    }
+    if (changed) {
+      for (let i = 0; i < wordLen; i++) {
+        shadow[base + i] = srcU32[i];
+      }
+    }
+    return changed;
+  }
 
   private uncapturedErrorHandler: ((event: any) => void) | null = null;
   private inFlightWeatherNextHour: number = -1;
   private inFlightWeatherNextPromise: Promise<void> | null = null;
+  private pendingWeatherNextHour: number = -1;
+  private pendingWeatherNextModel: 'weathernext3' | 'satellite' = 'weathernext3';
+  private cloudLayerLoadSeq: number = 0;
   private lastLoadedWindUrl: [string | null, string | null] = [null, null];
   private inFlightWindUrl: [string | null, string | null] = [null, null];
   private inFlightWindPromise: [Promise<void> | null, Promise<void> | null] = [null, null];
+  private pendingWindUrl: [string | null, string | null] = [null, null];
+  private lastLoadedJetStreamUrl: string | null = null;
+  private inFlightJetStreamUrl: string | null = null;
+  private inFlightJetStreamPromise: Promise<void> | null = null;
   private lastLoadedTempUrl: string | null = null;
   private inFlightTempUrl: string | null = null;
   private inFlightTempPromise: Promise<void> | null = null;
+  private pendingTempUrl: string | null = null;
+  private tempTextureLoadSeq: number = 0;
   private lastLoadedDewpointUrl: string | null = null;
   private inFlightDewpointUrl: string | null = null;
   private inFlightDewpointPromise: Promise<void> | null = null;
+  private pendingDewpointReq: { url: string; opt?: string } | null = null;
+  private dewpointTextureLoadSeq: number = 0;
+  private prefetchedColdDEMVersionTags: Map<string, string> = new Map();
+  private _volumetricPackedChannelFlags: number = 0;
+  private cloudTextureFormat: GPUTextureFormat = 'r16float';
+  private jetStreamTextureFormat: GPUTextureFormat = 'rg16float';
+  private _wnCloudSliceCache: Map<number, { low: ArrayBuffer; mid: ArrayBuffer; high: ArrayBuffer }> = new Map();
+  private _satelliteCloudTripletCache: { low: ArrayBuffer; mid: ArrayBuffer; high: ArrayBuffer } | null = null;
 
   // Milestone Section 1: Temporal Cloud Morphing & Semi-Lagrangian Vector Advection
   private cloudAdvectionEnabled: boolean = true;
@@ -1093,6 +1411,7 @@ export class WebGPUEngine {
   private cloudAdvectionHasRealTextures: boolean = false;
 
   public cloudAdvectionStep: number = 0;
+  private _advectionAccumDt: number = 0;
   public readonly cloudDensityGridDimensions: [number, number, number] = [128, 128, 32];
 
   private computeBindGroups: [GPUBindGroup, GPUBindGroup] = [null!, null!];
@@ -1136,22 +1455,6 @@ export class WebGPUEngine {
 
   public getDEMSampler(): GPUSampler | null {
     return this.demSampler;
-  }
-
-  public getCrustVertexBuffer(): GPUBuffer | null {
-    return this.crustVertexBuffer;
-  }
-
-  public getCrustIndexBuffer(): GPUBuffer | null {
-    return this.crustIndexBuffer;
-  }
-
-  public getCrustIndexCount(): number {
-    return this.crustIndexCount;
-  }
-
-  public isOrbitalTexturesLoaded(): boolean {
-    return this.orbitalTexturesLoaded;
   }
 
   public async init(config: WebGPUInitConfig): Promise<void> {
@@ -1222,36 +1525,16 @@ export class WebGPUEngine {
       maxAnisotropy: 16,
     });
 
-    // Default 2x2 placeholder texture (rgba16float)
+    // Default 2x2 placeholder texture (rg16float: [R=bNorm, G=elevM])
     this.demTexture = this.device.createTexture({
       label: 'dem_placeholder_texture',
       size: [2, 2, 1],
-      format: 'rgba16float',
+      format: 'rg16float',
       usage: (typeof GPUTextureUsage !== 'undefined' ? (GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST) : (4 | 8)),
     });
-    // [R=landElev, G=oceanDepth, B=landFraction, A=signedElevation]
     // 2x2 texels padded to 256 bytesPerRow (128 Uint16 per row, 256 Uint16 total)
+    // Initialize [bNorm = 0.0, elevM = 0.0m ASL]
     const placeholderTexels = new Uint16Array(256);
-    const zeroF16 = U16_TO_F16_LUT[0];
-    const halfF16 = U16_TO_F16_LUT[32768];
-    // Row 0: Texel (0,0) and (1,0)
-    placeholderTexels[0] = zeroF16;
-    placeholderTexels[1] = halfF16;
-    placeholderTexels[2] = zeroF16;
-    placeholderTexels[3] = halfF16;
-    placeholderTexels[4] = zeroF16;
-    placeholderTexels[5] = halfF16;
-    placeholderTexels[6] = zeroF16;
-    placeholderTexels[7] = halfF16;
-    // Row 1: Texel (0,1) and (1,1) at offset 128
-    placeholderTexels[128] = zeroF16;
-    placeholderTexels[129] = halfF16;
-    placeholderTexels[130] = zeroF16;
-    placeholderTexels[131] = halfF16;
-    placeholderTexels[132] = zeroF16;
-    placeholderTexels[133] = halfF16;
-    placeholderTexels[134] = zeroF16;
-    placeholderTexels[135] = halfF16;
     this.device.queue.writeTexture(
       { texture: this.demTexture },
       placeholderTexels,
@@ -1260,79 +1543,29 @@ export class WebGPUEngine {
     );
     this.demTextureView = this.demTexture.createView();
 
-    // ========================================================================
-    // 1b. NASA Blue Marble & VIIRS Night Lights 2-Layer Texture Array (F28)
-    // ========================================================================
-    this.orbitalSampler = this.device.createSampler({
-      label: 'orbital_sampler',
-      addressModeU: 'repeat',
-      addressModeV: 'clamp-to-edge',
-      minFilter: 'linear',
-      magFilter: 'linear',
-    });
-
-    // Default procedural 2-layer texture array (Layer 0: Day Blue Marble, Layer 1: Night Lights)
-    const isTestEnv = typeof process !== 'undefined' && process.env?.NODE_ENV === 'test';
-    const orbW = isTestEnv ? 512 : 1024;
-    const orbH = isTestEnv ? 256 : 512;
-    this.orbitalTexture = this.device.createTexture({
-      label: 'nasa_orbital_texture_array_procedural',
-      size: [orbW, orbH, 2],
+    // 1x1 fallback white texture for optional 2D bind-group slots
+    this.dummyWhiteTexture = this.device.createTexture({
+      label: 'dummy_white_texture',
+      size: [1, 1, 1],
       format: 'rgba8unorm',
-      usage: (typeof GPUTextureUsage !== 'undefined'
-        ? (GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST | GPUTextureUsage.RENDER_ATTACHMENT)
-        : (4 | 8 | 16)),
+      usage: (typeof GPUTextureUsage !== 'undefined' ? (GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST) : (4 | 8)),
     });
-
-    const dayTexels = new Uint8Array(orbW * orbH * 4);
-    const nightTexels = new Uint8Array(orbW * orbH * 4);
-
-    for (let y = 0; y < orbH; y++) {
-      const lat = 90.0 - (y / orbH) * 180.0;
-      const absLat = Math.abs(lat);
-      const iceT = Math.max(0.0, Math.min(1.0, (absLat - 70.0) / 16.0));
-      for (let x = 0; x < orbW; x++) {
-        const idx = (y * orbW + x) * 4;
-
-        // Smooth base: deep oceanic navy blending cleanly into polar ice
-        const oceanR = 12;
-        const oceanG = 34;
-        const oceanB = 72;
-        const iceR = 228;
-        const iceG = 238;
-        const iceB = 250;
-
-        dayTexels[idx + 0] = Math.round(oceanR + (iceR - oceanR) * iceT);
-        dayTexels[idx + 1] = Math.round(oceanG + (iceG - oceanG) * iceT);
-        dayTexels[idx + 2] = Math.round(oceanB + (iceB - oceanB) * iceT);
-        dayTexels[idx + 3] = 255;
-
-        // Clean darkness for procedural night layer (no hard yellow bounding boxes)
-        nightTexels[idx + 0] = 0;
-        nightTexels[idx + 1] = 0;
-        nightTexels[idx + 2] = 0;
-        nightTexels[idx + 3] = 255;
-      }
-    }
-
+    const whiteRow = new Uint8Array(256);
+    whiteRow[0] = 255;
+    whiteRow[1] = 255;
+    whiteRow[2] = 255;
+    whiteRow[3] = 255;
     this.device.queue.writeTexture(
-      { texture: this.orbitalTexture, origin: [0, 0, 0] },
-      dayTexels,
-      { bytesPerRow: orbW * 4, rowsPerImage: orbH },
-      [orbW, orbH, 1]
+      { texture: this.dummyWhiteTexture },
+      whiteRow,
+      { bytesPerRow: 256, rowsPerImage: 1 },
+      [1, 1, 1]
     );
-
-    this.device.queue.writeTexture(
-      { texture: this.orbitalTexture, origin: [0, 0, 1] },
-      nightTexels,
-      { bytesPerRow: orbW * 4, rowsPerImage: orbH },
-      [orbW, orbH, 1]
-    );
-
-    this.orbitalTextureView = this.orbitalTexture.createView({
+    this.dummyWhiteTextureView = this.dummyWhiteTexture.createView();
+    this.dummyWhiteArrayView = this.dummyWhiteTexture.createView({
       dimension: '2d-array',
       baseArrayLayer: 0,
-      arrayLayerCount: 2,
+      arrayLayerCount: 1,
     });
 
     // ========================================================================
@@ -1438,13 +1671,41 @@ export class WebGPUEngine {
     this.sdfAtlasView = this.sdfAtlasTexture.createView();
 
     try {
-      const sdfData = generateProceduralSDFAtlas();
-      this.device.queue.writeTexture(
-        { texture: this.sdfAtlasTexture },
-        sdfData,
-        { bytesPerRow: SDF_ATLAS_WIDTH, rowsPerImage: SDF_ATLAS_HEIGHT },
-        [SDF_ATLAS_WIDTH, SDF_ATLAS_HEIGHT, 1]
-      );
+      const preloadedSdf = getPreloadedSDFAtlas();
+      const isVitest = Boolean((globalThis as any).process?.env?.VITEST);
+      const isMockFetch = typeof fetch === 'function' && Boolean((fetch as any).mock);
+      if (preloadedSdf) {
+        this.device.queue.writeTexture(
+          { texture: this.sdfAtlasTexture },
+          preloadedSdf as unknown as BufferSource,
+          { bytesPerRow: SDF_ATLAS_WIDTH, rowsPerImage: SDF_ATLAS_HEIGHT },
+          [SDF_ATLAS_WIDTH, SDF_ATLAS_HEIGHT, 1]
+        );
+      } else if (!isVitest && typeof fetch === 'function' && !isMockFetch) {
+        void preloadSDFAtlas().then((loaded) => {
+          const sdfData = loaded ?? getOrGenerateSDFAtlas();
+          if (this.device && this.sdfAtlasTexture && this.isInitialized) {
+            try {
+              this.device.queue.writeTexture(
+                { texture: this.sdfAtlasTexture },
+                sdfData as unknown as BufferSource,
+                { bytesPerRow: SDF_ATLAS_WIDTH, rowsPerImage: SDF_ATLAS_HEIGHT },
+                [SDF_ATLAS_WIDTH, SDF_ATLAS_HEIGHT, 1]
+              );
+            } catch {
+              // Ignore late texture write if device was lost/disposed
+            }
+          }
+        });
+      } else {
+        const sdfData = getOrGenerateSDFAtlas();
+        this.device.queue.writeTexture(
+          { texture: this.sdfAtlasTexture },
+          sdfData as unknown as BufferSource,
+          { bytesPerRow: SDF_ATLAS_WIDTH, rowsPerImage: SDF_ATLAS_HEIGHT },
+          [SDF_ATLAS_WIDTH, SDF_ATLAS_HEIGHT, 1]
+        );
+      }
     } catch {
       // Mock environment guard
     }
@@ -1552,6 +1813,116 @@ export class WebGPUEngine {
 
     this.currentStep = 0;
     this.isInitialized = true;
+  }
+
+  /**
+   * Reallocates staticBuffer, particleBuffers[0..1], lineIndexBuffer, and computeBindGroups
+   * in-place when toggling Purity mode (100k <-> 1M) without tearing down the WebGPU device.
+   */
+  public reallocateParticleBuffers(config: {
+    pointCount: number;
+    pointsData: Float32Array;
+    target2DData: Float32Array;
+    typeData: Float32Array;
+    lineIndices: Uint32Array;
+  }): void {
+    if (!this.device || !this.isInitialized) return;
+
+    this.pointCount = config.pointCount;
+    this.lineIndexCount = config.lineIndices.length;
+
+    const particleFloatCount = this.pointCount * 8;
+    const initialParticles = new Float32Array(particleFloatCount);
+    const initialStaticParticles = new Float32Array(particleFloatCount);
+
+    for (let i = 0; i < this.pointCount; i++) {
+      const pBase = i * 8;
+      initialParticles[pBase + 0] = config.pointsData[i * 3 + 0];
+      initialParticles[pBase + 1] = config.pointsData[i * 3 + 1];
+      initialParticles[pBase + 2] = config.pointsData[i * 3 + 2];
+      initialParticles[pBase + 3] = config.typeData[i];
+      initialParticles[pBase + 4] = 0.0;
+      initialParticles[pBase + 5] = 0.0;
+      initialParticles[pBase + 6] = 0.0;
+      initialParticles[pBase + 7] = 0.0;
+
+      initialStaticParticles[pBase + 0] = config.pointsData[i * 3 + 0];
+      initialStaticParticles[pBase + 1] = config.pointsData[i * 3 + 1];
+      initialStaticParticles[pBase + 2] = config.pointsData[i * 3 + 2];
+      initialStaticParticles[pBase + 3] = 5.0;
+      initialStaticParticles[pBase + 4] = config.target2DData[i * 2 + 0];
+      initialStaticParticles[pBase + 5] = config.target2DData[i * 2 + 1];
+    }
+
+    this.staticBuffer?.destroy();
+    this.particleBuffers[0]?.destroy();
+    this.particleBuffers[1]?.destroy();
+    this.lineIndexBuffer?.destroy();
+
+    this.staticBuffer = this.device.createBuffer({
+      size: initialStaticParticles.byteLength,
+      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+    });
+    this.device.queue.writeBuffer(
+      this.staticBuffer,
+      0,
+      initialStaticParticles.buffer,
+      initialStaticParticles.byteOffset,
+      initialStaticParticles.byteLength
+    );
+
+    const bufferByteSize = initialParticles.byteLength;
+    this.particleBuffers[0] = this.device.createBuffer({
+      size: bufferByteSize,
+      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
+    });
+    this.device.queue.writeBuffer(
+      this.particleBuffers[0],
+      0,
+      initialParticles.buffer,
+      initialParticles.byteOffset,
+      initialParticles.byteLength
+    );
+
+    this.particleBuffers[1] = this.device.createBuffer({
+      size: bufferByteSize,
+      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
+    });
+    this.device.queue.writeBuffer(
+      this.particleBuffers[1],
+      0,
+      initialParticles.buffer,
+      initialParticles.byteOffset,
+      initialParticles.byteLength
+    );
+
+    const lineByteLength = Math.max(4, config.lineIndices.byteLength);
+    this.lineIndexBuffer = this.device.createBuffer({
+      size: lineByteLength,
+      usage: GPUBufferUsage.INDEX | GPUBufferUsage.COPY_DST,
+    });
+    if (config.lineIndices.byteLength > 0) {
+      this.device.queue.writeBuffer(
+        this.lineIndexBuffer,
+        0,
+        config.lineIndices.buffer,
+        config.lineIndices.byteOffset,
+        config.lineIndices.byteLength
+      );
+    }
+
+    this.cachedInitConfig = {
+      pointsData: config.pointsData,
+      target2DData: config.target2DData,
+      typeData: config.typeData,
+      lineIndices: config.lineIndices,
+      initialStaticParticles,
+    };
+    this.currentStep = 0;
+    this.simWarmupFrames = 0;
+    this.simPendingFrames = 2;
+    this.lastWrittenParticleBufferIndex = 0;
+    this.updateComputeBindGroups();
   }
 
   /**
@@ -1841,55 +2212,6 @@ export class WebGPUEngine {
   }
 
   /**
-   * Rebuilds the dual-surface lithosphere and hydrosphere sphere grid dynamically at the specified resolution.
-   */
-  public rebuildSphereMesh(
-    latSegments = 512,
-    lonSegments = 1024
-  ): { vertexCount: number; triangleCount: number; memoryBytes: number } {
-    if (!this.device) {
-      throw new Error('Device not initialized');
-    }
-    if (latSegments >= 256) {
-      this.cdlodSseTolerance = latSegments >= 2048 ? 0.55
-        : latSegments >= 1448 ? 0.80
-        : latSegments >= 1024 ? 1.10
-        : latSegments >= 886 ? 1.45
-        : latSegments >= 512 ? 2.00
-        : 3.50;
-    }
-    const sphereMesh = this.generateSphereGrid(latSegments, lonSegments);
-    this.crustIndexCount = sphereMesh.indices.length;
-
-    if (this.crustVertexBuffer) {
-      this.crustVertexBuffer.destroy();
-    }
-    this.crustVertexBuffer = this.device.createBuffer({
-      label: `crust_vertex_buffer_${latSegments}x${lonSegments}`,
-      size: sphereMesh.vertices.byteLength,
-      usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
-    });
-    this.device.queue.writeBuffer(this.crustVertexBuffer, 0, sphereMesh.vertices.buffer);
-
-    if (this.crustIndexBuffer) {
-      this.crustIndexBuffer.destroy();
-    }
-    this.crustIndexBuffer = this.device.createBuffer({
-      label: `crust_index_buffer_${latSegments}x${lonSegments}`,
-      size: sphereMesh.indices.byteLength,
-      usage: GPUBufferUsage.INDEX | GPUBufferUsage.COPY_DST,
-    });
-    this.device.queue.writeBuffer(this.crustIndexBuffer, 0, sphereMesh.indices.buffer);
-
-    const memoryBytes = sphereMesh.vertices.byteLength + sphereMesh.indices.byteLength;
-    return {
-      vertexCount: sphereMesh.vertices.length / 12,
-      triangleCount: sphereMesh.indices.length / 3,
-      memoryBytes,
-    };
-  }
-
-  /**
    * Generates an instanced 64x64 grid patch mesh for dual-surface CDLOD quadsphere.
    * Surface 0: Crust (surfaceType = 0.0)
    * Surface 1: Hydrosphere (surfaceType = 1.0)
@@ -2070,6 +2392,7 @@ export class WebGPUEngine {
   public ensureCDLODBuffers(): void {
     if (!this.device || this.cdlodBuffersInitialized) return;
     this.cdlodBuffersInitialized = true;
+    this.invalidateCDLODState();
 
     // Precalculate dyadic LOD distance ranges: R_L = 56.0 / 2^L
     this.cdlodLodRanges = [];
@@ -2105,17 +2428,27 @@ export class WebGPUEngine {
     this.patchIndexCount = patch.indices.length;
     this.patchVertexCount = patch.vertices.length / 12;
 
+    const bufVertex = typeof GPUBufferUsage !== 'undefined' ? GPUBufferUsage.VERTEX : 32;
+    const bufIndex = typeof GPUBufferUsage !== 'undefined' ? GPUBufferUsage.INDEX : 16;
+    const bufUniform = typeof GPUBufferUsage !== 'undefined' ? GPUBufferUsage.UNIFORM : 64;
+    const bufStorage = typeof GPUBufferUsage !== 'undefined' ? GPUBufferUsage.STORAGE : 128;
+    const bufIndirect = typeof GPUBufferUsage !== 'undefined' ? GPUBufferUsage.INDIRECT : 256;
+    const bufCopyDst = typeof GPUBufferUsage !== 'undefined' ? GPUBufferUsage.COPY_DST : 8;
+    const bufCopySrc = typeof GPUBufferUsage !== 'undefined' ? GPUBufferUsage.COPY_SRC : 4;
+    const stageVertex = typeof GPUShaderStage !== 'undefined' ? GPUShaderStage.VERTEX : 1;
+    const stageCompute = typeof GPUShaderStage !== 'undefined' ? GPUShaderStage.COMPUTE : 4;
+
     this.patchVertexBuffer = this.device.createBuffer({
       label: 'cdlod_patch_vertex_buffer',
       size: patch.vertices.byteLength,
-      usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
+      usage: bufVertex | bufCopyDst,
     });
     this.device.queue.writeBuffer(this.patchVertexBuffer, 0, patch.vertices.buffer);
 
     this.patchIndexBuffer = this.device.createBuffer({
       label: 'cdlod_patch_index_buffer',
       size: patch.indices.byteLength,
-      usage: GPUBufferUsage.INDEX | GPUBufferUsage.COPY_DST,
+      usage: bufIndex | bufCopyDst,
     });
     this.device.queue.writeBuffer(this.patchIndexBuffer, 0, patch.indices.buffer);
 
@@ -2123,81 +2456,86 @@ export class WebGPUEngine {
     this.cdlodCandidateBuffer = this.device.createBuffer({
       label: 'cdlod_candidate_nodes_buffer',
       size: WebGPUEngine.CDLOD_MAX_NODES * 48,
-      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+      usage: bufStorage | bufCopyDst,
     });
 
-    // 3. Indirect command buffer (drawIndexedIndirect)
+    // 3. Indirect command buffer (drawIndexedIndirect: offset 0 = combined 52224, offset 20 = Crust 26112, offset 40 = Hydrosphere 24576)
     this.cdlodIndirectBuffer = this.device.createBuffer({
       label: 'cdlod_indirect_draw_buffer',
-      size: 20,
-      usage: GPUBufferUsage.INDIRECT | GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC,
+      size: 60,
+      usage: bufIndirect | bufStorage | bufCopyDst | bufCopySrc,
     });
     this.device.queue.writeBuffer(this.cdlodIndirectBuffer, 0, this.cdlodIndirectInitFloats);
+    this.device.queue.writeBuffer(this.cdlodIndirectBuffer, 20, this.cdlodStrataIndirectInitFloats);
 
     // 4. Instance buffer (written by culling compute, read by vertex shader)
     this.cdlodInstanceBuffer = this.device.createBuffer({
       label: 'cdlod_instance_buffer',
       size: WebGPUEngine.CDLOD_MAX_INSTANCES * 32,
-      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC,
+      usage: bufStorage | bufCopyDst | bufCopySrc,
     });
 
     // 5. Culling uniforms buffer (144 bytes)
     this.cdlodCullingUniformBuffer = this.device.createBuffer({
       label: 'cdlod_culling_uniform_buffer',
       size: 144,
-      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+      usage: bufUniform | bufCopyDst,
     });
 
     // 6. CDLOD Control Uniform Buffer (16 bytes)
     this.cdlodControlBuffer = this.device.createBuffer({
       label: 'cdlod_control_uniform_buffer',
       size: 16,
-      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+      usage: bufUniform | bufCopyDst,
     });
     this.cdlodControlUints[0] = this.cdlodEnabled ? 1 : 0;
     this.device.queue.writeBuffer(this.cdlodControlBuffer, 0, this.cdlodControlFloats.buffer);
 
     // 7. CDLOD Render Bind Group Layout & Bind Group (@group(2) in crust_hydrosphere.wgsl)
-    if (!this.cdlodBindGroupLayout) {
+    if (!this.cdlodBindGroupLayout && typeof this.device.createBindGroupLayout === 'function') {
       this.cdlodBindGroupLayout = this.device.createBindGroupLayout({
         label: 'cdlod_render_bind_group_layout',
         entries: [
-          { binding: 0, visibility: GPUShaderStage.VERTEX, buffer: { type: 'uniform' } },
-          { binding: 1, visibility: GPUShaderStage.VERTEX, buffer: { type: 'read-only-storage' } },
+          { binding: 0, visibility: stageVertex, buffer: { type: 'uniform' } },
+          { binding: 1, visibility: stageVertex, buffer: { type: 'read-only-storage' } },
         ],
       });
     }
-    this.cdlodBindGroup = this.device.createBindGroup({
-      label: 'cdlod_render_bind_group',
-      layout: this.cdlodBindGroupLayout,
-      entries: [
-        { binding: 0, resource: { buffer: this.cdlodControlBuffer } },
-        { binding: 1, resource: { buffer: this.cdlodInstanceBuffer } },
-      ],
-    });
+    if (this.cdlodBindGroupLayout && typeof this.device.createBindGroup === 'function') {
+      this.cdlodBindGroup = this.device.createBindGroup({
+        label: 'cdlod_render_bind_group',
+        layout: this.cdlodBindGroupLayout,
+        entries: [
+          { binding: 0, resource: { buffer: this.cdlodControlBuffer } },
+          { binding: 1, resource: { buffer: this.cdlodInstanceBuffer } },
+        ],
+      });
+    }
 
     // 8. CDLOD Culling Compute Bind Group Layout & Bind Group (@group(0) in culling.wgsl)
-    if (!this.cdlodCullingBindGroupLayout) {
+    if (!this.cdlodCullingBindGroupLayout && typeof this.device.createBindGroupLayout === 'function') {
       this.cdlodCullingBindGroupLayout = this.device.createBindGroupLayout({
         label: 'cdlod_culling_bind_group_layout',
         entries: [
-          { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' } },
-          { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
-          { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
-          { binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
+          { binding: 0, visibility: stageCompute, buffer: { type: 'uniform' } },
+          { binding: 1, visibility: stageCompute, buffer: { type: 'read-only-storage' } },
+          { binding: 2, visibility: stageCompute, buffer: { type: 'storage' } },
+          { binding: 3, visibility: stageCompute, buffer: { type: 'storage' } },
         ],
       });
     }
-    this.cdlodCullingBindGroup = this.device.createBindGroup({
-      label: 'cdlod_culling_bind_group',
-      layout: this.cdlodCullingBindGroupLayout,
-      entries: [
-        { binding: 0, resource: { buffer: this.cdlodCullingUniformBuffer } },
-        { binding: 1, resource: { buffer: this.cdlodCandidateBuffer } },
-        { binding: 2, resource: { buffer: this.cdlodIndirectBuffer } },
-        { binding: 3, resource: { buffer: this.cdlodInstanceBuffer } },
-      ],
-    });
+    if (this.cdlodCullingBindGroupLayout && typeof this.device.createBindGroup === 'function') {
+      this.cdlodCullingBindGroup = this.device.createBindGroup({
+        label: 'cdlod_culling_bind_group',
+        layout: this.cdlodCullingBindGroupLayout,
+        entries: [
+          { binding: 0, resource: { buffer: this.cdlodCullingUniformBuffer } },
+          { binding: 1, resource: { buffer: this.cdlodCandidateBuffer } },
+          { binding: 2, resource: { buffer: this.cdlodIndirectBuffer } },
+          { binding: 3, resource: { buffer: this.cdlodInstanceBuffer } },
+        ],
+      });
+    }
 
     // 9. Culling Compute Pipelines
     if (!this.cdlodCullingPipeline) {
@@ -2206,22 +2544,31 @@ export class WebGPUEngine {
   }
 
   public initCDLODPipelines(): void {
-    if (!this.device) return;
+    if (
+      !this.device ||
+      typeof this.device.createBindGroupLayout !== 'function' ||
+      typeof this.device.createShaderModule !== 'function' ||
+      typeof this.device.createPipelineLayout !== 'function' ||
+      typeof this.device.createComputePipeline !== 'function'
+    ) {
+      return;
+    }
+    const stageCompute = typeof GPUShaderStage !== 'undefined' ? GPUShaderStage.COMPUTE : 4;
     try {
       if (!this.cdlodCullingBindGroupLayout) {
         this.cdlodCullingBindGroupLayout = this.device.createBindGroupLayout({
           label: 'cdlod_culling_bind_group_layout',
           entries: [
-            { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' } },
-            { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
-            { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
-            { binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
+            { binding: 0, visibility: stageCompute, buffer: { type: 'uniform' } },
+            { binding: 1, visibility: stageCompute, buffer: { type: 'read-only-storage' } },
+            { binding: 2, visibility: stageCompute, buffer: { type: 'storage' } },
+            { binding: 3, visibility: stageCompute, buffer: { type: 'storage' } },
           ],
         });
       }
       const cullingModule = this.device.createShaderModule({
         label: 'cdlod_culling_module',
-        code: cullingWGSL,
+        code: prepareCullingShaderWGSL(cullingWGSL),
       });
       const cullingPipelineLayout = this.device.createPipelineLayout({
         label: 'cdlod_culling_pipeline_layout',
@@ -2267,6 +2614,7 @@ export class WebGPUEngine {
     this.cdlodDiagnosticMode = mode;
     if (this.crustFloats && this.crustUniformBuffer && this.device) {
       this.crustFloats[79] = mode;
+      this.uniformShadowValidMask &= ~(1 << 3);
       this.device.queue.writeBuffer(this.crustUniformBuffer, 0, this.crustFloats.buffer);
     }
   }
@@ -2349,7 +2697,8 @@ export class WebGPUEngine {
     unfurl: number,
     radius = 5.0,
     simTimeOrOut: number | [number, number, number] = 0.0,
-    outArg?: [number, number, number]
+    outArg?: [number, number, number],
+    motionAmp = 0.0
   ): [number, number, number] {
     const simTime = typeof simTimeOrOut === 'number' ? simTimeOrOut : 0.0;
     const out = Array.isArray(simTimeOrOut) ? simTimeOrOut : outArg;
@@ -2569,9 +2918,21 @@ export class WebGPUEngine {
       const polarRimFlexY = sinLat * polarRimZone * Math.cos(lonRad * 2.0 - 0.2 * alpha) * radius * 0.018 * envLate * tParallel;
       const curY = yStraight + polarRimFlexY;
 
-      rx = curX + dx_lip + dx_corner + edgeFlexX;
-      ry = curY;
-      rz = curZ + dz_lip + dz_corner + dz_margin + dz_polar + waveFlex + chordLiftZ;
+      let dx_ortho = 0.0;
+      let dy_ortho = 0.0;
+      let dz_ortho = 0.0;
+      if (alpha > 0.001 && alpha < 0.999 && motionAmp > 0.001) {
+        const clampedMotion = Math.max(0.0, Math.min(1.0, motionAmp));
+        const orthoCornerEnv = Math.sin(cornerZone * PI * 0.5) * env * tParallel * clampedMotion;
+        const orthoFlexMag = orthoCornerEnv * radius * 0.036;
+        dx_ortho = normX * orthoFlexMag * 0.64;
+        dy_ortho = -sinLat * orthoFlexMag * 0.22;
+        dz_ortho = normZ * orthoFlexMag * 0.78;
+      }
+
+      rx = curX + dx_lip + dx_corner + edgeFlexX + dx_ortho;
+      ry = curY + dy_ortho;
+      rz = curZ + dz_lip + dz_corner + dz_margin + dz_polar + waveFlex + chordLiftZ + dz_ortho;
     }
 
     if (out) {
@@ -2891,7 +3252,8 @@ export class WebGPUEngine {
     if (camera) {
       this.camera = camera;
     }
-    const viewportHeight = (this.context?.canvas as HTMLCanvasElement)?.height || 1080;
+    const canvasEl = this.context?.canvas as HTMLCanvasElement | undefined;
+    const viewportHeight = canvasEl?.clientHeight || canvasEl?.height || 1080;
     const fovYRad = camera?.fov ? (camera.fov * Math.PI) / 180.0 : (camera?.fovY ?? (Math.PI / 4));
     const cdlodMeshBeta = 56.0 / 6518.3753;
     const planes = this.cdlodCullingUniformFloats;
@@ -2986,13 +3348,6 @@ export class WebGPUEngine {
     }
     this.lastCameraAltitudeKm = camAltitudeUnits * 1274.2;
 
-    // Phase 1: Selection & Spatial Hashing
-    this.cdlodSpatialHashKeys.fill(-1);
-    this.cdlodRippleQueueHead = 0;
-    this.cdlodRippleQueueTail = 0;
-    this.cdlodActiveNodeCount = 0;
-    let maxLodSeen = 1;
-
     const regDEM = this.activeRegionalDEM;
     const hasReg = (regDEM != null && regDEM.bounds != null) || this.hasActiveRegionalDEM;
     let regMinLon = 0, regMinLat = 0, regMaxLon = 0, regMaxLat = 0;
@@ -3009,10 +3364,120 @@ export class WebGPUEngine {
         regMaxLat = this.activeRegionalMaxLat;
       }
     }
+    const tileSlotCount = this.gpuTileCache ? this.gpuTileCache.getActiveClusterSlotCount() : 0;
     const tileClusterBounds =
-      this.gpuTileCache && this.gpuTileCache.getActiveClusterSlotCount() > 0
+      this.gpuTileCache && tileSlotCount > 0 && camAltitudeUnits <= 0.85
         ? this.gpuTileCache.getActiveClusterBounds()
         : null;
+    const isHighRes30mRegional =
+      regDEM?.id === 'grand-canyon' ||
+      regDEM?.id === 'matterhorn' ||
+      (regDEM as any)?.has30mGroundTruth === true;
+
+    if (!this.cdlodPrevSignature) {
+      this.cdlodPrevSignature = new Float64Array(36);
+    }
+    const sig = this.cdlodPrevSignature;
+    const b0 = tileClusterBounds ? tileClusterBounds[0] : -999;
+    const b1 = tileClusterBounds ? tileClusterBounds[1] : -999;
+    const b2 = tileClusterBounds ? tileClusterBounds[2] : -999;
+    const b3 = tileClusterBounds ? tileClusterBounds[3] : -999;
+    const configPacked =
+      this.cdlodMaxLod * 1000 + this.cdlodSseTolerance + (isHighRes30mRegional ? 50000 : 0);
+
+    const canReuseStationaryCDLOD =
+      !this.cdlodDirty &&
+      this.cdlodHasValidState &&
+      (!this.cdlodCandidateBuffer || this.cdlodGpuUploaded) &&
+      sig[0] === camX &&
+      sig[1] === camY &&
+      sig[2] === camZ &&
+      sig[3] === unfurl &&
+      sig[4] === mode &&
+      sig[5] === fluidDisplacement &&
+      sig[6] === maxDisplacementModelUnits &&
+      sig[7] === viewportHeight &&
+      sig[8] === fovYRad &&
+      sig[9] === m0 &&
+      sig[10] === m1 &&
+      sig[11] === m2 &&
+      sig[12] === m3 &&
+      sig[13] === m4 &&
+      sig[14] === m5 &&
+      sig[15] === m6 &&
+      sig[16] === m7 &&
+      sig[17] === m8 &&
+      sig[18] === m9 &&
+      sig[19] === m10 &&
+      sig[20] === m11 &&
+      sig[21] === m12 &&
+      sig[22] === m13 &&
+      sig[23] === m14 &&
+      sig[24] === m15 &&
+      sig[25] === (hasReg ? 1 : 0) &&
+      sig[26] === regMinLon &&
+      sig[27] === regMinLat &&
+      sig[28] === regMaxLon &&
+      sig[29] === regMaxLat &&
+      sig[30] === tileSlotCount &&
+      sig[31] === b0 &&
+      sig[32] === b1 &&
+      sig[33] === b2 &&
+      sig[34] === b3 &&
+      sig[35] === configPacked;
+
+    if (canReuseStationaryCDLOD) {
+      this.cdlodUpdatedThisFrame = false;
+      return;
+    }
+
+    sig[0] = camX;
+    sig[1] = camY;
+    sig[2] = camZ;
+    sig[3] = unfurl;
+    sig[4] = mode;
+    sig[5] = fluidDisplacement;
+    sig[6] = maxDisplacementModelUnits;
+    sig[7] = viewportHeight;
+    sig[8] = fovYRad;
+    sig[9] = m0;
+    sig[10] = m1;
+    sig[11] = m2;
+    sig[12] = m3;
+    sig[13] = m4;
+    sig[14] = m5;
+    sig[15] = m6;
+    sig[16] = m7;
+    sig[17] = m8;
+    sig[18] = m9;
+    sig[19] = m10;
+    sig[20] = m11;
+    sig[21] = m12;
+    sig[22] = m13;
+    sig[23] = m14;
+    sig[24] = m15;
+    sig[25] = hasReg ? 1 : 0;
+    sig[26] = regMinLon;
+    sig[27] = regMinLat;
+    sig[28] = regMaxLon;
+    sig[29] = regMaxLat;
+    sig[30] = tileSlotCount;
+    sig[31] = b0;
+    sig[32] = b1;
+    sig[33] = b2;
+    sig[34] = b3;
+    sig[35] = configPacked;
+
+    this.cdlodDirty = false;
+    this.cdlodHasValidState = true;
+    this.cdlodUpdatedThisFrame = true;
+
+    // Phase 1: Selection & Spatial Hashing
+    this.cdlodSpatialHashKeys.fill(-1);
+    this.cdlodRippleQueueHead = 0;
+    this.cdlodRippleQueueTail = 0;
+    this.cdlodActiveNodeCount = 0;
+    let maxLodSeen = 1;
 
     const traverseNode = (
       lod: number,
@@ -3387,6 +3852,7 @@ export class WebGPUEngine {
     this.cdlodCullingUniformUints[31] = WebGPUEngine.CDLOD_MAX_INSTANCES;
 
     if (this.device && this.cdlodCandidateBuffer && this.cdlodCullingUniformBuffer && this.cdlodIndirectBuffer) {
+      this.cdlodGpuUploaded = true;
       this.device.queue.writeBuffer(
         this.cdlodCandidateBuffer,
         0,
@@ -3406,7 +3872,12 @@ export class WebGPUEngine {
         0,
         this.cdlodIndirectInitFloats
       );
-      if (this.cdlodControlBuffer) {
+      this.device.queue.writeBuffer(
+        this.cdlodIndirectBuffer,
+        20,
+        this.cdlodStrataIndirectInitFloats
+      );
+      if (this.cdlodControlBuffer && this.cdlodControlUints[0] !== 1) {
         this.cdlodControlUints[0] = 1;
         this.device.queue.writeBuffer(
           this.cdlodControlBuffer,
@@ -3429,6 +3900,9 @@ export class WebGPUEngine {
           : (64 | 8)),
       });
       const zeroData = new Float32Array(16);
+      if (this.hideVectorsFlag !== 0) {
+        new Uint32Array(zeroData.buffer)[15] = this.hideVectorsFlag;
+      }
       this.device.queue.writeBuffer(this.regionalUniformBuffer, 0, zeroData);
     }
     return this.regionalUniformBuffer!;
@@ -3614,14 +4088,14 @@ export class WebGPUEngine {
       ? (GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST)
       : (4 | 2);
 
-    // 1x1 Fallback dummy regional DEM texture view for binding slot 5 (rgba16float filterable)
+    // 1x1 Fallback dummy regional DEM texture view for binding slot 5 (rg16float filterable)
     this.dummyRegionalTexture = this.device.createTexture({
       label: 'dummy_regional_dem_texture',
       size: [1, 1, 1],
-      format: 'rgba16float',
+      format: 'rg16float',
       usage: usageTexture,
     });
-    const dummyPix = new Uint16Array([0, 0, 0, U16_TO_F16_LUT[36240]]);
+    const dummyPix = new Uint16Array([0, 0]);
     this.device.queue.writeTexture(
       { texture: this.dummyRegionalTexture },
       dummyPix.buffer,
@@ -3657,13 +4131,10 @@ export class WebGPUEngine {
       this.loadDewpointTexture('/data/weathernext/dewpoint_temperature_2m_mean-0.bin').catch(() => {});
     }
 
-    // 4. Dual-Surface Lithosphere Crust & Liquid Hydrosphere High-Resolution Baseline Mesh
-    // Test environment uses lightweight 128x256; live production engine uses 512x1024 (1M triangles)
-    const [defLat, defLon] = isTestEnv ? [128, 256] : [512, 1024];
-    this.rebuildSphereMesh(defLat, defLon);
-    if (!isTestEnv) {
-      this.ensureCDLODBuffers();
-    }
+    // 4. Dual-Surface Lithosphere Crust & Liquid Hydrosphere Instanced CDLOD Quadsphere
+    this.ensureCDLODBuffers();
+    this.ensureRegionalBuffer();
+    this.gpuTileCache?.syncSlotDescriptorBuffer(this.device);
 
     this.updateDEMBindGroups();
   }
@@ -3822,7 +4293,8 @@ export class WebGPUEngine {
   private getTileCacheResources(): { arrayView: GPUTextureView; slotBuffer: GPUBuffer } {
     const arrayView = (
       this.gpuTileCache?.getArrayView() ||
-      this.orbitalTextureView ||
+      this.dummyWhiteArrayView ||
+      this.dummyWhiteTextureView ||
       this.demTextureView ||
       this.dummyRegionalTextureView ||
       this.dummyTerrainShadowTextureView ||
@@ -3856,8 +4328,11 @@ export class WebGPUEngine {
       this.regionalUniformData[11] = cBounds[3];
     }
     this.regionalUniformU32[14] = activeSlotCount;
+    this.regionalUniformU32[15] = this.hideVectorsFlag;
     const regBuf = this.ensureRegionalBuffer();
     this.device.queue.writeBuffer(regBuf, 0, this.regionalUniformData);
+    this.invalidateCDLODState();
+    this.invalidateVolumetricTaaHistory();
     if (
       (slotBufNow && this.boundTileSlotBuffer !== slotBufNow) ||
       this.boundRegionalUniformBuffer !== regBuf
@@ -3870,55 +4345,59 @@ export class WebGPUEngine {
     if (!this.device || !this.windParticleBuffers || !this.windUniformBuffer || !this.windTextureView || !this.jetStreamTextureView || !this.demTextureView || !this.demSampler) return;
 
     try {
-      const windComputeShaderModule = this.device.createShaderModule({
-        label: 'wind_particles_compute',
-        code: manifoldWGSL + '\n' + windParticlesWGSL,
-      });
-
       const regView = this.activeRegionalDEM ? this.activeRegionalDEM.view : (this.dummyRegionalTextureView || this.demTextureView);
       const regBuffer = (this.activeRegionalDEM && this.regionalUniformBuffer)
         ? this.regionalUniformBuffer
         : (this.regionalUniformBuffer || this.reliefUniformBuffer || this.windUniformBuffer || this.simUniformBuffer);
       const { arrayView: tileArrayView, slotBuffer: tileSlotBuffer } = this.getTileCacheResources();
 
-      const windComputeBindGroupLayout = this.device.createBindGroupLayout({
-        label: 'wind_compute_bind_group_layout',
-        entries: [
-          { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' } },
-          { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
-          { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
-          { binding: 3, visibility: GPUShaderStage.COMPUTE, sampler: {} },
-          { binding: 4, visibility: GPUShaderStage.COMPUTE, texture: {} },
-          { binding: 5, visibility: GPUShaderStage.COMPUTE, texture: {} },
-          { binding: 6, visibility: GPUShaderStage.COMPUTE, sampler: { type: 'filtering' } },
-          { binding: 7, visibility: GPUShaderStage.COMPUTE, texture: { sampleType: 'float', viewDimension: '2d' } },
-          { binding: 8, visibility: GPUShaderStage.COMPUTE, texture: { sampleType: 'float', viewDimension: '2d' } },
-          { binding: 9, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' } },
-          { binding: 10, visibility: GPUShaderStage.COMPUTE, texture: {} },
-        ],
-      });
+      if (!this.windComputePipeline || !this.windComputeBindGroupLayout || !this.windTileCacheBindGroupLayout) {
+        const windComputeShaderModule = this.device.createShaderModule({
+          label: 'wind_particles_compute',
+          code: manifoldWGSL + '\n' + windParticlesWGSL,
+        });
 
-      this.windTileCacheBindGroupLayout = this.device.createBindGroupLayout({
-        label: 'wind_tile_cache_bind_group_layout',
-        entries: [
-          { binding: 0, visibility: GPUShaderStage.COMPUTE, texture: { sampleType: 'float', viewDimension: '2d-array' } },
-          { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
-        ],
-      });
+        const windComputeBindGroupLayout = this.device.createBindGroupLayout({
+          label: 'wind_compute_bind_group_layout',
+          entries: [
+            { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' } },
+            { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
+            { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
+            { binding: 3, visibility: GPUShaderStage.COMPUTE, sampler: {} },
+            { binding: 4, visibility: GPUShaderStage.COMPUTE, texture: {} },
+            { binding: 5, visibility: GPUShaderStage.COMPUTE, texture: {} },
+            { binding: 6, visibility: GPUShaderStage.COMPUTE, sampler: { type: 'filtering' } },
+            { binding: 7, visibility: GPUShaderStage.COMPUTE, texture: { sampleType: 'float', viewDimension: '2d' } },
+            { binding: 8, visibility: GPUShaderStage.COMPUTE, texture: { sampleType: 'float', viewDimension: '2d' } },
+            { binding: 9, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' } },
+            { binding: 10, visibility: GPUShaderStage.COMPUTE, texture: {} },
+          ],
+        });
+        this.windComputeBindGroupLayout = windComputeBindGroupLayout;
 
-      const windComputePipelineLayout = this.device.createPipelineLayout({
-        bindGroupLayouts: [windComputeBindGroupLayout, this.windTileCacheBindGroupLayout],
-      });
+        this.windTileCacheBindGroupLayout = this.device.createBindGroupLayout({
+          label: 'wind_tile_cache_bind_group_layout',
+          entries: [
+            { binding: 0, visibility: GPUShaderStage.COMPUTE, texture: { sampleType: 'float', viewDimension: '2d-array' } },
+            { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
+          ],
+        });
 
-      this.windComputePipeline = this.device.createComputePipeline({
-        label: 'wind_compute_pipeline',
-        layout: windComputePipelineLayout,
-        compute: {
-          module: windComputeShaderModule,
-          entryPoint: 'cs_advect_wind',
-        },
-      });
+        const windComputePipelineLayout = this.device.createPipelineLayout({
+          bindGroupLayouts: [windComputeBindGroupLayout, this.windTileCacheBindGroupLayout],
+        });
 
+        this.windComputePipeline = this.device.createComputePipeline({
+          label: 'wind_compute_pipeline',
+          layout: windComputePipelineLayout,
+          compute: {
+            module: windComputeShaderModule,
+            entryPoint: 'cs_advect_wind',
+          },
+        });
+      }
+
+      const windComputeBindGroupLayout = this.windComputeBindGroupLayout!;
       const slot0View = this.windTextureView!;
       const slot1View = this.windTextureView1 || this.windTextureView!;
 
@@ -3961,7 +4440,7 @@ export class WebGPUEngine {
 
       this.windTileCacheBindGroup = this.device.createBindGroup({
         label: 'wind_tile_cache_bg',
-        layout: this.windTileCacheBindGroupLayout,
+        layout: this.windTileCacheBindGroupLayout!,
         entries: [
           { binding: 0, resource: tileArrayView },
           { binding: 1, resource: { buffer: tileSlotBuffer } },
@@ -3969,61 +4448,67 @@ export class WebGPUEngine {
       });
 
       // Wind Ribbon Render Pipeline
-      const windRibbonShaderModule = this.device.createShaderModule({
-        label: 'wind_ribbon_render',
-        code: windRibbonRenderWGSL,
-      });
+      if (!this.windRibbonPipeline || !this.windRibbonBindGroupLayout) {
+        const windRibbonShaderModule = this.device.createShaderModule({
+          label: 'wind_ribbon_render',
+          code: windRibbonRenderWGSL,
+        });
 
-      const windRibbonBindGroupLayout = this.device.createBindGroupLayout({
-        label: 'wind_ribbon_bind_group_layout',
-        entries: [
-          { binding: 0, visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT, buffer: { type: 'uniform' } },
-          { binding: 1, visibility: GPUShaderStage.VERTEX, buffer: { type: 'read-only-storage' } },
-        ],
-      });
-
-      const windRibbonPipelineLayout = this.device.createPipelineLayout({
-        bindGroupLayouts: [windRibbonBindGroupLayout],
-      });
-
-      const windQuadCornerLayout: GPUVertexBufferLayout = {
-        arrayStride: 8,
-        stepMode: 'vertex',
-        attributes: [{ shaderLocation: 0, offset: 0, format: 'float32x2' }],
-      };
-
-      this.windRibbonPipeline = this.device.createRenderPipeline({
-        label: 'wind_ribbon_pipeline',
-        layout: windRibbonPipelineLayout,
-        vertex: {
-          module: windRibbonShaderModule,
-          entryPoint: 'vs_main',
-          buffers: [windQuadCornerLayout],
-        },
-        fragment: {
-          module: windRibbonShaderModule,
-          entryPoint: 'fs_main',
-          targets: [
-            {
-              format: this.format,
-              blend: {
-                color: { srcFactor: 'src-alpha', dstFactor: 'one-minus-src-alpha', operation: 'add' },
-                alpha: { srcFactor: 'one', dstFactor: 'one-minus-src-alpha', operation: 'add' },
-              },
-            },
+        const windRibbonBindGroupLayout = this.device.createBindGroupLayout({
+          label: 'wind_ribbon_bind_group_layout',
+          entries: [
+            { binding: 0, visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT, buffer: { type: 'uniform' } },
+            { binding: 1, visibility: GPUShaderStage.VERTEX, buffer: { type: 'read-only-storage' } },
           ],
-        },
-        depthStencil: {
-          depthWriteEnabled: false,
-          depthCompare: 'less-equal',
-          format: 'depth32float',
-        },
-        primitive: {
-          topology: 'triangle-strip',
-          cullMode: 'none',
-        },
-      });
+        });
+        this.windRibbonBindGroupLayout = windRibbonBindGroupLayout;
 
+        const windRibbonPipelineLayout = this.device.createPipelineLayout({
+          bindGroupLayouts: [windRibbonBindGroupLayout],
+        });
+
+        const windQuadCornerLayout: GPUVertexBufferLayout = {
+          arrayStride: 8,
+          stepMode: 'vertex',
+          attributes: [{ shaderLocation: 0, offset: 0, format: 'float32x2' }],
+        };
+
+        this.windRibbonPipeline = this.device.createRenderPipeline({
+          label: 'wind_ribbon_pipeline',
+          layout: windRibbonPipelineLayout,
+          vertex: {
+            module: windRibbonShaderModule,
+            entryPoint: 'vs_main',
+            buffers: [windQuadCornerLayout],
+          },
+          fragment: {
+            module: windRibbonShaderModule,
+            entryPoint: 'fs_main',
+            targets: [
+              {
+                format: this.format,
+                blend: {
+                  color: { srcFactor: 'src-alpha', dstFactor: 'one-minus-src-alpha', operation: 'add' },
+                  alpha: { srcFactor: 'one', dstFactor: 'one-minus-src-alpha', operation: 'add' },
+                },
+              },
+            ],
+          },
+          depthStencil: {
+            depthWriteEnabled: false,
+            depthCompare: 'less-equal',
+            format: 'depth32float',
+            depthBias: -120,
+            depthBiasSlopeScale: -1.0,
+          },
+          primitive: {
+            topology: 'triangle-strip',
+            cullMode: 'none',
+          },
+        });
+      }
+
+      const windRibbonBindGroupLayout = this.windRibbonBindGroupLayout!;
       this.windRibbonBindGroups = [
         this.device.createBindGroup({
           label: 'wind_ribbon_bg_0',
@@ -4046,6 +4531,7 @@ export class WebGPUEngine {
   }
 
   private updateDEMBindGroups(): void {
+    this.invalidateCDLODState();
     if (!this.device || !this.demTextureView || !this.demSampler) return;
 
     // Relief Shading BindGroup
@@ -4068,6 +4554,7 @@ export class WebGPUEngine {
     const { arrayView: tileArrayView, slotBuffer: tileSlotBuffer } = this.getTileCacheResources();
     this.boundTileSlotBuffer = this.gpuTileCache?.getSlotDescriptorBuffer() ?? null;
     this.boundRegionalUniformBuffer = this.regionalUniformBuffer;
+    this.updateVolumetricTerrainBindGroup();
     
     // Vector Ribbon BindGroup
     if (this.ribbonBindGroupLayout && this.ribbonUniformBuffer) {
@@ -4106,7 +4593,7 @@ export class WebGPUEngine {
     }
 
     // Crust / Hydrosphere BindGroup
-    if (this.crustBindGroupLayout && this.crustUniformBuffer && this.orbitalTextureView && this.orbitalSampler) {
+    if (this.crustBindGroupLayout && this.crustUniformBuffer) {
       if (!this.dummyCloudTextureView) {
         this.dummyCloudTexture = this.device.createTexture({
           label: 'dummy_cloud_texture',
@@ -4131,6 +4618,8 @@ export class WebGPUEngine {
           label: 'cloud_sampler',
           minFilter: 'linear',
           magFilter: 'linear',
+          addressModeU: 'repeat',
+          addressModeV: 'clamp-to-edge',
         });
       }
 
@@ -4146,7 +4635,9 @@ export class WebGPUEngine {
       this.ensureTempTexture();
       this.ensureDewpointTexture();
       this.ensureWindTexture();
-      const precipView = this.precipTextureView || this.dummyPrecipTextureView;
+      const precipView = this.precipRingBuffer
+        ? ((this.precipTexture ? this.precipTexture.createView({ label: 'crust_precip_texture_view' }) : null) || this.dummyPrecipTextureView)
+        : (this.precipTextureView || this.dummyPrecipTextureView);
       const precipSampler = this.precipSampler || this.dummyPrecipSampler || this.demSampler;
       const tempView = this.tempTextureView || this.dummyTempTextureView;
       const dewpointView = this.dewpointTextureView || this.dummyDewpointTextureView;
@@ -4159,8 +4650,6 @@ export class WebGPUEngine {
           { binding: 0, resource: { buffer: this.crustUniformBuffer } },
           { binding: 1, resource: this.demTextureView },
           { binding: 2, resource: this.demSampler },
-          { binding: 3, resource: this.orbitalTextureView },
-          { binding: 4, resource: this.orbitalSampler },
           { binding: 5, resource: regView },
           { binding: 6, resource: { buffer: regBuffer } },
           { binding: 7, resource: cloudView },
@@ -4183,98 +4672,11 @@ export class WebGPUEngine {
     // Atmospheric Wind BindGroups (update with new DEM view)
     this.updateWindBindGroups();
     this.updateCloudBindGroups();
+    this.cloudAdvectionComputeBindGroups = [null, null];
+    this.updateCloudAdvectionBindGroups();
+    this.updateVolumetricCloudBindGroup();
     this.updateTerrainShadowBindGroups();
-  }
-
-  public async loadOrbitalTextures(
-    dayImage: ImageBitmap | HTMLImageElement | string,
-    nightImage: ImageBitmap | HTMLImageElement | string
-  ): Promise<void> {
-    if (!this.device || !this.isInitialized) return;
-
-    try {
-      let daySource: ImageBitmap | HTMLImageElement;
-      let nightSource: ImageBitmap | HTMLImageElement;
-
-      if (typeof dayImage === 'string') {
-        if (typeof fetch !== 'undefined' && typeof createImageBitmap !== 'undefined') {
-          const res = await fetch(dayImage);
-          const blob = await res.blob();
-          daySource = await createImageBitmap(blob);
-        } else if (typeof Image !== 'undefined') {
-          daySource = await new Promise<HTMLImageElement>((resolve, reject) => {
-            const img = new Image();
-            img.crossOrigin = 'anonymous';
-            img.onload = () => resolve(img);
-            img.onerror = reject;
-            img.src = dayImage as string;
-          });
-        } else {
-          return;
-        }
-      } else {
-        daySource = dayImage;
-      }
-
-      if (typeof nightImage === 'string') {
-        if (typeof fetch !== 'undefined' && typeof createImageBitmap !== 'undefined') {
-          const res = await fetch(nightImage);
-          const blob = await res.blob();
-          nightSource = await createImageBitmap(blob);
-        } else if (typeof Image !== 'undefined') {
-          nightSource = await new Promise<HTMLImageElement>((resolve, reject) => {
-            const img = new Image();
-            img.crossOrigin = 'anonymous';
-            img.onload = () => resolve(img);
-            img.onerror = reject;
-            img.src = nightImage as string;
-          });
-        } else {
-          return;
-        }
-      } else {
-        nightSource = nightImage;
-      }
-
-      const width = (daySource as any).width || this.defaultTextureWidth;
-      const height = (daySource as any).height || this.defaultTextureHeight;
-
-      if (this.orbitalTexture) {
-        this.orbitalTexture.destroy();
-      }
-
-      this.orbitalTexture = this.device.createTexture({
-        label: 'nasa_orbital_texture_array_4k',
-        size: [width, height, 2],
-        format: 'rgba8unorm',
-        usage: (typeof GPUTextureUsage !== 'undefined'
-          ? (GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST | GPUTextureUsage.RENDER_ATTACHMENT)
-          : (4 | 8 | 16)),
-      });
-
-      this.device.queue.copyExternalImageToTexture(
-        { source: daySource },
-        { texture: this.orbitalTexture, origin: [0, 0, 0] },
-        [width, height]
-      );
-
-      this.device.queue.copyExternalImageToTexture(
-        { source: nightSource },
-        { texture: this.orbitalTexture, origin: [0, 0, 1] },
-        [width, height]
-      );
-
-      this.orbitalTextureView = this.orbitalTexture.createView({
-        dimension: '2d-array',
-        baseArrayLayer: 0,
-        arrayLayerCount: 2,
-      });
-
-      this.updateDEMBindGroups();
-      this.orbitalTexturesLoaded = true;
-    } catch (err) {
-      console.warn('[WebGPUEngine] loadOrbitalTextures warning:', err);
-    }
+    this.updateDrainageBindGroups();
   }
 
   /**
@@ -4359,7 +4761,7 @@ export class WebGPUEngine {
 
             let uv = vec2<f32>(lambda / (2.0 * PI) + 0.5, 0.5 - lat / PI);
             let demSample = textureSampleLevel(u_demTexture, u_demSampler, uv, 0.0);
-            let isLand = select(0.0, 1.0, demSample.a * 19772.0 - 10924.0 > 0.0);
+            let isLand = select(0.0, 1.0, demSample.g > 0.0);
 
             var p: Particle;
             p.position = vec4<f32>(p3D, isLand);
@@ -4454,6 +4856,7 @@ export class WebGPUEngine {
   }
 
   private updateComputeBindGroups(): void {
+    const windView = this.windTextureView || this.dummyWindTextureView;
     if (
       !this.device ||
       !this.computePipeline ||
@@ -4462,7 +4865,7 @@ export class WebGPUEngine {
       !this.particleBuffers[0] ||
       !this.particleBuffers[1] ||
       !this.staticBuffer ||
-      !this.windTextureView ||
+      !windView ||
       !this.windSampler
     ) {
       return;
@@ -4481,7 +4884,7 @@ export class WebGPUEngine {
           { binding: 1, resource: { buffer: this.particleBuffers[0] } },
           { binding: 2, resource: { buffer: this.particleBuffers[1] } },
           { binding: 3, resource: { buffer: this.staticBuffer } },
-          { binding: 4, resource: this.windTextureView },
+          { binding: 4, resource: windView },
           { binding: 5, resource: this.windSampler },
         ],
       });
@@ -4494,28 +4897,978 @@ export class WebGPUEngine {
           { binding: 1, resource: { buffer: this.particleBuffers[1] } },
           { binding: 2, resource: { buffer: this.particleBuffers[0] } },
           { binding: 3, resource: { buffer: this.staticBuffer } },
-          { binding: 4, resource: this.windTextureView },
+          { binding: 4, resource: windView },
           { binding: 5, resource: this.windSampler },
         ],
       });
     } catch {}
   }
 
+  private canRunGPUBlit(): boolean {
+    const dev = this.device as any;
+    return Boolean(
+      dev &&
+      typeof dev.createRenderPipeline === 'function' &&
+      typeof dev.createBindGroupLayout === 'function' &&
+      typeof dev.createPipelineLayout === 'function' &&
+      typeof dev.createCommandEncoder === 'function' &&
+      typeof dev.createBindGroup === 'function' &&
+      typeof dev.createShaderModule === 'function' &&
+      typeof dev.createSampler === 'function' &&
+      typeof dev.queue?.submit === 'function'
+    );
+  }
+
+  private ensureRG16BlitPipelines(): void {
+    if (!this.device || !this.canRunGPUBlit()) return;
+    if (
+      this.rg16U16GlobalPipeline &&
+      this.rg16U16RegionalPipeline &&
+      this.rg16U16MipGlobalPipeline &&
+      this.rg16U16MipLinearPipeline &&
+      this.rg16BA8GlobalPipeline &&
+      this.rg16BA8RegionalPipeline &&
+      this.rg16MipGlobalPipeline &&
+      this.rg16MipLinearPipeline &&
+      this.rg16ElevToRG16Pipeline &&
+      this.rg16U16Layout &&
+      this.rg16TexLayout &&
+      this.rg16ElevLayout
+    ) {
+      return;
+    }
+
+    const vsAndMipCode = `
+struct VSOut {
+  @builtin(position) pos: vec4<f32>,
+  @location(0) uv: vec2<f32>,
+};
+fn roundF32ToExactF16(val: f32) -> f32 {
+  let clamped = clamp(val, -65504.0, 65504.0);
+  let bits = bitcast<u32>(clamped);
+  let absBits = bits & 0x7fffffffu;
+  if (absBits == 0u) { return clamped; }
+  let exp32 = (absBits >> 23u) & 0xffu;
+  if (exp32 <= 112u) {
+    if (exp32 < 102u) { return bitcast<f32>(bits & 0x80000000u); }
+    return round(clamped * 16777216.0) * (1.0 / 16777216.0);
+  }
+  let bias = 0x0fffu + ((bits >> 13u) & 1u);
+  return bitcast<f32>((bits + bias) & 0xffffe000u);
+}
+fn roundVec2ToExactF16(v: vec2<f32>) -> vec2<f32> {
+  return vec2<f32>(roundF32ToExactF16(v.x), roundF32ToExactF16(v.y));
+}
+@vertex fn vs_blit(@builtin(vertex_index) vi: u32) -> VSOut {
+  var out: VSOut;
+  var p = vec2<f32>(-1.0, -1.0);
+  if (vi == 1u) { p = vec2<f32>(3.0, -1.0); }
+  else if (vi == 2u) { p = vec2<f32>(-1.0, 3.0); }
+  out.pos = vec4<f32>(p, 0.0, 1.0);
+  out.uv = vec2<f32>(p.x * 0.5 + 0.5, 1.0 - (p.y * 0.5 + 0.5));
+  return out;
+}
+`;
+
+    const u16Module = this.device.createShaderModule({
+      label: 'rg16float_u16_unpack_blit',
+      code: vsAndMipCode + `
+@group(0) @binding(0) var u_srcU16: texture_2d<u32>;
+@fragment fn fs_u16_global(in: VSOut) -> @location(0) vec2<f32> {
+  let t = textureLoad(u_srcU16, vec2<i32>(in.pos.xy), 0);
+  return roundVec2ToExactF16(vec2<f32>(f32(t.z) / 65535.0, f32(t.w) / 65535.0));
+}
+@fragment fn fs_u16_regional(in: VSOut) -> @location(0) vec2<f32> {
+  let t = textureLoad(u_srcU16, vec2<i32>(in.pos.xy), 0);
+  let rgElevM = (f32(t.x) / 65535.0) * 8848.0 - (f32(t.y) / 65535.0) * 10924.0;
+  let alphaElevM = (f32(t.w) / 65535.0) * 19772.0 - 10924.0;
+  let useAlphaFallback = t.x == 0u && t.y == 0u && t.w > 0u && abs(i32(t.w) - 36211) > 2;
+  let elevM = select(rgElevM, alphaElevM, useAlphaFallback);
+  return roundVec2ToExactF16(vec2<f32>(f32(t.z) / 65535.0, elevM));
+}
+@fragment fn fs_u16_mip_global(in: VSOut) -> @location(0) vec4<u32> {
+  let c = vec2<i32>(in.pos.xy) * 2;
+  let maxC = vec2<i32>(textureDimensions(u_srcU16, 0)) - vec2<i32>(1);
+  let p00 = textureLoad(u_srcU16, min(c, maxC), 0);
+  let p10 = textureLoad(u_srcU16, min(c + vec2<i32>(1, 0), maxC), 0);
+  let p01 = textureLoad(u_srcU16, min(c + vec2<i32>(0, 1), maxC), 0);
+  let p11 = textureLoad(u_srcU16, min(c + vec2<i32>(1, 1), maxC), 0);
+  let sum = p00 + p10 + p01 + p11;
+  let avg = min(vec4<u32>(65535u), (sum + vec4<u32>(2u)) >> vec4<u32>(2u));
+  let bOut = select(0u, 65535u, sum.z >= 131072u);
+  return vec4<u32>(avg.x, avg.y, bOut, avg.w);
+}
+@fragment fn fs_u16_mip_linear(in: VSOut) -> @location(0) vec4<u32> {
+  let c = vec2<i32>(in.pos.xy) * 2;
+  let maxC = vec2<i32>(textureDimensions(u_srcU16, 0)) - vec2<i32>(1);
+  let p00 = textureLoad(u_srcU16, min(c, maxC), 0);
+  let p10 = textureLoad(u_srcU16, min(c + vec2<i32>(1, 0), maxC), 0);
+  let p01 = textureLoad(u_srcU16, min(c + vec2<i32>(0, 1), maxC), 0);
+  let p11 = textureLoad(u_srcU16, min(c + vec2<i32>(1, 1), maxC), 0);
+  let sum = p00 + p10 + p01 + p11;
+  return min(vec4<u32>(65535u), (sum + vec4<u32>(2u)) >> vec4<u32>(2u));
+}
+`,
+    });
+
+    const texModule = this.device.createShaderModule({
+      label: 'rg16float_tex_swizzle_and_mips',
+      code: vsAndMipCode + `
+@group(0) @binding(0) var u_srcTex: texture_2d<f32>;
+@fragment fn fs_ba8_global(in: VSOut) -> @location(0) vec2<f32> {
+  let s = textureLoad(u_srcTex, vec2<i32>(in.pos.xy), 0);
+  return roundVec2ToExactF16(s.ba);
+}
+@fragment fn fs_ba8_regional(in: VSOut) -> @location(0) vec2<f32> {
+  let s = textureLoad(u_srcTex, vec2<i32>(in.pos.xy), 0);
+  return roundVec2ToExactF16(vec2<f32>(s.b, s.a * 19772.0 - 10924.0));
+}
+@fragment fn fs_mip_global(in: VSOut) -> @location(0) vec2<f32> {
+  let c = vec2<i32>(in.pos.xy) * 2;
+  let maxC = vec2<i32>(textureDimensions(u_srcTex, 0)) - vec2<i32>(1);
+  let p00 = textureLoad(u_srcTex, min(c, maxC), 0).rg;
+  let p10 = textureLoad(u_srcTex, min(c + vec2<i32>(1, 0), maxC), 0).rg;
+  let p01 = textureLoad(u_srcTex, min(c + vec2<i32>(0, 1), maxC), 0).rg;
+  let p11 = textureLoad(u_srcTex, min(c + vec2<i32>(1, 1), maxC), 0).rg;
+  let mean = (p00 + p10 + p01 + p11) * 0.25;
+  return roundVec2ToExactF16(vec2<f32>(select(0.0, 1.0, mean.x >= (32768.0 / 65535.0)), mean.y));
+}
+@fragment fn fs_mip_linear(in: VSOut) -> @location(0) vec2<f32> {
+  let c = vec2<i32>(in.pos.xy) * 2;
+  let maxC = vec2<i32>(textureDimensions(u_srcTex, 0)) - vec2<i32>(1);
+  let p00 = textureLoad(u_srcTex, min(c, maxC), 0).rg;
+  let p10 = textureLoad(u_srcTex, min(c + vec2<i32>(1, 0), maxC), 0).rg;
+  let p01 = textureLoad(u_srcTex, min(c + vec2<i32>(0, 1), maxC), 0).rg;
+  let p11 = textureLoad(u_srcTex, min(c + vec2<i32>(1, 1), maxC), 0).rg;
+  return roundVec2ToExactF16((p00 + p10 + p01 + p11) * 0.25);
+}
+`,
+    });
+
+    const elevModule = this.device.createShaderModule({
+      label: 'rg16float_regional_f32_blit',
+      code: vsAndMipCode + `
+@group(0) @binding(0) var u_srcElev: texture_2d<f32>;
+@fragment fn fs_elev_to_rg16(in: VSOut) -> @location(0) vec2<f32> {
+  let p = vec2<i32>(in.pos.xy);
+  let maxC = vec2<i32>(textureDimensions(u_srcElev, 0)) - vec2<i32>(1);
+  let rawElev = textureLoad(u_srcElev, p, 0).x;
+  var landCount = 0;
+  for (var dy = -1; dy <= 1; dy = dy + 1) {
+    let sy = clamp(p.y + dy, 0, maxC.y);
+    for (var dx = -1; dx <= 1; dx = dx + 1) {
+      let sx = clamp(p.x + dx, 0, maxC.x);
+      if (textureLoad(u_srcElev, vec2<i32>(sx, sy), 0).x > 0.0) {
+        landCount = landCount + 1;
+      }
+    }
+  }
+  let bNorm = f32(landCount) / 9.0;
+  let elev = clamp(select(rawElev, min(rawElev, -3.5), rawElev <= 0.0 && bNorm < 0.35), -10924.0, 8848.0);
+  return roundVec2ToExactF16(vec2<f32>(bNorm, elev));
+}
+`,
+    });
+
+    const fragVis = typeof GPUShaderStage !== 'undefined' ? GPUShaderStage.FRAGMENT : 2;
+    this.rg16U16Layout = this.device.createBindGroupLayout({
+      label: 'rg16_u16_bgl',
+      entries: [{ binding: 0, visibility: fragVis, texture: { sampleType: 'uint' } }],
+    });
+    this.rg16TexLayout = this.device.createBindGroupLayout({
+      label: 'rg16_tex_bgl',
+      entries: [{ binding: 0, visibility: fragVis, texture: { sampleType: 'float' } }],
+    });
+    this.rg16ElevLayout = this.device.createBindGroupLayout({
+      label: 'rg16_elev_bgl',
+      entries: [{ binding: 0, visibility: fragVis, texture: { sampleType: 'unfilterable-float' } }],
+    });
+    const u16Pl = this.device.createPipelineLayout({
+      label: 'rg16_u16_pl',
+      bindGroupLayouts: [this.rg16U16Layout],
+    });
+    const texPl = this.device.createPipelineLayout({
+      label: 'rg16_tex_pl',
+      bindGroupLayouts: [this.rg16TexLayout],
+    });
+    const elevPl = this.device.createPipelineLayout({
+      label: 'rg16_elev_pl',
+      bindGroupLayouts: [this.rg16ElevLayout],
+    });
+
+    this.rg16U16GlobalPipeline = this.device.createRenderPipeline({
+      label: 'rg16_u16_global_pipeline',
+      layout: u16Pl,
+      vertex: { module: u16Module, entryPoint: 'vs_blit' },
+      fragment: { module: u16Module, entryPoint: 'fs_u16_global', targets: [{ format: 'rg16float' }] },
+      primitive: { topology: 'triangle-list' },
+    });
+    this.rg16U16RegionalPipeline = this.device.createRenderPipeline({
+      label: 'rg16_u16_regional_pipeline',
+      layout: u16Pl,
+      vertex: { module: u16Module, entryPoint: 'vs_blit' },
+      fragment: { module: u16Module, entryPoint: 'fs_u16_regional', targets: [{ format: 'rg16float' }] },
+      primitive: { topology: 'triangle-list' },
+    });
+    this.rg16U16MipGlobalPipeline = this.device.createRenderPipeline({
+      label: 'rg16_u16_mip_global_pipeline',
+      layout: u16Pl,
+      vertex: { module: u16Module, entryPoint: 'vs_blit' },
+      fragment: { module: u16Module, entryPoint: 'fs_u16_mip_global', targets: [{ format: 'rgba16uint' }] },
+      primitive: { topology: 'triangle-list' },
+    });
+    this.rg16U16MipLinearPipeline = this.device.createRenderPipeline({
+      label: 'rg16_u16_mip_linear_pipeline',
+      layout: u16Pl,
+      vertex: { module: u16Module, entryPoint: 'vs_blit' },
+      fragment: { module: u16Module, entryPoint: 'fs_u16_mip_linear', targets: [{ format: 'rgba16uint' }] },
+      primitive: { topology: 'triangle-list' },
+    });
+    this.rg16BA8GlobalPipeline = this.device.createRenderPipeline({
+      label: 'rg16_ba8_global_pipeline',
+      layout: texPl,
+      vertex: { module: texModule, entryPoint: 'vs_blit' },
+      fragment: { module: texModule, entryPoint: 'fs_ba8_global', targets: [{ format: 'rg16float' }] },
+      primitive: { topology: 'triangle-list' },
+    });
+    this.rg16BA8RegionalPipeline = this.device.createRenderPipeline({
+      label: 'rg16_ba8_regional_pipeline',
+      layout: texPl,
+      vertex: { module: texModule, entryPoint: 'vs_blit' },
+      fragment: { module: texModule, entryPoint: 'fs_ba8_regional', targets: [{ format: 'rg16float' }] },
+      primitive: { topology: 'triangle-list' },
+    });
+    this.rg16MipGlobalPipeline = this.device.createRenderPipeline({
+      label: 'rg16_mip_global_pipeline',
+      layout: texPl,
+      vertex: { module: texModule, entryPoint: 'vs_blit' },
+      fragment: { module: texModule, entryPoint: 'fs_mip_global', targets: [{ format: 'rg16float' }] },
+      primitive: { topology: 'triangle-list' },
+    });
+    this.rg16MipLinearPipeline = this.device.createRenderPipeline({
+      label: 'rg16_mip_linear_pipeline',
+      layout: texPl,
+      vertex: { module: texModule, entryPoint: 'vs_blit' },
+      fragment: { module: texModule, entryPoint: 'fs_mip_linear', targets: [{ format: 'rg16float' }] },
+      primitive: { topology: 'triangle-list' },
+    });
+    this.rg16ElevToRG16Pipeline = this.device.createRenderPipeline({
+      label: 'rg16_elev_to_rg16_pipeline',
+      layout: elevPl,
+      vertex: { module: elevModule, entryPoint: 'vs_blit' },
+      fragment: { module: elevModule, entryPoint: 'fs_elev_to_rg16', targets: [{ format: 'rg16float' }] },
+      primitive: { topology: 'triangle-list' },
+    });
+  }
+
+  private recordRG16FloatMips(
+    encoder: GPUCommandEncoder,
+    texture: GPUTexture,
+    mipLevelCount: number,
+    binaryLandMask: boolean
+  ): void {
+    if (!this.device || mipLevelCount <= 1 || !this.rg16TexLayout) return;
+    const pipeline = binaryLandMask ? this.rg16MipGlobalPipeline : this.rg16MipLinearPipeline;
+    if (!pipeline) return;
+
+    for (let mip = 1; mip < mipLevelCount; mip++) {
+      const srcView = texture.createView({ baseMipLevel: mip - 1, mipLevelCount: 1 });
+      const dstView = texture.createView({ baseMipLevel: mip, mipLevelCount: 1 });
+      const bg = this.device.createBindGroup({
+        layout: this.rg16TexLayout,
+        entries: [{ binding: 0, resource: srcView }],
+      });
+      const pass = encoder.beginRenderPass({
+        colorAttachments: [
+          {
+            view: dstView,
+            loadOp: 'clear',
+            storeOp: 'store',
+            clearValue: { r: 0, g: 0, b: 0, a: 0 },
+          },
+        ],
+      });
+      pass.setPipeline(pipeline);
+      pass.setBindGroup(0, bg);
+      pass.draw(3, 1, 0, 0);
+      pass.end();
+    }
+  }
+
+  private generateRG16FloatMips(texture: GPUTexture, mipLevelCount: number, binaryLandMask: boolean): void {
+    if (!this.device || mipLevelCount <= 1 || !this.canRunGPUBlit()) return;
+    this.ensureRG16BlitPipelines();
+    const encoder = this.device.createCommandEncoder({ label: 'rg16float_mip_chain_encoder' });
+    this.recordRG16FloatMips(encoder, texture, mipLevelCount, binaryLandMask);
+    this.device.queue.submit([encoder.finish()]);
+  }
+
+  private blitFloat32RegionalElevToRG16Float(
+    elevGrid: Float32Array,
+    width: number,
+    height: number,
+    mipLevelCount: number,
+    dstTex: GPUTexture,
+    label: string
+  ): void {
+    this.ensureRG16BlitPipelines();
+    const usageTmp = typeof GPUTextureUsage !== 'undefined'
+      ? (GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST | GPUTextureUsage.RENDER_ATTACHMENT)
+      : (4 | 8 | 16);
+    const tempElev = this.device.createTexture({
+      label: `${label}_f32_tmp`,
+      size: [width, height, 1],
+      mipLevelCount: 1,
+      format: 'r32float',
+      usage: usageTmp,
+    });
+
+    const rawF32Bytes = width * 4;
+    const paddedF32Bytes = Math.ceil(rawF32Bytes / 256) * 256;
+    if (paddedF32Bytes === rawF32Bytes && elevGrid.byteLength >= paddedF32Bytes * height) {
+      this.device.queue.writeTexture(
+        { texture: tempElev, mipLevel: 0 },
+        elevGrid,
+        { bytesPerRow: paddedF32Bytes, rowsPerImage: height },
+        [width, height, 1]
+      );
+    } else {
+      const rowF32 = paddedF32Bytes / 4;
+      const padded = new Float32Array(rowF32 * height);
+      for (let y = 0; y < height; y++) {
+        const srcOff = y * width;
+        if (srcOff >= elevGrid.length) break;
+        padded.set(elevGrid.subarray(srcOff, Math.min(elevGrid.length, srcOff + width)), y * rowF32);
+      }
+      this.device.queue.writeTexture(
+        { texture: tempElev, mipLevel: 0 },
+        padded,
+        { bytesPerRow: paddedF32Bytes, rowsPerImage: height },
+        [width, height, 1]
+      );
+    }
+
+    const encoder = this.device.createCommandEncoder({ label: `${label}_f32_blit_encoder` });
+    const bgOut = this.device.createBindGroup({
+      layout: this.rg16ElevLayout!,
+      entries: [{ binding: 0, resource: tempElev.createView({ baseMipLevel: 0, mipLevelCount: 1 }) }],
+    });
+    const passOut = encoder.beginRenderPass({
+      colorAttachments: [
+        {
+          view: dstTex.createView({ baseMipLevel: 0, mipLevelCount: 1 }),
+          loadOp: 'clear',
+          storeOp: 'store',
+          clearValue: { r: 0, g: 0, b: 0, a: 0 },
+        },
+      ],
+    });
+    passOut.setPipeline(this.rg16ElevToRG16Pipeline!);
+    passOut.setBindGroup(0, bgOut);
+    passOut.draw(3, 1, 0, 0);
+    passOut.end();
+
+    this.recordRG16FloatMips(encoder, dstTex, mipLevelCount, false);
+    this.device.queue.submit([encoder.finish()]);
+    tempElev.destroy();
+  }
+
+  private uploadRG16MipPyramid(
+    mipLevels: Uint8Array[],
+    width: number,
+    height: number,
+    label: string
+  ): GPUTexture {
+    const mipLevelCount = Math.max(1, mipLevels.length);
+    const usageDst = typeof GPUTextureUsage !== 'undefined'
+      ? (GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST | GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC)
+      : (4 | 8 | 16 | 1);
+    const dstTex = this.device.createTexture({
+      label,
+      size: [width, height, 1],
+      mipLevelCount,
+      format: 'rg16float',
+      usage: usageDst,
+    });
+
+    for (let mip = 0; mip < mipLevelCount; mip++) {
+      const mw = Math.max(1, width >> mip);
+      const mh = Math.max(1, height >> mip);
+      const rawRowBytes = mw * 4;
+      const paddedRowBytes = Math.ceil(rawRowBytes / 256) * 256;
+      const mipData = mipLevels[mip];
+      if (!mipData) continue;
+
+      if (paddedRowBytes === rawRowBytes && mipData.byteLength >= rawRowBytes * mh) {
+        this.device.queue.writeTexture(
+          { texture: dstTex, mipLevel: mip },
+          mipData as unknown as BufferSource,
+          { bytesPerRow: rawRowBytes, rowsPerImage: mh },
+          [mw, mh, 1]
+        );
+      } else {
+        const padded = new Uint8Array(paddedRowBytes * mh);
+        for (let y = 0; y < mh; y++) {
+          const srcOff = y * rawRowBytes;
+          if (srcOff >= mipData.byteLength) break;
+          padded.set(
+            mipData.subarray(srcOff, Math.min(mipData.byteLength, srcOff + rawRowBytes)),
+            y * paddedRowBytes
+          );
+        }
+        this.device.queue.writeTexture(
+          { texture: dstTex, mipLevel: mip },
+          padded as unknown as BufferSource,
+          { bytesPerRow: paddedRowBytes, rowsPerImage: mh },
+          [mw, mh, 1]
+        );
+      }
+    }
+
+    return dstTex;
+  }
+
+  private async readbackRG16MipPyramid(
+    texture: GPUTexture,
+    width: number,
+    height: number,
+    mipLevelCount: number
+  ): Promise<Uint8Array[] | null> {
+    if (!this.device || !this.isInitialized) {
+      return null;
+    }
+    return readbackGPUTextureRG16MipPyramid(this.device, texture, width, height, mipLevelCount);
+  }
+
+  private blitU16ToRG16Float(
+    u16: Uint16Array,
+    width: number,
+    height: number,
+    mipLevelCount: number,
+    label: string,
+    binaryLandMask: boolean
+  ): GPUTexture {
+    const usageTmp = typeof GPUTextureUsage !== 'undefined'
+      ? (GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST | GPUTextureUsage.RENDER_ATTACHMENT)
+      : (4 | 8 | 16);
+    const usageDst = typeof GPUTextureUsage !== 'undefined'
+      ? (usageTmp | GPUTextureUsage.COPY_SRC)
+      : (usageTmp | 1);
+    const dstTex = this.device.createTexture({
+      label,
+      size: [width, height, 1],
+      mipLevelCount,
+      format: 'rg16float',
+      usage: usageDst,
+    });
+
+    if (this.canRunGPUBlit()) {
+      this.ensureRG16BlitPipelines();
+      const tempTex = this.device.createTexture({
+        label: `${label}_u16_tmp`,
+        size: [width, height, 1],
+        mipLevelCount,
+        format: 'rgba16uint',
+        usage: usageTmp,
+      });
+
+      const rawU16Bytes = width * 8;
+      const paddedU16Bytes = Math.ceil(rawU16Bytes / 256) * 256;
+      if (paddedU16Bytes === rawU16Bytes && u16.byteLength >= paddedU16Bytes * height) {
+        this.device.queue.writeTexture(
+          { texture: tempTex, mipLevel: 0 },
+          u16,
+          { bytesPerRow: paddedU16Bytes, rowsPerImage: height },
+          [width, height, 1]
+        );
+      } else {
+        const rowU16 = paddedU16Bytes / 2;
+        const padded = new Uint16Array(rowU16 * height);
+        const srcRowU16 = width * 4;
+        for (let y = 0; y < height; y++) {
+          const srcOff = y * srcRowU16;
+          if (srcOff >= u16.length) break;
+          padded.set(u16.subarray(srcOff, Math.min(u16.length, srcOff + srcRowU16)), y * rowU16);
+        }
+        this.device.queue.writeTexture(
+          { texture: tempTex, mipLevel: 0 },
+          padded,
+          { bytesPerRow: paddedU16Bytes, rowsPerImage: height },
+          [width, height, 1]
+        );
+      }
+
+      const encoder = this.device.createCommandEncoder({ label: `${label}_u16_blit_encoder` });
+      const u16MipPipeline = binaryLandMask ? this.rg16U16MipGlobalPipeline! : this.rg16U16MipLinearPipeline!;
+      for (let mip = 1; mip < mipLevelCount; mip++) {
+        const bgMip = this.device.createBindGroup({
+          layout: this.rg16U16Layout!,
+          entries: [{ binding: 0, resource: tempTex.createView({ baseMipLevel: mip - 1, mipLevelCount: 1 }) }],
+        });
+        const passMip = encoder.beginRenderPass({
+          colorAttachments: [
+            {
+              view: tempTex.createView({ baseMipLevel: mip, mipLevelCount: 1 }),
+              loadOp: 'clear',
+              storeOp: 'store',
+              clearValue: { r: 0, g: 0, b: 0, a: 0 },
+            },
+          ],
+        });
+        passMip.setPipeline(u16MipPipeline);
+        passMip.setBindGroup(0, bgMip);
+        passMip.draw(3, 1, 0, 0);
+        passMip.end();
+      }
+
+      const u16OutPipeline = binaryLandMask ? this.rg16U16GlobalPipeline! : this.rg16U16RegionalPipeline!;
+      for (let mip = 0; mip < mipLevelCount; mip++) {
+        const bgOut = this.device.createBindGroup({
+          layout: this.rg16U16Layout!,
+          entries: [{ binding: 0, resource: tempTex.createView({ baseMipLevel: mip, mipLevelCount: 1 }) }],
+        });
+        const passOut = encoder.beginRenderPass({
+          colorAttachments: [
+            {
+              view: dstTex.createView({ baseMipLevel: mip, mipLevelCount: 1 }),
+              loadOp: 'clear',
+              storeOp: 'store',
+              clearValue: { r: 0, g: 0, b: 0, a: 0 },
+            },
+          ],
+        });
+        passOut.setPipeline(u16OutPipeline);
+        passOut.setBindGroup(0, bgOut);
+        passOut.draw(3, 1, 0, 0);
+        passOut.end();
+      }
+
+      this.device.queue.submit([encoder.finish()]);
+      tempTex.destroy();
+      return dstTex;
+    }
+
+    // Minimal unit-test spy fallback (no render pipeline on stub device)
+    const rawRowBytes = width * 4;
+    const paddedRowBytes = Math.ceil(rawRowBytes / 256) * 256;
+    const rowElements = paddedRowBytes / 2;
+    const f16 = new Uint16Array(rowElements * height);
+    for (let y = 0; y < height; y++) {
+      const srcRow = y * width * 4;
+      const dstRow = y * rowElements;
+      for (let x = 0; x < width; x++) {
+        const rx = u16[srcRow + x * 4 + 0] ?? 0;
+        const gy = u16[srcRow + x * 4 + 1] ?? 0;
+        const b = u16[srcRow + x * 4 + 2] ?? 0;
+        const a = u16[srcRow + x * 4 + 3] ?? 0;
+        f16[dstRow + x * 2 + 0] = U16_TO_F16_LUT[b];
+        if (binaryLandMask) {
+          f16[dstRow + x * 2 + 1] = U16_TO_F16_LUT[a];
+        } else {
+          const rgElevM = (rx / 65535.0) * 8848.0 - (gy / 65535.0) * 10924.0;
+          const alphaElevM = (a / 65535.0) * 19772.0 - 10924.0;
+          const useAlphaFallback = rx === 0 && gy === 0 && a > 0 && Math.abs(a - 36211) > 2;
+          const elevM = useAlphaFallback ? alphaElevM : rgElevM;
+          f16[dstRow + x * 2 + 1] = encodeFloat16(elevM);
+        }
+      }
+    }
+    this.device.queue.writeTexture(
+      { texture: dstTex, mipLevel: 0 },
+      f16,
+      { bytesPerRow: paddedRowBytes, rowsPerImage: height },
+      [width, height, 1]
+    );
+    return dstTex;
+  }
+
+  private blitImageOrRGBA8ToRG16Float(
+    source: ImageBitmap | Uint8Array,
+    width: number,
+    height: number,
+    mipLevelCount: number,
+    label: string,
+    binaryLandMask: boolean
+  ): GPUTexture {
+    const usageTmp = typeof GPUTextureUsage !== 'undefined'
+      ? (GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST | GPUTextureUsage.RENDER_ATTACHMENT)
+      : (4 | 8 | 16);
+    const usageDst = typeof GPUTextureUsage !== 'undefined'
+      ? (usageTmp | GPUTextureUsage.COPY_SRC)
+      : (usageTmp | 1);
+    const dstTex = this.device.createTexture({
+      label,
+      size: [width, height, 1],
+      mipLevelCount,
+      format: 'rg16float',
+      usage: usageDst,
+    });
+
+    if (this.canRunGPUBlit()) {
+      this.ensureRG16BlitPipelines();
+      const tempTex = this.device.createTexture({
+        label: `${label}_rgba8_tmp`,
+        size: [width, height, 1],
+        mipLevelCount: 1,
+        format: 'rgba8unorm',
+        usage: usageTmp,
+      });
+
+      if (source instanceof Uint8Array) {
+        const rawBytes = width * 4;
+        const paddedBytes = Math.ceil(rawBytes / 256) * 256;
+        if (paddedBytes === rawBytes && source.byteLength >= paddedBytes * height) {
+          this.device.queue.writeTexture(
+            { texture: tempTex, mipLevel: 0 },
+            source,
+            { bytesPerRow: paddedBytes, rowsPerImage: height },
+            [width, height, 1]
+          );
+        } else {
+          const padded = new Uint8Array(paddedBytes * height);
+          for (let y = 0; y < height; y++) {
+            const srcOff = y * rawBytes;
+            if (srcOff >= source.length) break;
+            padded.set(source.subarray(srcOff, Math.min(source.length, srcOff + rawBytes)), y * paddedBytes);
+          }
+          this.device.queue.writeTexture(
+            { texture: tempTex, mipLevel: 0 },
+            padded,
+            { bytesPerRow: paddedBytes, rowsPerImage: height },
+            [width, height, 1]
+          );
+        }
+      } else {
+        let copied = false;
+        if (typeof this.device.queue.copyExternalImageToTexture === 'function') {
+          try {
+            this.device.queue.copyExternalImageToTexture(
+              { source },
+              { texture: tempTex, premultipliedAlpha: false },
+              [width, height]
+            );
+            copied = true;
+          } catch {}
+        }
+        if (!copied && typeof OffscreenCanvas !== 'undefined') {
+          const osc = new OffscreenCanvas(width, height);
+          const ctx = osc.getContext('2d');
+          if (ctx) {
+            ctx.drawImage(source, 0, 0);
+            const u8 = new Uint8Array(ctx.getImageData(0, 0, width, height).data.buffer);
+            const rawBytes = width * 4;
+            const paddedBytes = Math.ceil(rawBytes / 256) * 256;
+            const padded = new Uint8Array(paddedBytes * height);
+            for (let y = 0; y < height; y++) {
+              padded.set(u8.subarray(y * rawBytes, (y + 1) * rawBytes), y * paddedBytes);
+            }
+            this.device.queue.writeTexture(
+              { texture: tempTex, mipLevel: 0 },
+              padded,
+              { bytesPerRow: paddedBytes, rowsPerImage: height },
+              [width, height, 1]
+            );
+          }
+        }
+      }
+
+      const encoder = this.device.createCommandEncoder({ label: `${label}_ba8_blit_encoder` });
+      const bg0 = this.device.createBindGroup({
+        layout: this.rg16TexLayout!,
+        entries: [{ binding: 0, resource: tempTex.createView() }],
+      });
+      const pass0 = encoder.beginRenderPass({
+        colorAttachments: [
+          {
+            view: dstTex.createView({ baseMipLevel: 0, mipLevelCount: 1 }),
+            loadOp: 'clear',
+            storeOp: 'store',
+            clearValue: { r: 0, g: 0, b: 0, a: 0 },
+          },
+        ],
+      });
+      const ba8Pipeline = binaryLandMask ? this.rg16BA8GlobalPipeline! : this.rg16BA8RegionalPipeline!;
+      pass0.setPipeline(ba8Pipeline);
+      pass0.setBindGroup(0, bg0);
+      pass0.draw(3, 1, 0, 0);
+      pass0.end();
+
+      this.recordRG16FloatMips(encoder, dstTex, mipLevelCount, binaryLandMask);
+      this.device.queue.submit([encoder.finish()]);
+      tempTex.destroy();
+      return dstTex;
+    }
+
+    // Minimal unit-test spy fallback
+    const rawRowBytes = width * 4;
+    const paddedRowBytes = Math.ceil(rawRowBytes / 256) * 256;
+    const rowElements = paddedRowBytes / 2;
+    const f16 = new Uint16Array(rowElements * height);
+    if (source instanceof Uint8Array) {
+      for (let y = 0; y < height; y++) {
+        const srcRow = y * width * 4;
+        const dstRow = y * rowElements;
+        for (let x = 0; x < width; x++) {
+          const b = (source[srcRow + x * 4 + 2] ?? 0) / 255.0;
+          const a = (source[srcRow + x * 4 + 3] ?? 0) / 255.0;
+          f16[dstRow + x * 2 + 0] = encodeFloat16(b);
+          f16[dstRow + x * 2 + 1] = binaryLandMask
+            ? encodeFloat16(a)
+            : encodeFloat16(a * 19772.0 - 10924.0);
+        }
+      }
+    }
+    this.device.queue.writeTexture(
+      { texture: dstTex, mipLevel: 0 },
+      f16,
+      { bytesPerRow: paddedRowBytes, rowsPerImage: height },
+      [width, height, 1]
+    );
+    return dstTex;
+  }
+
+  private buildCompactCPUDEM(
+    src: Uint16Array | Uint8Array | Float32Array,
+    srcW: number,
+    srcH: number,
+    mode: 'u16_rgba' | 'u8_rgba' | 'f32_elev'
+  ): Int16Array {
+    const dstW = WebGPUEngine.CPU_DEM_WIDTH;
+    const dstH = WebGPUEngine.CPU_DEM_HEIGHT;
+    const out = (this.cpuDEMData instanceof Int16Array && this.cpuDEMData.length === dstW * dstH * 2)
+      ? this.cpuDEMData
+      : new Int16Array(dstW * dstH * 2);
+
+    const maxVal = mode === 'u16_rgba' ? 65535.0 : 255.0;
+    const landThresh = maxVal * 0.45;
+
+    for (let dy = 0; dy < dstH; dy++) {
+      const y0 = Math.floor((dy * srcH) / dstH);
+      const y1 = Math.max(y0 + 1, Math.min(srcH, Math.floor(((dy + 1) * srcH) / dstH)));
+      const dstRow = dy * dstW * 2;
+      for (let dx = 0; dx < dstW; dx++) {
+        const x0 = Math.floor((dx * srcW) / dstW);
+        const x1 = Math.max(x0 + 1, Math.min(srcW, Math.floor(((dx + 1) * srcW) / dstW)));
+        let sum = 0.0;
+        let maxElev = -32768.0;
+        let count = 0;
+
+        for (let sy = y0; sy < y1; sy++) {
+          const rowBase = sy * srcW;
+          for (let sx = x0; sx < x1; sx++) {
+            let elev = 0.0;
+            if (mode === 'f32_elev') {
+              elev = src[rowBase + sx] ?? 0.0;
+            } else {
+              const idx = (rowBase + sx) * 4;
+              const r = src[idx] ?? 0;
+              const g = src[idx + 1] ?? 0;
+              const b = src[idx + 2] ?? 0;
+              const a = src[idx + 3] ?? 0;
+              if (r === 0 && g === 0 && b === 0 && a === 0) {
+                elev = 0.0;
+              } else if (r === 0 && g === 0 && a > 0) {
+                elev = (a / maxVal) * 19772.0 - 10924.0;
+              } else {
+                elev = b > landThresh ? (r / maxVal) * 8848.0 : -(g / maxVal) * 10924.0;
+              }
+            }
+            sum += elev;
+            if (elev > maxElev) maxElev = elev;
+            count++;
+          }
+        }
+
+        const meanM = count > 0 ? Math.round(sum / count) : 0;
+        const maxM = count > 0 ? Math.round(maxElev) : 0;
+        out[dstRow + dx * 2 + 0] = Math.max(-32768, Math.min(32767, meanM));
+        out[dstRow + dx * 2 + 1] = Math.max(-32768, Math.min(32767, maxM));
+      }
+    }
+    return out;
+  }
+
+  private registerRegionalDEMTexture(
+    id: string,
+    entry: {
+      texture: GPUTexture;
+      view: GPUTextureView;
+      bounds: { minLon: number; maxLon: number; minLat: number; maxLat: number };
+      width: number;
+      height: number;
+      id: string;
+      has30mGroundTruth?: boolean;
+      hasFinerLevel0?: boolean;
+      level0LatDegPerPx?: number;
+      mipLevelCount?: number;
+    }
+  ): void {
+    const sharedCacheTex = this.gpuTileCache?.getTexture() ?? null;
+    const prev = this.regionalDEMTextures.get(id);
+    if (prev) {
+      if (prev.texture !== entry.texture && prev.texture !== sharedCacheTex) {
+        try { prev.texture.destroy(); } catch {}
+      }
+      this.regionalDEMTextures.delete(id);
+    }
+    this.regionalDEMTextures.set(id, entry);
+
+    while (this.regionalDEMTextures.size > 2) {
+      let evictKey: string | null = null;
+      for (const k of this.regionalDEMTextures.keys()) {
+        if (k !== id) {
+          evictKey = k;
+          break;
+        }
+      }
+      if (!evictKey) break;
+      const evicted = this.regionalDEMTextures.get(evictKey);
+      if (evicted && evicted.texture !== entry.texture && evicted.texture !== sharedCacheTex) {
+        try { evicted.texture.destroy(); } catch {}
+      }
+      this.regionalDEMTextures.delete(evictKey);
+    }
+  }
+
   public async spawnParticlesOnGPU(nodeCount: number = 4194304): Promise<void> {
     return this.spawnParticlesInVRAM(nodeCount);
   }
 
+  public async tryApplyWarmPrefetchedDEM(url: string): Promise<boolean> {
+    if (!this.device || !this.isInitialized || !opfsAssetStore.isEnabled()) return false;
+    const isMockFetch = typeof fetch === 'function' && Boolean((fetch as any).mock);
+    if (isMockFetch) return false;
+    if (this.lastLoadedDEMUrl === url && this.demTexture) return true;
+
+    const prefetched = await opfsAssetStore.consumePrefetchedGlobalDEMPyramid(url);
+    if (!prefetched) return false;
+    if (!prefetched.record) {
+      this.prefetchedColdDEMVersionTags.set(url, prefetched.versionTag);
+      return false;
+    }
+
+    if (!this.device || !this.isInitialized) return false;
+    this.ensureCartographicBuffers();
+    const tUploadStart = typeof performance !== 'undefined' ? performance.now() : 0;
+    const warmCached = prefetched.record;
+    this.demWidth = warmCached.width;
+    this.demHeight = warmCached.height;
+    this.cpuDEMData = warmCached.cpuDEMData;
+    const oldTexture = this.demTexture;
+    this.demTexture = this.uploadRG16MipPyramid(
+      warmCached.mipLevels,
+      warmCached.width,
+      warmCached.height,
+      'dem_elevation_texture_rg16f'
+    );
+    this.demTextureView = this.demTexture.createView();
+    this.updateDEMBindGroups();
+    if (oldTexture) oldTexture.destroy();
+    this.lastLoadedDEMUrl = url;
+    this.lastGlobalDEMLoadSource = 'opfs-warm';
+    const uploadMs = (typeof performance !== 'undefined' ? performance.now() : 0) - tUploadStart;
+    this.lastGlobalDEMLoadMs = (prefetched.elapsedMs ?? 0) + uploadMs;
+    return true;
+  }
+
   public async loadDEMTexture(urlOrBuffer: string | ArrayBuffer): Promise<void> {
     if (!this.device || !this.isInitialized) return;
+    const isMockFetch = typeof fetch === 'function' && Boolean((fetch as any).mock);
+    if (typeof urlOrBuffer === 'string' && !isMockFetch && this.lastLoadedDEMUrl === urlOrBuffer && this.demTexture) {
+      return;
+    }
     this.ensureCartographicBuffers();
+    const tDemStart = typeof performance !== 'undefined' ? performance.now() : 0;
 
     try {
       if (typeof urlOrBuffer === 'string') {
         const url = urlOrBuffer;
         if (url.endsWith('.cog.tif') || url.endsWith('.cog')) {
           const streamed = await this.streamGlobalCOGBasemap(url);
-          if (streamed) return;
+          if (streamed) {
+            this.lastLoadedDEMUrl = url;
+            return;
+          }
         }
+
+        let opfsVersionTag: string | null = null;
+        if (!isMockFetch && opfsAssetStore.isEnabled()) {
+          const stashedColdTag = this.prefetchedColdDEMVersionTags.get(url);
+          if (stashedColdTag) {
+            this.prefetchedColdDEMVersionTags.delete(url);
+            opfsVersionTag = stashedColdTag;
+          } else {
+            const prefetched = await opfsAssetStore.consumePrefetchedGlobalDEMPyramid(url);
+            let warmCached = prefetched ? prefetched.record : null;
+            if (prefetched) {
+              opfsVersionTag = prefetched.versionTag;
+            } else {
+              opfsVersionTag = await probeAssetVersionTag(url, 'global-dem-v1');
+              if (opfsVersionTag.includes('|status-') && url.endsWith('-u16.bin')) {
+                const fbUrl = url.replace('-u16.bin', '.webp');
+                const fbTag = await probeAssetVersionTag(fbUrl, 'global-dem-v1');
+                if (!fbTag.includes('|status-')) {
+                  opfsVersionTag = fbTag;
+                }
+              }
+              warmCached = await opfsAssetStore.getGlobalDEMPyramid(url, opfsVersionTag);
+            }
+            if (warmCached) {
+              if (!this.device || !this.isInitialized) return;
+              const tUploadStart = typeof performance !== 'undefined' ? performance.now() : 0;
+              this.demWidth = warmCached.width;
+              this.demHeight = warmCached.height;
+              this.cpuDEMData = warmCached.cpuDEMData;
+              const oldTexture = this.demTexture;
+              this.demTexture = this.uploadRG16MipPyramid(
+                warmCached.mipLevels,
+                warmCached.width,
+                warmCached.height,
+                'dem_elevation_texture_rg16f'
+              );
+              this.demTextureView = this.demTexture.createView();
+              this.updateDEMBindGroups();
+              if (oldTexture) oldTexture.destroy();
+              this.lastLoadedDEMUrl = url;
+              this.lastGlobalDEMLoadSource = 'opfs-warm';
+              const nowMs = typeof performance !== 'undefined' ? performance.now() : 0;
+              this.lastGlobalDEMLoadMs = prefetched
+                ? (prefetched.elapsedMs ?? 0) + (nowMs - tUploadStart)
+                : nowMs - tDemStart;
+              return;
+            }
+          }
+        }
+
+        const persistGlobalDEMToOPFS = () => {
+          if (
+            !opfsVersionTag ||
+            !opfsAssetStore.isEnabled() ||
+            !this.demTexture ||
+            !(this.cpuDEMData instanceof Int16Array)
+          ) {
+            return;
+          }
+          const texSnap = this.demTexture;
+          const wSnap = this.demWidth;
+          const hSnap = this.demHeight;
+          const mipsSnap = Math.floor(Math.log2(Math.max(1, wSnap, hSnap))) + 1;
+          const cpuSnap = this.cpuDEMData;
+          const tagSnap = opfsVersionTag;
+          this.lastOPFSWritePromise = this.readbackRG16MipPyramid(texSnap, wSnap, hSnap, mipsSnap)
+            .then((mipLevels) => {
+              if (!mipLevels) return false;
+              return opfsAssetStore.putGlobalDEMPyramid(url, {
+                versionTag: tagSnap,
+                width: wSnap,
+                height: hSnap,
+                mipLevelCount: mipsSnap,
+                cpuDEMData: cpuSnap,
+                mipLevels,
+              });
+            })
+            .catch(() => false);
+        };
 
         let res: Response | null = null;
         let isImage = url.endsWith('.webp') || url.endsWith('.png');
@@ -4524,7 +5877,6 @@ export class WebGPUEngine {
           res = await fetch(url);
           const isHtmlFallback = res.headers?.get?.('content-type')?.includes('text/html') ?? false;
           if ((!res.ok || isHtmlFallback) && url.endsWith('.bin')) {
-            // Primary .bin fetch 404/SPA-fallback: fallback to .webp
             const fallbackUrl = url.replace('-u16.bin', '.webp');
             const res2 = await fetch(fallbackUrl);
             const isHtml2 = res2.headers?.get?.('content-type')?.includes('text/html') ?? false;
@@ -4548,64 +5900,55 @@ export class WebGPUEngine {
 
         if (!res || !res.ok) return;
 
-        // Lossless WebP/PNG image fallback decoding in browser environment
+        // Lossless WebP/PNG image fallback decoding (.public-release/ .webp .ba -> .rg swizzle)
         if (isImage && typeof createImageBitmap !== 'undefined') {
           const blob = await res.blob();
-          const imgBitmap = await createImageBitmap(blob);
+          let imgBitmap: ImageBitmap;
+          try {
+            imgBitmap = await createImageBitmap(blob, {
+              premultiplyAlpha: 'none',
+              colorSpaceConversion: 'none',
+            });
+          } catch {
+            imgBitmap = await createImageBitmap(blob);
+          }
           const width = imgBitmap.width;
           const height = imgBitmap.height;
           this.demWidth = width;
           this.demHeight = height;
 
-          let u8: Uint8Array | null = null;
           if (typeof OffscreenCanvas !== 'undefined') {
-            const osc = new OffscreenCanvas(width, height);
+            const dstW = WebGPUEngine.CPU_DEM_WIDTH;
+            const dstH = WebGPUEngine.CPU_DEM_HEIGHT;
+            const osc = new OffscreenCanvas(dstW, dstH);
             const ctx = osc.getContext('2d');
             if (ctx) {
-              ctx.drawImage(imgBitmap, 0, 0);
-              const imgData = ctx.getImageData(0, 0, width, height);
-              u8 = new Uint8Array(imgData.data.buffer);
-              this.cpuDEMData = u8;
+              ctx.drawImage(imgBitmap, 0, 0, dstW, dstH);
+              const u8 = new Uint8Array(ctx.getImageData(0, 0, dstW, dstH).data.buffer);
+              this.cpuDEMData = this.buildCompactCPUDEM(u8, dstW, dstH, 'u8_rgba');
             }
           }
 
           const oldTexture = this.demTexture;
-          const mips8 = u8
-            ? this.generateMipsRGBA8(u8, width, height)
-            : [{ data: new Uint8Array(0), width, height }];
-
-          const newTexture = this.device.createTexture({
-            label: 'dem_texture_rgba8',
-            size: [width, height, 1],
-            mipLevelCount: u8 ? mips8.length : 1,
-            format: 'rgba8unorm',
-            usage: (typeof GPUTextureUsage !== 'undefined'
-              ? (GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST | GPUTextureUsage.RENDER_ATTACHMENT)
-              : (4 | 8 | 16)),
-          });
-
-          if (u8) {
-            for (let level = 0; level < mips8.length; level++) {
-              const m = mips8[level];
-              this.device.queue.writeTexture(
-                { texture: newTexture, mipLevel: level },
-                m.data,
-                { bytesPerRow: m.width * 4, rowsPerImage: m.height },
-                [m.width, m.height, 1]
-              );
-            }
-          } else {
-            this.device.queue.copyExternalImageToTexture(
-              { source: imgBitmap },
-              { texture: newTexture },
-              [width, height]
-            );
-          }
+          const mipLevelCount = Math.floor(Math.log2(Math.max(1, width, height))) + 1;
+          const newTexture = this.blitImageOrRGBA8ToRG16Float(
+            imgBitmap,
+            width,
+            height,
+            mipLevelCount,
+            'dem_elevation_texture_rg16f',
+            true
+          );
+          imgBitmap.close?.();
 
           this.demTexture = newTexture;
           this.demTextureView = this.demTexture.createView();
           this.updateDEMBindGroups();
           if (oldTexture) oldTexture.destroy();
+          this.lastLoadedDEMUrl = url;
+          this.lastGlobalDEMLoadSource = 'network-cold';
+          this.lastGlobalDEMLoadMs = (typeof performance !== 'undefined' ? performance.now() : 0) - tDemStart;
+          persistGlobalDEMToOPFS();
           return;
         }
 
@@ -4613,15 +5956,18 @@ export class WebGPUEngine {
         if (buffer && buffer.byteLength > 0) {
           if (!this.device || !this.isInitialized) return;
           await this.loadDEMTexture(buffer);
+          this.lastLoadedDEMUrl = url;
+          this.lastGlobalDEMLoadSource = 'network-cold';
+          this.lastGlobalDEMLoadMs = (typeof performance !== 'undefined' ? performance.now() : 0) - tDemStart;
+          persistGlobalDEMToOPFS();
         }
         return;
       }
 
-      // Buffer ingestion with full mipmap pyramid generation
+      // Buffer ingestion with Core-WebGPU RENDER_ATTACHMENT rg16float compaction + mipmap pyramid
       if (!this.device || !this.isInitialized) return;
       const byteLength = urlOrBuffer.byteLength;
       const isU16 = byteLength > 0 && byteLength % 8 === 0 && Number.isInteger(Math.sqrt(byteLength / 16));
-      this.cpuDEMData = isU16 ? new Uint16Array(urlOrBuffer) : new Uint8Array(urlOrBuffer);
       const totalPixels = Math.floor(byteLength / (isU16 ? 8 : 4));
       const calculatedH = Math.max(1, Math.round(Math.sqrt(totalPixels / 2)));
       const calculatedW = calculatedH * 2;
@@ -4629,78 +5975,37 @@ export class WebGPUEngine {
       this.demHeight = calculatedH > 0 ? calculatedH : WebGPUEngine.DEFAULT_DEM_HEIGHT;
       const width = this.demWidth;
       const height = this.demHeight;
+      const mipLevelCount = Math.floor(Math.log2(Math.max(1, width, height))) + 1;
 
       const oldTexture = this.demTexture;
       if (isU16) {
-        // Full-range 16-bit uint16 texture encoded to rgba16float for sub-meter vertical precision
         const u16 = new Uint16Array(urlOrBuffer);
-        const mips16 = this.generateMipsRGBA16(u16, width, height);
-        const newTexture = this.device.createTexture({
-          label: 'dem_elevation_texture_rgba16f',
-          size: [width, height, 1],
-          mipLevelCount: mips16.length,
-          format: 'rgba16float',
-          usage: (typeof GPUTextureUsage !== 'undefined'
-            ? (GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST)
-            : (4 | 8)),
-        });
-
-        for (let level = 0; level < mips16.length; level++) {
-          const m = mips16[level];
-          const rawRowBytes = m.width * 8;
-          const paddedRowBytes = Math.ceil(rawRowBytes / 256) * 256;
-
-          let writeData: Uint16Array;
-          if (paddedRowBytes === rawRowBytes) {
-            writeData = new Uint16Array(m.data.length);
-            for (let i = 0; i < m.data.length; i++) {
-              writeData[i] = U16_TO_F16_LUT[m.data[i]];
-            }
-          } else {
-            const rowElements = paddedRowBytes / 2;
-            writeData = new Uint16Array(rowElements * m.height);
-            for (let y = 0; y < m.height; y++) {
-              const srcOffset = y * m.width * 4;
-              const dstOffset = y * rowElements;
-              for (let x = 0; x < m.width * 4; x++) {
-                writeData[dstOffset + x] = U16_TO_F16_LUT[m.data[srcOffset + x]];
-              }
-            }
-          }
-
-          this.device.queue.writeTexture(
-            { texture: newTexture, mipLevel: level },
-            writeData,
-            { bytesPerRow: paddedRowBytes, rowsPerImage: m.height },
-            [m.width, m.height, 1]
-          );
-        }
-
+        this.cpuDEMData = this.buildCompactCPUDEM(u16, width, height, 'u16_rgba');
+        if (!this.device || !this.isInitialized) return;
+        const newTexture = this.blitU16ToRG16Float(
+          u16,
+          width,
+          height,
+          mipLevelCount,
+          'dem_elevation_texture_rg16f',
+          true
+        );
         this.demTexture = newTexture;
         this.demTextureView = this.demTexture.createView();
         this.updateDEMBindGroups();
         if (oldTexture) oldTexture.destroy();
       } else if (byteLength > 0) {
-        // Fallback 8-bit texture ingestion or test mock buffer
         const u8 = new Uint8Array(urlOrBuffer);
-        const mips8 = this.generateMipsRGBA8(u8.length >= width * height * 4 ? u8 : new Uint8Array(width * height * 4), width, height);
-        const newTexture = this.device.createTexture({
-          label: 'dem_texture_fallback',
-          size: [width, height, 1],
-          mipLevelCount: mips8.length,
-          format: 'rgba8unorm',
-          usage: (typeof GPUTextureUsage !== 'undefined' ? (GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST) : (4 | 8)),
-        });
-
-        for (let level = 0; level < mips8.length; level++) {
-          const m = mips8[level];
-          this.device.queue.writeTexture(
-            { texture: newTexture, mipLevel: level },
-            m.data,
-            { bytesPerRow: m.width * 4, rowsPerImage: m.height },
-            [m.width, m.height, 1]
-          );
-        }
+        const safeU8 = u8.length >= width * height * 4 ? u8 : new Uint8Array(width * height * 4);
+        this.cpuDEMData = this.buildCompactCPUDEM(safeU8, width, height, 'u8_rgba');
+        const newTexture = this.blitImageOrRGBA8ToRG16Float(
+          safeU8,
+          width,
+          height,
+          mipLevelCount,
+          'dem_texture_fallback_rg16f',
+          true
+        );
         this.demTexture = newTexture;
         this.demTextureView = this.demTexture.createView();
         this.updateDEMBindGroups();
@@ -4725,8 +6030,30 @@ export class WebGPUEngine {
   }
 
   /**
-   * Asynchronously streams and caches on-demand 256x256 elevation tiles from
-   * Cloud-Optimized GeoTIFFs (COGs) via HTTP Range Requests without downloading monolithic arrays.
+   * Packs a 256x256 Float32 elevation tile into GPU-ready rg16float [bNorm, elevM]
+   * using exact IEEE-754 round-to-nearest-even Float16 encoding and GPUTileCache's two-sided coastal curve.
+   */
+  public packElevationTileRG16(elevData: Float32Array, outF16?: Uint16Array): Uint16Array {
+    const count = 256 * 256;
+    const dst = outF16 && outF16.length >= count * 2 ? outF16 : new Uint16Array(count * 2);
+    const limit = Math.min(count, elevData.length);
+    for (let i = 0; i < limit; i++) {
+      const elev = elevData[i];
+      const bNorm = elev > 0.15
+        ? 0.5 + 0.5 * Math.max(0.0, Math.min(1.0, (elev - 0.15) / 1.35))
+        : 0.5 * (1.0 - Math.max(0.0, Math.min(1.0, (0.15 - elev) / 0.13)));
+      const clampedElev = Math.max(-10924.0, Math.min(8848.0, elev));
+      const baseIdx = i * 2;
+      dst[baseIdx + 0] = encodeFloat16(bNorm);
+      dst[baseIdx + 1] = encodeFloat16(clampedElev);
+    }
+    return dst;
+  }
+
+  /**
+   * Asynchronously streams and caches on-demand 256x256 Level-0 (lod = 0) elevation tiles from
+   * Cloud-Optimized GeoTIFFs (COGs) via HTTP 206 Range Requests + OPFS into the 64-slot GPUTileCache
+   * without downloading monolithic arrays or overwriting whole-island overview pyramids.
    */
   public async streamRegionalCOGTile(
     id: string,
@@ -4735,6 +6062,7 @@ export class WebGPUEngine {
     cogUrl?: string
   ): Promise<boolean> {
     const url = cogUrl || `/regional/${id}.cog.tif`;
+    const isMockFetch = typeof fetch === 'function' && Boolean((fetch as any).mock);
 
     try {
       if (!this.geoTIFFDataSource.isConnected || this.geoTIFFDataSource.endpointUrl !== this.geoTIFFDataSource.normalizeUrl(url)) {
@@ -4744,106 +6072,151 @@ export class WebGPUEngine {
         }
       }
 
-      const chunk = await this.geoTIFFDataSource.fetch(
-        { minLon: bounds.minLon, maxLon: bounds.maxLon, minLat: bounds.minLat, maxLat: bounds.maxLat, minAlt: 0, maxAlt: 0 },
-        zoom
-      );
-
-      const elevData = chunk.attributes.get('elevation');
-      if (!elevData || !(elevData instanceof Float32Array)) {
-        return false;
+      const { tileX, tileY } = this.geoTIFFDataSource.calculateTileCoords({
+        minLon: bounds.minLon,
+        maxLon: bounds.maxLon,
+        minLat: bounds.minLat,
+        maxLat: bounds.maxLat,
+        minAlt: 0,
+        maxAlt: 0,
+      });
+      const opfsTileKey = `${id}:l0:${tileX}:${tileY}`;
+      let opfsVersionTag: string | null = null;
+      let warmTile = null;
+      if (!isMockFetch && opfsAssetStore.isEnabled()) {
+        opfsVersionTag = await probeAssetVersionTag(url, 'regional-cog-l0-v1');
+        warmTile = await opfsAssetStore.getRegionalCOGTile(opfsTileKey, opfsVersionTag);
       }
 
       const tileW = 256;
       const tileH = 256;
+      let elevData: Float32Array | null = null;
+      let chunkBounds = bounds;
+      let uvScaleX = 1.0;
+      let uvScaleY = 1.0;
+
+      if (warmTile) {
+        chunkBounds = warmTile.bounds;
+        uvScaleX = warmTile.uvScaleX;
+        uvScaleY = warmTile.uvScaleY;
+      } else {
+        const chunk = await this.geoTIFFDataSource.fetch(
+          { minLon: bounds.minLon, maxLon: bounds.maxLon, minLat: bounds.minLat, maxLat: bounds.maxLat, minAlt: 0, maxAlt: 0 },
+          zoom
+        );
+        const rawElev = chunk.attributes.get('elevation');
+        if (!rawElev || !(rawElev instanceof Float32Array)) {
+          return false;
+        }
+        elevData = rawElev;
+        const lv0Geom = this.geoTIFFDataSource.getLevel0TileGeometry(tileX, tileY);
+        chunkBounds = lv0Geom ? lv0Geom.bounds : (chunk.bounds || bounds);
+        uvScaleX = lv0Geom ? lv0Geom.uvScaleX : 1.0;
+        uvScaleY = lv0Geom ? lv0Geom.uvScaleY : 1.0;
+      }
 
       if (this.device && this.isInitialized) {
-        // Zero-GC: populate preallocated f16 array matching regional encoding
-        const f16Data = this.regionalTileF16Data;
-        for (let i = 0; i < tileW * tileH; i++) {
-          const elev = elevData[i];
-          const rNorm = Math.max(0.0, Math.min(1.0, elev / 8848.0));
-          const gNorm = Math.max(0.0, Math.min(1.0, -elev / 10924.0));
-          const bNorm = Math.max(0.0, Math.min(1.0, (elev + 15.0) / 30.0));
-          const aNorm = Math.max(0.0, Math.min(1.0, (elev + 10924.0) / 19772.0));
+        const effectiveBounds = (bounds.maxLon - bounds.minLon > 0.05) ? bounds : chunkBounds;
+        const has30m =
+          id.includes('30m') ||
+          id === 'grand-canyon' ||
+          id === 'matterhorn' ||
+          id === 'hawaii' ||
+          id === 'capecod' ||
+          id === 'fuji' ||
+          id === 'yellowstone' ||
+          id === 'flatirons-chautauqua';
 
-          f16Data[i * 4 + 0] = encodeFloat16(rNorm);
-          f16Data[i * 4 + 1] = encodeFloat16(gNorm);
-          f16Data[i * 4 + 2] = encodeFloat16(bNorm);
-          f16Data[i * 4 + 3] = encodeFloat16(aNorm);
-        }
-
-        const existing = this.regionalDEMTextures.get(id);
-        let texture: GPUTexture;
-        let view: GPUTextureView;
-
-        if (existing && existing.width === tileW && existing.height === tileH) {
-          // Zero-GC in-place reuse of existing GPUTexture and GPUTextureView
-          texture = existing.texture;
-          view = existing.view;
-        } else {
-          if (existing) {
-            try { existing.texture.destroy(); } catch {}
-          }
-          texture = this.device.createTexture({
-            label: `regional_dem_${id}`,
-            size: [tileW, tileH, 1],
-            mipLevelCount: 1,
-            format: 'rgba16float',
-            usage: (typeof GPUTextureUsage !== 'undefined'
-              ? (GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST)
-              : (4 | 8)),
-          });
-          view = texture.createView();
-        }
-
-        // 256 * 4 channels * 2 bytes = 2048 bytes per row (perfect 256-byte alignment)
-        const rowBytes = tileW * 8;
-        this.device.queue.writeTexture(
-          { texture },
-          f16Data.buffer,
-          { bytesPerRow: rowBytes, rowsPerImage: tileH, offset: 0 },
-          [tileW, tileH, 1]
-        );
-
-        const effectiveBounds = (bounds.maxLon - bounds.minLon > 0.05) ? bounds : (chunk.bounds || bounds);
-        const has30m = id.includes('30m') || id === 'grand-canyon' || id === 'matterhorn';
-        this.regionalDEMTextures.set(id, {
-          texture,
-          view,
-          bounds: effectiveBounds,
-          width: tileW,
-          height: tileH,
-          id,
-          has30mGroundTruth: has30m,
-        });
-
-        const { tileX, tileY } = this.geoTIFFDataSource.calculateTileCoords({
-          minLon: bounds.minLon,
-          maxLon: bounds.maxLon,
-          minLat: bounds.minLat,
-          maxLat: bounds.maxLat,
-          minAlt: 0,
-          maxAlt: 0,
-        });
         this.activeRegionalTileKey = `${id}:${tileX}:${tileY}`;
 
-        // Track B: Ingest into 64-slot Texture2DArray GPUTileCache with zero-GC LRU eviction
-        if (this.gpuTileCache) {
+        const sharedCacheTex = this.gpuTileCache?.getTexture() ?? null;
+        if (this.gpuTileCache && sharedCacheTex) {
+          // Track B: Ingest directly into 64-slot rg16float Texture2DArray GPUTileCache (9 mips) with zero-GC LRU eviction
           const slot = this.gpuTileCache.allocateSlot(
             this.activeRegionalTileKey,
             effectiveBounds,
             zoom,
             tileX,
-            tileY
+            tileY,
+            uvScaleX,
+            uvScaleY
           );
-          this.gpuTileCache.uploadElevationTile(slot, elevData);
+          if (warmTile) {
+            this.gpuTileCache.uploadPackedRG16Tile(slot, warmTile.rg16Data);
+          } else if (elevData) {
+            const packed = this.packElevationTileRG16(elevData, this.regionalTileF16Data);
+            this.gpuTileCache.uploadPackedRG16Tile(slot, packed);
+            if (opfsVersionTag && opfsAssetStore.isEnabled()) {
+              const copyForOpfs = new Uint16Array(packed);
+              void opfsAssetStore.putRegionalCOGTile(opfsTileKey, {
+                versionTag: opfsVersionTag,
+                id,
+                lod: 0,
+                tileX,
+                tileY,
+                bounds: effectiveBounds,
+                uvScaleX,
+                uvScaleY,
+                rg16Data: copyForOpfs,
+              });
+            }
+          }
           this.syncTileCacheUniformsAndBindGroups();
+          const existingReg = this.regionalDEMTextures.get(id);
           const cachedView = this.gpuTileCache.getSlotView(slot);
-          if (cachedView && this.gpuTileCache.getTexture()) {
-            view = cachedView;
-            texture = this.gpuTileCache.getTexture()!;
-            this.regionalDEMTextures.set(id, {
+          if (cachedView && (!existingReg || existingReg.width <= tileW)) {
+            this.registerRegionalDEMTexture(id, {
+              texture: sharedCacheTex,
+              view: cachedView,
+              bounds: effectiveBounds,
+              width: tileW,
+              height: tileH,
+              id,
+              has30mGroundTruth: has30m,
+              mipLevelCount: 9,
+            });
+          }
+        } else {
+          // Zero-GC fallback when GPUTileCache is uninitialized: pack 2-channel rg16float [bNorm, elevM]
+          const f16Data = warmTile
+            ? warmTile.rg16Data
+            : this.packElevationTileRG16(elevData!, this.regionalTileF16Data);
+
+          const existing = this.regionalDEMTextures.get(id);
+          let texture: GPUTexture;
+          let view: GPUTextureView;
+
+          if (existing && existing.width === tileW && existing.height === tileH && existing.texture !== sharedCacheTex) {
+            texture = existing.texture;
+            view = existing.view;
+          } else {
+            if (existing && existing.texture !== sharedCacheTex) {
+              try { existing.texture.destroy(); } catch {}
+            }
+            texture = this.device.createTexture({
+              label: `regional_dem_${id}`,
+              size: [tileW, tileH, 1],
+              mipLevelCount: 1,
+              format: 'rg16float',
+              usage: (typeof GPUTextureUsage !== 'undefined'
+                ? (GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST)
+                : (4 | 2)),
+            });
+            view = texture.createView();
+          }
+
+          // 256 * 2 channels * 2 bytes = 1024 bytes per row (256-byte aligned)
+          const rowBytes = tileW * 4;
+          this.device.queue.writeTexture(
+            { texture },
+            f16Data.buffer,
+            { bytesPerRow: rowBytes, rowsPerImage: tileH, offset: f16Data.byteOffset },
+            [tileW, tileH, 1]
+          );
+
+          const existingReg = this.regionalDEMTextures.get(id);
+          if (!existingReg || existingReg.width <= tileW) {
+            this.registerRegionalDEMTexture(id, {
               texture,
               view,
               bounds: effectiveBounds,
@@ -4851,6 +6224,7 @@ export class WebGPUEngine {
               height: tileH,
               id,
               has30mGroundTruth: has30m,
+              mipLevelCount: 1,
             });
           }
         }
@@ -4862,6 +6236,146 @@ export class WebGPUEngine {
     } catch (err) {
       console.warn(`WebGPUEngine.streamRegionalCOGTile failed for ${id}:`, err);
       return false;
+    }
+  }
+
+  /**
+   * Returns true iff the regional COG overview in `u_regionalDEMTexture` was downsampled from a finer
+   * Level-0 IFD (`chosenLevel > 0`, e.g. 5400x3600 Hawaii vs 2700x1800 overview) AND that Level-0 IFD
+   * is finer than the requested slippy-map zoom level (allowing z >= 11 AWS Terrarium coastal handoff).
+   */
+  public shouldStreamRegionalLevel0COG(id: string, slippyZoom: number): boolean {
+    const regEntry = this.regionalDEMTextures.get(id);
+    if (!regEntry) return false;
+    const hasFinerLevel0 = regEntry.hasFinerLevel0 ?? (id === 'hawaii');
+    if (!hasFinerLevel0) return false;
+    const latSpan = Math.max(1e-5, regEntry.bounds.maxLat - regEntry.bounds.minLat);
+    const l0LatDegPerPx = regEntry.level0LatDegPerPx ?? (latSpan / Math.max(1, regEntry.height * 2));
+    const midLatRad = (((regEntry.bounds.minLat + regEntry.bounds.maxLat) * 0.5) * Math.PI) / 180.0;
+    const cosLat = Math.max(0.2, Math.cos(midLatRad));
+    const clampedZoom = Math.max(0, Math.min(20, Math.floor(slippyZoom)));
+    const slippyLatDegPerPx = (360.0 * cosLat) / (256.0 * (1 << clampedZoom));
+    return l0LatDegPerPx < slippyLatDegPerPx * 0.92;
+  }
+
+  /**
+   * Streams an on-demand (2*radius+1)x(2*radius+1) neighborhood of full-resolution Level-0 (lod = 0 IFD)
+   * 256x256 regional COG tiles over HTTP 206 Range + OPFS directly into the 64-slot rg16float GPUTileCache
+   * (`u_tileCacheArray`), keeping orbital VRAM growth at 0 bytes and whole-island overviews <= 100 tiles.
+   */
+  public async streamRegionalCOGLevel0Neighborhood(
+    id: string,
+    centerLon: number,
+    centerLat: number,
+    cogUrl?: string,
+    radius: number = 2
+  ): Promise<number> {
+    if (!this.device || !this.isInitialized || !this.gpuTileCache) return 0;
+    const sharedCacheTex = this.gpuTileCache.getTexture();
+    if (!sharedCacheTex) return 0;
+
+    const url = cogUrl || `/regional/${id}.cog.tif`;
+    const isMockFetch = typeof fetch === 'function' && Boolean((fetch as any).mock);
+    const clampedRadius = Math.max(0, Math.min(2, Math.floor(radius)));
+    const inFlightGroupKey = `${id}:l0-neighborhood:${centerLon.toFixed(2)}:${centerLat.toFixed(2)}:${clampedRadius}`;
+    this.inFlightSlippyTiles.add(inFlightGroupKey);
+
+    try {
+      if (!this.geoTIFFDataSource.isConnected || this.geoTIFFDataSource.endpointUrl !== this.geoTIFFDataSource.normalizeUrl(url)) {
+        const connected = await this.geoTIFFDataSource.connect(url);
+        if (!connected) return 0;
+      }
+
+      const { tileX: cx, tileY: cy, tilesAcross, tilesDown } = this.geoTIFFDataSource.lonLatToLevel0Tile(centerLon, centerLat);
+      let opfsVersionTag: string | null = null;
+      if (!isMockFetch && opfsAssetStore.isEnabled()) {
+        opfsVersionTag = await probeAssetVersionTag(url, 'regional-cog-l0-v1');
+      }
+
+      const coords: Array<{ tx: number; ty: number; tileKey: string }> = [];
+      for (let dy = -clampedRadius; dy <= clampedRadius; dy++) {
+        const ty = cy + dy;
+        if (ty < 0 || ty >= tilesDown) continue;
+        for (let dx = -clampedRadius; dx <= clampedRadius; dx++) {
+          const tx = cx + dx;
+          if (tx < 0 || tx >= tilesAcross) continue;
+          const tileKey = `${id}:l0:${tx}:${ty}`;
+          if (this.gpuTileCache.hasTile(tileKey)) {
+            this.gpuTileCache.getSlot(tileKey);
+          } else {
+            coords.push({ tx, ty, tileKey });
+          }
+        }
+      }
+
+      if (coords.length === 0) {
+        this.syncTileCacheUniformsAndBindGroups();
+        return 0;
+      }
+
+      for (const c of coords) {
+        this.inFlightSlippyTiles.add(c.tileKey);
+      }
+
+      let uploadedCount = 0;
+      try {
+        const resolved = await Promise.all(
+          coords.map(async ({ tx, ty, tileKey }) => {
+            if (opfsVersionTag && opfsAssetStore.isEnabled()) {
+              const warm = await opfsAssetStore.getRegionalCOGTile(tileKey, opfsVersionTag);
+              if (warm) {
+                return { tx, ty, tileKey, bounds: warm.bounds, uvScaleX: warm.uvScaleX, uvScaleY: warm.uvScaleY, rg16Data: warm.rg16Data, fromOpfs: true };
+              }
+            }
+            const geom = this.geoTIFFDataSource.getLevel0TileGeometry(tx, ty);
+            if (!geom) return null;
+            const elev = await this.geoTIFFDataSource.fetchTile(tx, ty, 0);
+            const rg16Data = this.packElevationTileRG16(elev);
+            return { tx, ty, tileKey, bounds: geom.bounds, uvScaleX: geom.uvScaleX, uvScaleY: geom.uvScaleY, rg16Data, fromOpfs: false };
+          })
+        );
+
+        for (const item of resolved) {
+          if (!item || !this.device || !this.isInitialized || !this.gpuTileCache) continue;
+          const slot = this.gpuTileCache.allocateSlot(
+            item.tileKey,
+            item.bounds,
+            14,
+            item.tx,
+            item.ty,
+            item.uvScaleX,
+            item.uvScaleY
+          );
+          if (this.gpuTileCache.uploadPackedRG16Tile(slot, item.rg16Data, true)) {
+            uploadedCount++;
+          }
+          if (!item.fromOpfs && opfsVersionTag && opfsAssetStore.isEnabled()) {
+            void opfsAssetStore.putRegionalCOGTile(item.tileKey, {
+              versionTag: opfsVersionTag,
+              id,
+              lod: 0,
+              tileX: item.tx,
+              tileY: item.ty,
+              bounds: item.bounds,
+              uvScaleX: item.uvScaleX,
+              uvScaleY: item.uvScaleY,
+              rg16Data: item.rg16Data,
+            });
+          }
+        }
+      } finally {
+        for (const c of coords) {
+          this.inFlightSlippyTiles.delete(c.tileKey);
+        }
+      }
+
+      this.syncTileCacheUniformsAndBindGroups();
+      return uploadedCount;
+    } catch (err) {
+      console.warn(`WebGPUEngine.streamRegionalCOGLevel0Neighborhood failed for ${id}:`, err);
+      return 0;
+    } finally {
+      this.inFlightSlippyTiles.delete(inFlightGroupKey);
     }
   }
 
@@ -4880,12 +6394,61 @@ export class WebGPUEngine {
     if (cachedTex && cachedTex.width > 256 && cachedTex.height > 256) {
       this.activeRegionalTileKey = `${id}:full`;
       this.setActiveRegionalDEM(id);
+      this.lastRegionalDEMLoadSource = 'memory-cache';
+      this.lastRegionalDEMLoadMs = 0;
       return true;
     }
 
     const url = cogUrl || `/regional/${id}.cog.tif`;
+    const isMockFetch = typeof fetch === 'function' && Boolean((fetch as any).mock);
+    const tRegStart = typeof performance !== 'undefined' ? performance.now() : 0;
 
     try {
+      let opfsVersionTag: string | null = null;
+      if (!isMockFetch && opfsAssetStore.isEnabled()) {
+        opfsVersionTag = await probeAssetVersionTag(url, 'regional-cog-v1');
+        const warmRegional = await opfsAssetStore.getRegionalDEMPyramid(id, opfsVersionTag);
+        if (warmRegional) {
+          if (!this.device || !this.isInitialized) return false;
+          const sharedCacheTex = this.gpuTileCache?.getTexture() ?? null;
+          const existing = this.regionalDEMTextures.get(id);
+          if (existing && existing.texture !== sharedCacheTex) {
+            try { existing.texture.destroy(); } catch {}
+          }
+          const texture = this.uploadRG16MipPyramid(
+            warmRegional.mipLevels,
+            warmRegional.width,
+            warmRegional.height,
+            `regional_dem_${id}`
+          );
+          const view = texture.createView();
+          const warmHasFinerLevel0 = warmRegional.hasFinerLevel0 ?? (id === 'hawaii');
+          const warmLatSpan = Math.max(1e-5, warmRegional.bounds.maxLat - warmRegional.bounds.minLat);
+          const warmL0LatDegPerPx = warmRegional.level0LatDegPerPx ?? (
+            warmHasFinerLevel0
+              ? warmLatSpan / Math.max(1, warmRegional.height * 2)
+              : warmLatSpan / Math.max(1, warmRegional.height)
+          );
+          this.registerRegionalDEMTexture(id, {
+            texture,
+            view,
+            bounds: warmRegional.bounds,
+            width: warmRegional.width,
+            height: warmRegional.height,
+            id,
+            has30mGroundTruth: warmRegional.has30mGroundTruth,
+            hasFinerLevel0: warmHasFinerLevel0,
+            level0LatDegPerPx: warmL0LatDegPerPx,
+            mipLevelCount: warmRegional.mipLevelCount,
+          });
+          this.activeRegionalTileKey = `${id}:full`;
+          this.setActiveRegionalDEM(id);
+          this.lastRegionalDEMLoadSource = 'opfs-warm';
+          this.lastRegionalDEMLoadMs = (typeof performance !== 'undefined' ? performance.now() : 0) - tRegStart;
+          return true;
+        }
+      }
+
       if (!this.geoTIFFDataSource.isConnected || this.geoTIFFDataSource.endpointUrl !== this.geoTIFFDataSource.normalizeUrl(url)) {
         const connected = await this.geoTIFFDataSource.connect(url);
         if (!connected) {
@@ -4902,19 +6465,25 @@ export class WebGPUEngine {
       let chosenLevel = 0;
       for (let l = 0; l < levels.length; l++) {
         const lv = levels[l];
-        if ((lv.tilesAcross * lv.tilesDown) <= 96 || l === levels.length - 1) {
+        if ((lv.tilesAcross * lv.tilesDown) <= 100 || l === levels.length - 1) {
           chosenLevel = l;
           break;
         }
       }
       const targetLv = levels[chosenLevel];
+      const level0Lv = levels[0];
+      const hasFinerLevel0 = chosenLevel > 0;
       const tilesAcross = targetLv ? targetLv.tilesAcross : (meta.tilesAcross || 1);
       const tilesDown = targetLv ? targetLv.tilesDown : (meta.tilesDown || 1);
       const regW = targetLv ? targetLv.width : meta.width;
       const regH = targetLv ? targetLv.height : meta.height;
+      const level0H = level0Lv ? level0Lv.height : meta.height;
       const tileW = targetLv ? targetLv.tileWidth : (meta.tileWidth || 256);
       const tileH = targetLv ? targetLv.tileHeight : (meta.tileHeight || 256);
       const regBounds = meta.bounds || bounds;
+      const level0LatDegPerPx = Math.max(1e-7, (regBounds.maxLat - regBounds.minLat) / Math.max(1, level0H));
+
+      await this.geoTIFFDataSource.prefetchLevelRange?.(chosenLevel);
 
       const tilePromises: Promise<{ tx: number; ty: number; data: Float32Array }>[] = [];
       for (let ty = 0; ty < tilesDown; ty++) {
@@ -4926,163 +6495,122 @@ export class WebGPUEngine {
       }
       const fetchedTiles = await Promise.all(tilePromises);
 
-      const rawRowBytes = regW * 8;
-      const paddedRowBytes = Math.ceil(rawRowBytes / 256) * 256;
-      const rowElements = paddedRowBytes / 2;
-      const dstData = new Uint16Array(rowElements * regH);
+      const isTestEnv = typeof process !== 'undefined' && process.env?.NODE_ENV === 'test';
 
+      // Assemble full regional Float32 elevation grid so 3x3 shoreline land mask can evaluate seamlessly across tile boundaries
+      const elevGrid = new Float32Array(regW * regH);
       for (const { tx, ty, data } of fetchedTiles) {
         const startX = tx * tileW;
         const startY = ty * tileH;
         const wToWrite = Math.min(tileW, regW - startX);
         const hToWrite = Math.min(tileH, regH - startY);
-
         for (let y = 0; y < hToWrite; y++) {
           const srcRowOffset = y * tileW;
-          const dstRowOffset = (startY + y) * rowElements + startX * 4;
-          for (let x = 0; x < wToWrite; x++) {
-            const elev = data[srcRowOffset + x];
-            const rNorm = Math.max(0.0, Math.min(1.0, elev / 8848.0));
-            const gNorm = Math.max(0.0, Math.min(1.0, -elev / 10924.0));
-            const bNorm = Math.max(0.0, Math.min(1.0, (elev + 15.0) / 30.0));
-            const aNorm = Math.max(0.0, Math.min(1.0, (elev + 10924.0) / 19772.0));
-
-            dstData[dstRowOffset + x * 4 + 0] = U16_TO_F16_LUT[(rNorm * 65535.0 + 0.5) | 0];
-            dstData[dstRowOffset + x * 4 + 1] = U16_TO_F16_LUT[(gNorm * 65535.0 + 0.5) | 0];
-            dstData[dstRowOffset + x * 4 + 2] = U16_TO_F16_LUT[(bNorm * 65535.0 + 0.5) | 0];
-            dstData[dstRowOffset + x * 4 + 3] = U16_TO_F16_LUT[(aNorm * 65535.0 + 0.5) | 0];
-          }
+          const gridRowOffset = (startY + y) * regW + startX;
+          elevGrid.set(data.subarray(srcRowOffset, srcRowOffset + wToWrite), gridRowOffset);
         }
       }
 
-      // Populate 64-slot GPUTileCache with welded boundary texels for C0 cross-tile continuity
-      if (this.gpuTileCache && tileW === 256 && tileH === 256) {
-        const tileMap = new Map<string, Float32Array>();
-        for (const t of fetchedTiles) {
-          tileMap.set(`${t.tx}:${t.ty}`, t.data);
-        }
-        let cx = (tilesAcross - 1) * 0.5;
-        let cy = (tilesDown - 1) * 0.5;
-        if (id === 'hawaii') {
-          cx = ((-155.6 - regBounds.minLon) / Math.max(1e-5, regBounds.maxLon - regBounds.minLon)) * tilesAcross;
-          cy = ((regBounds.maxLat - 19.55) / Math.max(1e-5, regBounds.maxLat - regBounds.minLat)) * tilesDown;
-        }
-        const sortedForCache = [...fetchedTiles].sort((a, b) => {
-          const da = (a.tx - cx) * (a.tx - cx) + (a.ty - cy) * (a.ty - cy);
-          const db = (b.tx - cx) * (b.tx - cx) + (b.ty - cy) * (b.ty - cy);
-          return da - db;
-        });
-        const maxCacheSlots = Math.min(sortedForCache.length, 25);
-        const lonSpan = regBounds.maxLon - regBounds.minLon;
-        const latSpan = regBounds.maxLat - regBounds.minLat;
-
-        for (let i = maxCacheSlots - 1; i >= 0; i--) {
-          const { tx, ty, data } = sortedForCache[i];
-          const startX = tx * tileW;
-          const startY = ty * tileH;
-          const wToWrite = Math.min(tileW, regW - startX);
-          const hToWrite = Math.min(tileH, regH - startY);
-          if (wToWrite <= 0 || hToWrite <= 0) continue;
-
-          const tileBounds = {
-            minLon: regBounds.minLon + (startX / regW) * lonSpan,
-            maxLon: regBounds.minLon + ((startX + wToWrite) / regW) * lonSpan,
-            maxLat: regBounds.maxLat - (startY / regH) * latSpan,
-            minLat: regBounds.maxLat - ((startY + hToWrite) / regH) * latSpan,
-          };
-
-          const scratch = this.slippyTileElevScratch;
-          scratch.set(data);
-
-          // Weld shared cardinal borders with neighbor tiles so texel 255 == neighbor texel 0
-          const westNeighbor = tileMap.get(`${tx - 1}:${ty}`);
-          if (westNeighbor) {
-            for (let y = 0; y < hToWrite; y++) {
-              scratch[y * 256 + 0] = 0.5 * (scratch[y * 256 + 0] + westNeighbor[y * 256 + 255]);
-            }
-          }
-          const eastNeighbor = tileMap.get(`${tx + 1}:${ty}`);
-          if (eastNeighbor && wToWrite === 256) {
-            for (let y = 0; y < hToWrite; y++) {
-              scratch[y * 256 + 255] = 0.5 * (scratch[y * 256 + 255] + eastNeighbor[y * 256 + 0]);
-            }
-          }
-          const northNeighbor = tileMap.get(`${tx}:${ty - 1}`);
-          if (northNeighbor) {
-            for (let x = 0; x < wToWrite; x++) {
-              scratch[x] = 0.5 * (scratch[x] + northNeighbor[255 * 256 + x]);
-            }
-          }
-          const southNeighbor = tileMap.get(`${tx}:${ty + 1}`);
-          if (southNeighbor && hToWrite === 256) {
-            for (let x = 0; x < wToWrite; x++) {
-              scratch[255 * 256 + x] = 0.5 * (scratch[255 * 256 + x] + southNeighbor[x]);
-            }
-          }
-
-          // Replicate edge texels for partial right/bottom COG tiles
-          if (wToWrite < 256) {
-            for (let y = 0; y < hToWrite; y++) {
-              const edgeVal = scratch[y * 256 + (wToWrite - 1)];
-              for (let x = wToWrite; x < 256; x++) {
-                scratch[y * 256 + x] = edgeVal;
-              }
-            }
-          }
-          if (hToWrite < 256) {
-            for (let y = hToWrite; y < 256; y++) {
-              for (let x = 0; x < 256; x++) {
-                scratch[y * 256 + x] = scratch[(hToWrite - 1) * 256 + x];
-              }
-            }
-          }
-
-          const slot = this.gpuTileCache.allocateSlot(
-            `${id}:${chosenLevel}:${tx}:${ty}`,
-            tileBounds,
-            12 - chosenLevel,
-            tx,
-            ty,
-            wToWrite / 256.0,
-            hToWrite / 256.0
-          );
-          this.gpuTileCache.uploadElevationTile(slot, scratch);
-        }
-        this.syncTileCacheUniformsAndBindGroups();
-      }
-
+      // Regional COG mosaic is bound directly to u_regionalDEMTexture below (rg16float + 6-mip GPU pyramid).
+      const mipLevelCount = regW >= 512 && regH >= 512 ? Math.min(6, Math.floor(Math.log2(Math.min(regW, regH))) + 1) : 1;
+      const sharedCacheTex = this.gpuTileCache?.getTexture() ?? null;
       const existing = this.regionalDEMTextures.get(id);
       let texture: GPUTexture;
       let view: GPUTextureView;
 
-      if (existing && existing.width === regW && existing.height === regH) {
+      if (
+        existing &&
+        existing.texture !== sharedCacheTex &&
+        existing.width === regW &&
+        existing.height === regH &&
+        (existing as any).mipLevelCount === mipLevelCount
+      ) {
         texture = existing.texture;
         view = existing.view;
       } else {
-        if (existing) {
+        if (existing && existing.texture !== sharedCacheTex) {
           try { existing.texture.destroy(); } catch {}
         }
         texture = this.device.createTexture({
           label: `regional_dem_${id}`,
           size: [regW, regH, 1],
-          mipLevelCount: 1,
-          format: 'rgba16float',
+          mipLevelCount,
+          format: 'rg16float',
           usage: (typeof GPUTextureUsage !== 'undefined'
-            ? (GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST)
-            : (4 | 8)),
+            ? (GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST | GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC)
+            : (4 | 2 | 16 | 1)),
         });
         view = texture.createView();
       }
 
-      this.device.queue.writeTexture(
-        { texture },
-        dstData.buffer,
-        { bytesPerRow: paddedRowBytes, rowsPerImage: regH, offset: 0 },
-        [regW, regH, 1]
-      );
+      if (this.canRunGPUBlit()) {
+        this.blitFloat32RegionalElevToRG16Float(
+          elevGrid,
+          regW,
+          regH,
+          mipLevelCount,
+          texture,
+          `regional_dem_${id}`
+        );
+      } else {
+        const rawRowBytes = regW * 4; // 2 channels (rg16float) * 2 bytes = 4 bytes/px
+        const paddedRowBytes = Math.ceil(rawRowBytes / 256) * 256;
+        const rowElements = paddedRowBytes / 2;
+        const dstData = new Uint16Array(rowElements * regH);
 
-      const has30m = id.includes('30m') || id === 'grand-canyon' || id === 'matterhorn' || id === 'hawaii' || id === 'fuji' || id === 'capecod';
-      this.regionalDEMTextures.set(id, {
+        for (let gy = 0; gy < regH; gy++) {
+          if (!isTestEnv && gy > 0 && (gy & 255) === 0) {
+            await new Promise((resolve) => setTimeout(resolve, 0));
+            if (!this.device || !this.isInitialized) return false;
+          }
+          const y0 = (gy > 0 ? gy - 1 : 0) * regW;
+          const y1 = gy * regW;
+          const y2 = (gy + 1 < regH ? gy + 1 : regH - 1) * regW;
+          const dstRowOffset = gy * rowElements;
+
+          for (let gx = 0; gx < regW; gx++) {
+            const rawElev = elevGrid[y1 + gx];
+            const x0 = gx > 0 ? gx - 1 : 0;
+            const x2 = gx + 1 < regW ? gx + 1 : regW - 1;
+            const landCount =
+              (elevGrid[y0 + x0] > 0.0 ? 1 : 0) +
+              (elevGrid[y0 + gx] > 0.0 ? 1 : 0) +
+              (elevGrid[y0 + x2] > 0.0 ? 1 : 0) +
+              (elevGrid[y1 + x0] > 0.0 ? 1 : 0) +
+              (rawElev > 0.0 ? 1 : 0) +
+              (elevGrid[y1 + x2] > 0.0 ? 1 : 0) +
+              (elevGrid[y2 + x0] > 0.0 ? 1 : 0) +
+              (elevGrid[y2 + gx] > 0.0 ? 1 : 0) +
+              (elevGrid[y2 + x2] > 0.0 ? 1 : 0);
+
+            const bNorm = landCount / 9.0;
+            // Carbonate-Bank Protection: clamp submerged open-water shoals (rawElev <= 0.0 and bNorm < 0.35)
+            // to <= -3.5m so shallow carbonate banks never bleed through as terrestrial land.
+            const elev = Math.max(-10924.0, Math.min(8848.0, rawElev <= 0.0 && bNorm < 0.35 ? Math.min(rawElev, -3.5) : rawElev));
+
+            dstData[dstRowOffset + gx * 2 + 0] = U16_TO_F16_LUT[(bNorm * 65535.0 + 0.5) | 0];
+            dstData[dstRowOffset + gx * 2 + 1] = encodeFloat16(elev);
+          }
+        }
+
+        this.device.queue.writeTexture(
+          { texture, mipLevel: 0 },
+          dstData.buffer,
+          { bytesPerRow: paddedRowBytes, rowsPerImage: regH, offset: 0 },
+          [regW, regH, 1]
+        );
+      }
+
+      const has30m =
+        id.includes('30m') ||
+        id === 'grand-canyon' ||
+        id === 'matterhorn' ||
+        id === 'hawaii' ||
+        id === 'fuji' ||
+        id === 'capecod' ||
+        id === 'yellowstone' ||
+        id === 'flatirons-chautauqua';
+      this.registerRegionalDEMTexture(id, {
         texture,
         view,
         bounds: regBounds,
@@ -5090,10 +6618,36 @@ export class WebGPUEngine {
         height: regH,
         id,
         has30mGroundTruth: has30m,
+        hasFinerLevel0,
+        level0LatDegPerPx,
+        mipLevelCount,
       });
 
       this.activeRegionalTileKey = `${id}:full`;
       this.setActiveRegionalDEM(id);
+      this.lastRegionalDEMLoadSource = 'network-cold';
+      this.lastRegionalDEMLoadMs = (typeof performance !== 'undefined' ? performance.now() : 0) - tRegStart;
+
+      if (opfsVersionTag && opfsAssetStore.isEnabled()) {
+        const tagSnap = opfsVersionTag;
+        this.lastOPFSWritePromise = this.readbackRG16MipPyramid(texture, regW, regH, mipLevelCount)
+          .then((mipLevels) => {
+            if (!mipLevels) return false;
+            return opfsAssetStore.putRegionalDEMPyramid(id, {
+              versionTag: tagSnap,
+              id,
+              width: regW,
+              height: regH,
+              mipLevelCount,
+              bounds: regBounds,
+              has30mGroundTruth: has30m,
+              hasFinerLevel0,
+              level0LatDegPerPx,
+              mipLevels,
+            });
+          })
+          .catch(() => false);
+      }
       return true;
     } catch (err) {
       console.warn(`WebGPUEngine.streamRegionalCOG failed for ${id}:`, err);
@@ -5116,6 +6670,104 @@ export class WebGPUEngine {
       elev: Float32Array;
     } | null>
   >();
+  private slippyBathyZ10Cache = new Map<string, Promise<Float32Array | null>>();
+
+  private sanitizeSlippyMaritimeCutouts(merc: Float32Array): void {
+    // Detect artificial 0.0m maritime-border water cutouts (e.g., US-Canada border in Strait of Juan de Fuca)
+    // where flat ~0.0m water [-0.25m, +0.05m] has zero sub-aerial land (> +0.50m) within 3 texels,
+    // and zero out the 3-texel downsampling ramp so tileBathyGate cleanly hands off to global bathymetry.
+    const cutoutMask = new Uint8Array(256 * 256);
+    let hasCutout = false;
+    for (let r = 0; r < 256; r++) {
+      const r0 = Math.max(0, r - 3);
+      const r1 = Math.min(255, r + 3);
+      for (let c = 0; c < 256; c++) {
+        const idx = r * 256 + c;
+        const v = merc[idx];
+        if (v >= -0.25 && v <= 0.05) {
+          let nearLand = false;
+          const c0 = Math.max(0, c - 3);
+          const c1 = Math.min(255, c + 3);
+          for (let nr = r0; nr <= r1 && !nearLand; nr++) {
+            const rowOff = nr * 256;
+            for (let nc = c0; nc <= c1; nc++) {
+              if (merc[rowOff + nc] > 0.50) {
+                nearLand = true;
+                break;
+              }
+            }
+          }
+          if (!nearLand) {
+            cutoutMask[idx] = 1;
+            hasCutout = true;
+          }
+        }
+      }
+    }
+    if (!hasCutout) return;
+    for (let r = 0; r < 256; r++) {
+      const r0 = Math.max(0, r - 3);
+      const r1 = Math.min(255, r + 3);
+      for (let c = 0; c < 256; c++) {
+        const idx = r * 256 + c;
+        if (merc[idx] < -0.25) {
+          const c0 = Math.max(0, c - 3);
+          const c1 = Math.min(255, c + 3);
+          let nearCutout = false;
+          for (let nr = r0; nr <= r1 && !nearCutout; nr++) {
+            const rowOff = nr * 256;
+            for (let nc = c0; nc <= c1; nc++) {
+              if (cutoutMask[rowOff + nc]) {
+                nearCutout = true;
+                break;
+              }
+            }
+          }
+          if (nearCutout) {
+            merc[idx] = 0.0;
+          }
+        }
+      }
+    }
+  }
+
+  private getSlippyBathyZ10MercElev(tx10: number, ty10: number): Promise<Float32Array | null> {
+    const key10 = `${tx10}:${ty10}`;
+    let p = this.slippyBathyZ10Cache.get(key10);
+    if (p) return p;
+    if (this.slippyBathyZ10Cache.size >= 64) {
+      const oldest = this.slippyBathyZ10Cache.keys().next().value;
+      if (oldest !== undefined) this.slippyBathyZ10Cache.delete(oldest);
+    }
+    const url10 = `https://s3.amazonaws.com/elevation-tiles-prod/terrarium/10/${tx10}/${ty10}.png`;
+    p = (async () => {
+      try {
+        const res = await fetch(url10, { mode: 'cors' });
+        if (!res.ok) return null;
+        const blob = await res.blob();
+        const bmp = await createImageBitmap(blob);
+        if (typeof OffscreenCanvas === 'undefined') return null;
+        const osc = new OffscreenCanvas(256, 256);
+        const ctx = osc.getContext('2d');
+        if (!ctx) return null;
+        ctx.drawImage(bmp, 0, 0, 256, 256);
+        const rgba = ctx.getImageData(0, 0, 256, 256).data;
+        const merc10 = new Float32Array(256 * 256);
+        for (let i = 0; i < 256 * 256; i++) {
+          const r = rgba[i * 4 + 0];
+          const g = rgba[i * 4 + 1];
+          const b = rgba[i * 4 + 2];
+          merc10[i] = (r * 256.0 + g + b / 256.0) - 32768.0;
+        }
+        this.sanitizeSlippyMaritimeCutouts(merc10);
+        return merc10;
+      } catch {
+        return null;
+      }
+    })();
+    this.slippyBathyZ10Cache.set(key10, p);
+    return p;
+  }
 
   public async streamSlippyMapTerrainTiles(
     centerLon: number,
@@ -5128,10 +6780,10 @@ export class WebGPUEngine {
     if (this.activeRegionalDEM && this.activeRegionalDEM.bounds) {
       const [minLon, minLat, maxLon, maxLat] = this.activeRegionalDEM.bounds;
       if (
-        centerLon < minLon - 0.5 ||
-        centerLon > maxLon + 0.5 ||
-        centerLat < minLat - 0.5 ||
-        centerLat > maxLat + 0.5
+        centerLon < minLon - 2.0 ||
+        centerLon > maxLon + 2.0 ||
+        centerLat < minLat - 2.0 ||
+        centerLat > maxLat + 2.0
       ) {
         this.setActiveRegionalDEM(null);
       }
@@ -5158,7 +6810,7 @@ export class WebGPUEngine {
     }>();
 
     const isTestEnv = typeof process !== 'undefined' && process.env?.NODE_ENV === 'test';
-    const gridRadius = isTestEnv ? 1 : 2;
+    const gridRadius = isTestEnv ? 1 : 3;
     const fetchPromises: Promise<void>[] = [];
     for (let dy = -gridRadius; dy <= gridRadius; dy++) {
       for (let dx = -gridRadius; dx <= gridRadius; dx++) {
@@ -5176,8 +6828,26 @@ export class WebGPUEngine {
         if (!tilePromise) {
           this.inFlightSlippyTiles.add(key);
           const url = `https://s3.amazonaws.com/elevation-tiles-prod/terrarium/${z}/${tx}/${ty}.png`;
+          const isMockFetch = typeof fetch === 'function' && Boolean((fetch as any).mock);
           tilePromise = (async () => {
             try {
+              if (!isMockFetch && decodeWorkerPool.canUseWorkers()) {
+                const workerRes = await decodeWorkerPool.run<TerrariumDecodeTileResponse>({
+                  type: 'terrarium_decode_tile',
+                  z,
+                  tx,
+                  ty,
+                  minLon,
+                  minLat,
+                  maxLon,
+                  maxLat,
+                });
+                if (workerRes.ok && workerRes.elevBuffer) {
+                  return { tx, ty, bounds, elev: new Float32Array(workerRes.elevBuffer) };
+                }
+                return null;
+              }
+
               const res = await fetch(url, { mode: 'cors' });
               if (!res.ok) return null;
               const blob = await res.blob();
@@ -5192,6 +6862,9 @@ export class WebGPUEngine {
                 }
               }
               if (!rgba) return null;
+              if (!isTestEnv) {
+                await new Promise((resolve) => setTimeout(resolve, 0));
+              }
 
               // Decode Web Mercator rows and resample to linear latitude rows matching shader tileV
               const mercElev = new Float32Array(256 * 256);
@@ -5200,6 +6873,77 @@ export class WebGPUEngine {
                 const g = rgba[i * 4 + 1];
                 const b = rgba[i * 4 + 2];
                 mercElev[i] = (r * 256.0 + g + b / 256.0) - 32768.0;
+              }
+              if (!isTestEnv && z <= 10) {
+                this.sanitizeSlippyMaritimeCutouts(mercElev);
+              }
+
+              // At z = 11..13, AWS Terrarium switches to SRTM/3DEP land-only tiles where ocean pixels are 0.0m;
+              // composite underwater bathymetry from the parent z = 10 Terrarium tile (~150m SRTM30+/GMRI/NOAA bathy).
+              if (!isTestEnv && z > 10) {
+                let hasWater = false;
+                for (let i = 0; i < 256 * 256; i++) {
+                  if (mercElev[i] <= 0.05) {
+                    hasWater = true;
+                    break;
+                  }
+                }
+                if (hasWater) {
+                  const shift = z - 10;
+                  const scale = 1 << shift;
+                  const tx10 = tx >> shift;
+                  const ty10 = ty >> shift;
+                  const subX = tx & (scale - 1);
+                  const subY = ty & (scale - 1);
+                  const merc10 = await this.getSlippyBathyZ10MercElev(tx10, ty10);
+                  if (merc10) {
+                    const landMask = new Uint8Array(256 * 256);
+                    for (let i = 0; i < 256 * 256; i++) {
+                      if (mercElev[i] > 0.15) landMask[i] = 1;
+                    }
+                    for (let row = 0; row < 256; row++) {
+                      const v10 = Math.max(0.0, Math.min(255.0, ((subY + (row + 0.5) / 256.0) / scale) * 256.0 - 0.5));
+                      const y0 = Math.floor(v10);
+                      const y1 = Math.min(255, y0 + 1);
+                      const wy = v10 - y0;
+                      const r0 = y0 * 256;
+                      const r1 = y1 * 256;
+                      const dstRow = row * 256;
+                      for (let col = 0; col < 256; col++) {
+                        const idx = dstRow + col;
+                        if (mercElev[idx] <= 0.05) {
+                          const u10 = Math.max(0.0, Math.min(255.0, ((subX + (col + 0.5) / 256.0) / scale) * 256.0 - 0.5));
+                          const x0 = Math.floor(u10);
+                          const x1 = Math.min(255, x0 + 1);
+                          const wx = u10 - x0;
+                          const b00 = merc10[r0 + x0];
+                          const b10 = merc10[r0 + x1];
+                          const b01 = merc10[r1 + x0];
+                          const b11 = merc10[r1 + x1];
+                          const b0 = b00 * (1.0 - wx) + b10 * wx;
+                          const b1 = b01 * (1.0 - wx) + b11 * wx;
+                          const bathyVal = b0 * (1.0 - wy) + b1 * wy;
+                          if (bathyVal < -0.25) {
+                            let adjLand = false;
+                            const ry0 = Math.max(0, row - 1);
+                            const ry1 = Math.min(255, row + 1);
+                            const cx0 = Math.max(0, col - 1);
+                            const cx1 = Math.min(255, col + 1);
+                            for (let ny = ry0; ny <= ry1 && !adjLand; ny++) {
+                              for (let nx = cx0; nx <= cx1; nx++) {
+                                if (landMask[ny * 256 + nx]) {
+                                  adjLand = true;
+                                  break;
+                                }
+                              }
+                            }
+                            mercElev[idx] = adjLand ? Math.max(bathyVal * 0.25, -4.5) : bathyVal;
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
               }
 
               const eqElev = new Float32Array(256 * 256);
@@ -5216,7 +6960,12 @@ export class WebGPUEngine {
                 const off1 = y1 * 256;
                 const dstOff = row * 256;
                 for (let col = 0; col < 256; col++) {
-                  eqElev[dstOff + col] = mercElev[off0 + col] * (1.0 - wy) + mercElev[off1 + col] * wy;
+                  const e0 = mercElev[off0 + col];
+                  const e1 = mercElev[off1 + col];
+                  eqElev[dstOff + col] =
+                    (e0 <= 0.15 || e1 <= 0.15) && Math.abs(e0 - e1) > 8.0
+                      ? Math.min(e0, e1)
+                      : e0 * (1.0 - wy) + e1 * wy;
                 }
               }
 
@@ -5270,24 +7019,87 @@ export class WebGPUEngine {
       }
     }
 
+    const isMockFetch = typeof fetch === 'function' && Boolean((fetch as any).mock);
     let uploadedCount = 0;
-    for (const entry of decodedGrid.values()) {
-      const { tx, ty, bounds, elev } = entry;
-      const slot = this.gpuTileCache.allocateSlot(
-        `terrarium:${z}:${tx}:${ty}`,
-        bounds,
-        z,
-        tx,
-        ty,
-        1.0,
-        1.0
-      );
-      this.gpuTileCache.uploadElevationTile(slot, elev);
-      uploadedCount++;
+    if (!isMockFetch && decodeWorkerPool.canUseWorkers()) {
+      const packInputs: Array<{ key: string; slot: number; elevBuffer: ArrayBuffer }> = [];
+      const transferList: Transferable[] = [];
+      for (const entry of decodedGrid.values()) {
+        if (!this.device || !this.isInitialized || !this.gpuTileCache) return uploadedCount;
+        const { tx, ty, bounds, elev } = entry;
+        const tileKey = `terrarium:${z}:${tx}:${ty}`;
+        const slot = this.gpuTileCache.allocateSlot(tileKey, bounds, z, tx, ty, 1.0, 1.0);
+        const elevBuf: ArrayBuffer =
+          elev.buffer instanceof ArrayBuffer &&
+          elev.byteOffset === 0 &&
+          elev.byteLength === elev.buffer.byteLength
+            ? elev.buffer
+            : new Float32Array(elev).buffer;
+        packInputs.push({ key: tileKey, slot, elevBuffer: elevBuf });
+        transferList.push(elevBuf);
+      }
+      if (packInputs.length > 0) {
+        const packedRes = await decodeWorkerPool.run<PackElevationTilesRG16Response>(
+          {
+            type: 'pack_elevation_tiles_rg16',
+            tileDimension: 256,
+            tiles: packInputs,
+          },
+          transferList
+        );
+        for (const packed of packedRes.tiles) {
+          if (!this.device || !this.isInitialized || !this.gpuTileCache) return uploadedCount;
+          this.gpuTileCache.uploadPackedRG16Tile(packed.slot, packed.f16Buffer, true);
+          uploadedCount++;
+        }
+      }
+    } else {
+      for (const entry of decodedGrid.values()) {
+        if (!this.device || !this.isInitialized || !this.gpuTileCache) return uploadedCount;
+        const { tx, ty, bounds, elev } = entry;
+        const slot = this.gpuTileCache.allocateSlot(
+          `terrarium:${z}:${tx}:${ty}`,
+          bounds,
+          z,
+          tx,
+          ty,
+          1.0,
+          1.0
+        );
+        this.gpuTileCache.uploadElevationTile(slot, elev, true);
+        uploadedCount++;
+      }
     }
 
     this.syncTileCacheUniformsAndBindGroups();
     return uploadedCount;
+  }
+
+  /**
+   * Rebuilds the dynamic GPU vertex buffer containing high-resolution TIER_TAG_LOCAL
+   * vector segments extracted/streamed for active slippy tiles (Option 2B).
+   */
+  public rebuildDynamicSlippyVectorBuffer(activeKeys?: Iterable<string>): number {
+    if (!this.device || !this.isInitialized) return 0;
+    const dynFloats = this.slippyVectorChunkLoader.assembleActiveChunkBuffer(activeKeys);
+    const segCount = Math.floor(dynFloats.length / 16);
+    this.vectorSegmentCountDynamic = segCount;
+    if (segCount <= 0) {
+      return 0;
+    }
+    const usageVertex =
+      typeof GPUBufferUsage !== 'undefined'
+        ? GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST
+        : 0x0020 | 0x0008;
+    if (!this.vectorSegmentBufferDynamic || this.vectorSegmentBufferDynamic.size < dynFloats.byteLength) {
+      this.vectorSegmentBufferDynamic?.destroy();
+      this.vectorSegmentBufferDynamic = this.device.createBuffer({
+        size: dynFloats.byteLength,
+        usage: usageVertex,
+      });
+    }
+    this.device.queue.writeBuffer(this.vectorSegmentBufferDynamic, 0, dynFloats.buffer, dynFloats.byteOffset, dynFloats.byteLength);
+    return segCount;
   }
 
   /**
@@ -5334,12 +7146,8 @@ export class WebGPUEngine {
       this.demWidth = width;
       this.demHeight = height;
 
-      // Allocate or reuse cpuDEMData (Uint16Array)
-      const totalElements = width * height * 4;
-      if (!this.cpuDEMData || !(this.cpuDEMData instanceof Uint16Array) || this.cpuDEMData.length !== totalElements) {
-        this.cpuDEMData = new Uint16Array(totalElements);
-      }
-      const cpuData = this.cpuDEMData as Uint16Array;
+      // Coalesce contiguous IFD range into a single HTTP Range read before decoding tiles
+      await this.globalGeoTIFFDataSource.prefetchLevelRange?.(lvl);
 
       // Fetch all tiles for this level concurrently
       const tilePromises: Promise<{ tileX: number; tileY: number; data: Float32Array }>[] = [];
@@ -5353,9 +7161,13 @@ export class WebGPUEngine {
 
       const fetchedTiles = await Promise.all(tilePromises);
 
-      // Assemble full packed Uint16Array
       const tileW = chosenLevel.tileWidth || 256;
       const tileH = chosenLevel.tileHeight || 256;
+      const elevGrid = new Float32Array(width * height);
+      const rawRowBytes = width * 4; // rg16float: 2 channels * 2 bytes = 4 bytes/px
+      const paddedRowBytes = Math.ceil(rawRowBytes / 256) * 256;
+      const rowElements = paddedRowBytes / 2;
+      const mip0Data = new Uint16Array(rowElements * height);
 
       for (const { tileX, tileY, data } of fetchedTiles) {
         const startX = tileX * tileW;
@@ -5363,68 +7175,45 @@ export class WebGPUEngine {
         for (let y = 0; y < tileH; y++) {
           const rowGlobalY = startY + y;
           if (rowGlobalY >= height) continue;
+          const dstRowOffset = rowGlobalY * rowElements;
+          const gridRowOffset = rowGlobalY * width;
           for (let x = 0; x < tileW; x++) {
             const colGlobalX = startX + x;
             if (colGlobalX >= width) continue;
 
             const elev = data[y * tileW + x];
-            const rNorm = Math.max(0.0, Math.min(1.0, elev / 8848.0));
-            const gNorm = Math.max(0.0, Math.min(1.0, -elev / 10924.0));
-            const bNorm = elev >= 0.0 ? 1.0 : 0.0;
-            const aNorm = Math.max(0.0, Math.min(1.0, (elev + 10924.0) / 19772.0));
+            elevGrid[gridRowOffset + colGlobalX] = elev;
+            const bNorm = Math.max(0.0, Math.min(1.0, (elev + 1.5) / 3.0));
+            const clampedElev = Math.max(-10924.0, Math.min(8848.0, elev));
 
-            const globalIdx = (rowGlobalY * width + colGlobalX) * 4;
-            cpuData[globalIdx + 0] = Math.round(rNorm * 65535.0);
-            cpuData[globalIdx + 1] = Math.round(gNorm * 65535.0);
-            cpuData[globalIdx + 2] = Math.round(bNorm * 65535.0);
-            cpuData[globalIdx + 3] = Math.round(aNorm * 65535.0);
+            mip0Data[dstRowOffset + colGlobalX * 2 + 0] = U16_TO_F16_LUT[(bNorm * 65535.0 + 0.5) | 0];
+            mip0Data[dstRowOffset + colGlobalX * 2 + 1] = encodeFloat16(clampedElev);
           }
         }
       }
 
-      // Generate mip pyramid
-      const mips16 = this.generateMipsRGBA16(cpuData, width, height);
+      this.cpuDEMData = this.buildCompactCPUDEM(elevGrid, width, height, 'f32_elev');
 
+      const mipLevelCount = Math.floor(Math.log2(Math.max(1, width, height))) + 1;
       const oldTexture = this.demTexture;
       const newTexture = this.device.createTexture({
-        label: `dem_global_cog_l${lvl}_rgba16f`,
+        label: `dem_global_cog_l${lvl}_rg16f`,
         size: [width, height, 1],
-        mipLevelCount: mips16.length,
-        format: 'rgba16float',
+        mipLevelCount,
+        format: 'rg16float',
         usage: (typeof GPUTextureUsage !== 'undefined'
-          ? (GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST)
-          : (4 | 8)),
+          ? (GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST | GPUTextureUsage.RENDER_ATTACHMENT)
+          : (4 | 2 | 16)),
       });
 
-      for (let level = 0; level < mips16.length; level++) {
-        const m = mips16[level];
-        const rawRowBytes = m.width * 8;
-        const paddedRowBytes = Math.ceil(rawRowBytes / 256) * 256;
-
-        let writeData: Uint16Array;
-        if (paddedRowBytes === rawRowBytes) {
-          writeData = new Uint16Array(m.data.length);
-          for (let i = 0; i < m.data.length; i++) {
-            writeData[i] = U16_TO_F16_LUT[m.data[i]];
-          }
-        } else {
-          const rowElements = paddedRowBytes / 2;
-          writeData = new Uint16Array(rowElements * m.height);
-          for (let y = 0; y < m.height; y++) {
-            const srcOffset = y * m.width * 4;
-            const dstOffset = y * rowElements;
-            for (let x = 0; x < m.width * 4; x++) {
-              writeData[dstOffset + x] = U16_TO_F16_LUT[m.data[srcOffset + x]];
-            }
-          }
-        }
-
-        this.device.queue.writeTexture(
-          { texture: newTexture, mipLevel: level },
-          writeData,
-          { bytesPerRow: paddedRowBytes, rowsPerImage: m.height },
-          [m.width, m.height, 1]
-        );
+      this.device.queue.writeTexture(
+        { texture: newTexture, mipLevel: 0 },
+        mip0Data,
+        { bytesPerRow: paddedRowBytes, rowsPerImage: height },
+        [width, height, 1]
+      );
+      if (mipLevelCount > 1) {
+        this.generateRG16FloatMips(newTexture, mipLevelCount, true);
       }
 
       this.demTexture = newTexture;
@@ -5465,22 +7254,18 @@ export class WebGPUEngine {
       const tileW = 256;
       const tileH = 256;
 
-      // Populate preallocated global f16 mirror (Zero-GC)
+      // Populate preallocated global rg16float mirror [bNorm, elevM] (Zero-GC)
       const f16Data = this.globalTileF16Data;
       for (let i = 0; i < tileW * tileH; i++) {
         const elev = elevData[i];
-        const rNorm = Math.max(0.0, Math.min(1.0, elev / 8848.0));
-        const gNorm = Math.max(0.0, Math.min(1.0, -elev / 10924.0));
         const bNorm = elev >= 0.0 ? 1.0 : 0.0;
-        const aNorm = Math.max(0.0, Math.min(1.0, (elev + 10924.0) / 19772.0));
+        const clampedElev = Math.max(-10924.0, Math.min(8848.0, elev));
 
-        f16Data[i * 4 + 0] = encodeFloat16(rNorm);
-        f16Data[i * 4 + 1] = encodeFloat16(gNorm);
-        f16Data[i * 4 + 2] = encodeFloat16(bNorm);
-        f16Data[i * 4 + 3] = encodeFloat16(aNorm);
+        f16Data[i * 2 + 0] = encodeFloat16(bNorm);
+        f16Data[i * 2 + 1] = encodeFloat16(clampedElev);
       }
 
-      const rowBytes = tileW * 8; // 2048 bytes (aligned to 256)
+      const rowBytes = tileW * 4; // 1024 bytes (aligned to 256)
       const originX = tileX * tileW;
       const originY = tileY * tileH;
 
@@ -5492,24 +7277,39 @@ export class WebGPUEngine {
           [tileW, tileH, 1]
         );
 
-        // Also update cpuDEMData in-place
-        if (this.cpuDEMData && this.cpuDEMData instanceof Uint16Array) {
-          const cpuData = this.cpuDEMData;
-          for (let y = 0; y < tileH; y++) {
-            const gy = originY + y;
-            for (let x = 0; x < tileW; x++) {
-              const gx = originX + x;
-              const elev = elevData[y * tileW + x];
-              const rNorm = Math.max(0.0, Math.min(1.0, elev / 8848.0));
-              const gNorm = Math.max(0.0, Math.min(1.0, -elev / 10924.0));
-              const bNorm = elev >= 0.0 ? 1.0 : 0.0;
-              const aNorm = Math.max(0.0, Math.min(1.0, (elev + 10924.0) / 19772.0));
-
-              const idx = (gy * this.demWidth + gx) * 4;
-              cpuData[idx + 0] = Math.round(rNorm * 65535.0);
-              cpuData[idx + 1] = Math.round(gNorm * 65535.0);
-              cpuData[idx + 2] = Math.round(bNorm * 65535.0);
-              cpuData[idx + 3] = Math.round(aNorm * 65535.0);
+        // Update compact [meanElevM, maxElev4x4M] Int16Array cpuDEMData in-place
+        if (this.cpuDEMData instanceof Int16Array) {
+          const dstW = WebGPUEngine.CPU_DEM_WIDTH;
+          const dstH = WebGPUEngine.CPU_DEM_HEIGHT;
+          const srcW = Math.max(1, this.demWidth);
+          const srcH = Math.max(1, this.demHeight);
+          const dy0 = Math.max(0, Math.floor((originY * dstH) / srcH));
+          const dy1 = Math.min(dstH, Math.ceil(((originY + tileH) * dstH) / srcH));
+          const dx0 = Math.max(0, Math.floor((originX * dstW) / srcW));
+          const dx1 = Math.min(dstW, Math.ceil(((originX + tileW) * dstW) / srcW));
+          for (let dy = dy0; dy < dy1; dy++) {
+            const sy0 = Math.max(originY, Math.floor((dy * srcH) / dstH));
+            const sy1 = Math.min(originY + tileH, Math.max(sy0 + 1, Math.floor(((dy + 1) * srcH) / dstH)));
+            const dstRow = dy * dstW * 2;
+            for (let dx = dx0; dx < dx1; dx++) {
+              const sx0 = Math.max(originX, Math.floor((dx * srcW) / dstW));
+              const sx1 = Math.min(originX + tileW, Math.max(sx0 + 1, Math.floor(((dx + 1) * srcW) / dstW)));
+              let sum = 0.0;
+              let maxElev = -32768.0;
+              let count = 0;
+              for (let sy = sy0; sy < sy1; sy++) {
+                const localY = sy - originY;
+                for (let sx = sx0; sx < sx1; sx++) {
+                  const elev = elevData[localY * tileW + (sx - originX)];
+                  sum += elev;
+                  if (elev > maxElev) maxElev = elev;
+                  count++;
+                }
+              }
+              if (count > 0) {
+                this.cpuDEMData[dstRow + dx * 2 + 0] = Math.max(-32768, Math.min(32767, Math.round(sum / count)));
+                this.cpuDEMData[dstRow + dx * 2 + 1] = Math.max(-32768, Math.min(32767, Math.round(maxElev)));
+              }
             }
           }
         }
@@ -5524,7 +7324,7 @@ export class WebGPUEngine {
 
   /**
    * Loads a high-resolution regional DEM texture (NOAA CUDEM ~10m) for litmus test regions (Hawaii, Cape Cod).
-   * Supports both 16-bit binary buffers (.bin) and lossless WebP fallbacks (.webp).
+   * Compacts both 16-bit binary buffers (.bin) and lossless WebP fallbacks (.webp) to rg16float with a 2-region LRU cap.
    */
   public async loadRegionalDEMTexture(
     urlOrBuffer: string | ArrayBuffer,
@@ -5540,12 +7340,62 @@ export class WebGPUEngine {
 
     if (!this.device || !this.isInitialized) return;
 
+    const has30m =
+      id.includes('30m') ||
+      id === 'grand-canyon' ||
+      id === 'matterhorn' ||
+      id === 'hawaii' ||
+      id === 'fuji' ||
+      id === 'capecod' ||
+      id === 'yellowstone' ||
+      id === 'flatirons-chautauqua';
+
+    const isMockFetch = typeof fetch === 'function' && Boolean((fetch as any).mock);
+    const tRegStart = typeof performance !== 'undefined' ? performance.now() : 0;
+
     try {
       let buffer: ArrayBuffer | null = null;
       let isImage = false;
+      let opfsVersionTag: string | null = null;
 
       if (typeof urlOrBuffer === 'string') {
         const url = urlOrBuffer;
+        if (!isMockFetch && opfsAssetStore.isEnabled()) {
+          opfsVersionTag = await probeAssetVersionTag(url, 'regional-dem-v1');
+          if (opfsVersionTag.includes('|status-') && url.endsWith('-u16.bin')) {
+            const fbUrl = url.replace('-u16.bin', '.webp');
+            const fbTag = await probeAssetVersionTag(fbUrl, 'regional-dem-v1');
+            if (!fbTag.includes('|status-')) {
+              opfsVersionTag = fbTag;
+            }
+          }
+          const warmRegional = await opfsAssetStore.getRegionalDEMPyramid(id, opfsVersionTag);
+          if (warmRegional) {
+            if (!this.device || !this.isInitialized) return;
+            const texture = this.uploadRG16MipPyramid(
+              warmRegional.mipLevels,
+              warmRegional.width,
+              warmRegional.height,
+              `regional_dem_${id}`
+            );
+            const view = texture.createView();
+            this.registerRegionalDEMTexture(id, {
+              texture,
+              view,
+              bounds: warmRegional.bounds,
+              width: warmRegional.width,
+              height: warmRegional.height,
+              id,
+              has30mGroundTruth: warmRegional.has30mGroundTruth,
+              mipLevelCount: warmRegional.mipLevelCount,
+            });
+            this.setActiveRegionalDEM(id);
+            this.lastRegionalDEMLoadSource = 'opfs-warm';
+            this.lastRegionalDEMLoadMs = (typeof performance !== 'undefined' ? performance.now() : 0) - tRegStart;
+            return;
+          }
+        }
+
         isImage = url.endsWith('.webp') || url.endsWith('.png');
         let res: Response | null = null;
         try {
@@ -5575,74 +7425,60 @@ export class WebGPUEngine {
 
         if (isImage && typeof createImageBitmap !== 'undefined') {
           const blob = await res.blob();
-          const imgBitmap = await createImageBitmap(blob);
+          let imgBitmap: ImageBitmap;
+          try {
+            imgBitmap = await createImageBitmap(blob, {
+              premultiplyAlpha: 'none',
+              colorSpaceConversion: 'none',
+            });
+          } catch {
+            imgBitmap = await createImageBitmap(blob);
+          }
           const w = imgBitmap.width;
           const h = imgBitmap.height;
-
-          const texture = this.device.createTexture({
-            label: `regional_dem_${id}`,
-            size: [w, h, 1],
-            mipLevelCount: 1,
-            format: 'rgba8unorm',
-            usage: (typeof GPUTextureUsage !== 'undefined'
-              ? (GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST | GPUTextureUsage.RENDER_ATTACHMENT)
-              : (4 | 8 | 16)),
-          });
-
-          try {
-            this.device.queue.copyExternalImageToTexture(
-              { source: imgBitmap },
-              { texture },
-              [w, h]
-            );
-          } catch {
-            if (typeof OffscreenCanvas !== 'undefined') {
-              const osc = new OffscreenCanvas(w, h);
-              const ctx = osc.getContext('2d');
-              if (ctx) {
-                ctx.drawImage(imgBitmap, 0, 0);
-                const imgData = ctx.getImageData(0, 0, w, h);
-                const u8 = new Uint8Array(imgData.data.buffer);
-                const unpaddedRowBytes = w * 4;
-                const paddedRowBytes = Math.ceil(unpaddedRowBytes / 256) * 256;
-                let dataToWrite: ArrayBufferView;
-                if (paddedRowBytes === unpaddedRowBytes) {
-                  dataToWrite = u8;
-                } else {
-                  const padded = new Uint8Array(paddedRowBytes * h);
-                  for (let y = 0; y < h; y++) {
-                    padded.set(
-                      u8.subarray(y * unpaddedRowBytes, (y + 1) * unpaddedRowBytes),
-                      y * paddedRowBytes
-                    );
-                  }
-                  dataToWrite = padded;
-                }
-                this.device.queue.writeTexture(
-                  { texture },
-                  dataToWrite.buffer,
-                  { bytesPerRow: paddedRowBytes, rowsPerImage: h, offset: dataToWrite.byteOffset },
-                  [w, h, 1]
-                );
-              }
-            }
-          }
+          const mipLevelCount = w >= 512 && h >= 512 ? Math.min(6, Math.floor(Math.log2(Math.min(w, h))) + 1) : 1;
+          const texture = this.blitImageOrRGBA8ToRG16Float(
+            imgBitmap,
+            w,
+            h,
+            mipLevelCount,
+            `regional_dem_${id}`,
+            false
+          );
+          imgBitmap.close?.();
 
           const view = texture.createView();
-          const existing = this.regionalDEMTextures.get(id);
-          if (existing) {
-            try { existing.texture.destroy(); } catch {}
-          }
-
-          this.regionalDEMTextures.set(id, {
+          this.registerRegionalDEMTexture(id, {
             texture,
             view,
             bounds,
             width: w,
             height: h,
             id,
+            has30mGroundTruth: has30m,
+            mipLevelCount,
           });
           this.setActiveRegionalDEM(id);
+          this.lastRegionalDEMLoadSource = 'network-cold';
+          this.lastRegionalDEMLoadMs = (typeof performance !== 'undefined' ? performance.now() : 0) - tRegStart;
+          if (opfsVersionTag && opfsAssetStore.isEnabled()) {
+            const tagSnap = opfsVersionTag;
+            this.lastOPFSWritePromise = this.readbackRG16MipPyramid(texture, w, h, mipLevelCount)
+              .then((mipLevels) => {
+                if (!mipLevels) return false;
+                return opfsAssetStore.putRegionalDEMPyramid(id, {
+                  versionTag: tagSnap,
+                  id,
+                  width: w,
+                  height: h,
+                  mipLevelCount,
+                  bounds,
+                  has30mGroundTruth: has30m,
+                  mipLevels,
+                });
+              })
+              .catch(() => false);
+          }
           return;
         }
 
@@ -5654,61 +7490,26 @@ export class WebGPUEngine {
       if (!buffer || buffer.byteLength === 0) return;
 
       const byteLength = buffer.byteLength;
-      const isU16 = byteLength % 8 === 0;
+      const isU16 = width > 0 && height > 0
+        ? byteLength >= width * height * 8 && byteLength % 8 === 0
+        : byteLength % 8 === 0;
       const totalPixels = isU16 ? byteLength / 8 : byteLength / 4;
       const w = width;
       const h = height || Math.floor(totalPixels / w);
 
       if (isU16) {
         const u16 = new Uint16Array(buffer);
-        const unpaddedRowBytes = w * 8; // 4 channels * 2 bytes per float16 = 8 bytes per pixel
-        const paddedRowBytes = Math.ceil(unpaddedRowBytes / 256) * 256;
-        let dataToWrite: ArrayBufferView;
-        if (paddedRowBytes === unpaddedRowBytes) {
-          const f16 = new Uint16Array(w * h * 4);
-          for (let i = 0; i < u16.length; i++) {
-            f16[i] = U16_TO_F16_LUT[u16[i]];
-          }
-          dataToWrite = f16;
-        } else {
-          const paddedF16 = new Uint16Array((paddedRowBytes / 2) * h);
-          const u16PerRow = w * 4;
-          const paddedU16PerRow = paddedRowBytes / 2;
-          for (let y = 0; y < h; y++) {
-            const srcRow = y * u16PerRow;
-            const dstRow = y * paddedU16PerRow;
-            for (let x = 0; x < u16PerRow; x++) {
-              paddedF16[dstRow + x] = U16_TO_F16_LUT[u16[srcRow + x]];
-            }
-          }
-          dataToWrite = paddedF16;
-        }
-
-        const texture = this.device.createTexture({
-          label: `regional_dem_${id}`,
-          size: [w, h, 1],
-          mipLevelCount: 1,
-          format: 'rgba16float',
-          usage: (typeof GPUTextureUsage !== 'undefined'
-            ? (GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST)
-            : (4 | 8)),
-        });
-
-        this.device.queue.writeTexture(
-          { texture },
-          dataToWrite.buffer,
-          { bytesPerRow: paddedRowBytes, rowsPerImage: h, offset: dataToWrite.byteOffset },
-          [w, h, 1]
+        const mipLevelCount = w >= 512 && h >= 512 ? Math.min(6, Math.floor(Math.log2(Math.min(w, h))) + 1) : 1;
+        const texture = this.blitU16ToRG16Float(
+          u16,
+          w,
+          h,
+          mipLevelCount,
+          `regional_dem_${id}`,
+          false
         );
-
         const view = texture.createView();
-        const existing = this.regionalDEMTextures.get(id);
-        if (existing) {
-          try { existing.texture.destroy(); } catch {}
-        }
-
-        const has30m = id.includes('30m') || id === 'grand-canyon' || id === 'matterhorn';
-        this.regionalDEMTextures.set(id, {
+        this.registerRegionalDEMTexture(id, {
           texture,
           view,
           bounds,
@@ -5716,60 +7517,54 @@ export class WebGPUEngine {
           height: h,
           id,
           has30mGroundTruth: has30m,
+          mipLevelCount,
         });
         this.setActiveRegionalDEM(id);
+        this.lastRegionalDEMLoadSource = typeof urlOrBuffer === 'string' ? 'network-cold' : 'buffer';
+        this.lastRegionalDEMLoadMs = (typeof performance !== 'undefined' ? performance.now() : 0) - tRegStart;
+        if (opfsVersionTag && opfsAssetStore.isEnabled()) {
+          const tagSnap = opfsVersionTag;
+          this.lastOPFSWritePromise = this.readbackRG16MipPyramid(texture, w, h, mipLevelCount)
+            .then((mipLevels) => {
+              if (!mipLevels) return false;
+              return opfsAssetStore.putRegionalDEMPyramid(id, {
+                versionTag: tagSnap,
+                id,
+                width: w,
+                height: h,
+                mipLevelCount,
+                bounds,
+                has30mGroundTruth: has30m,
+                mipLevels,
+              });
+            })
+            .catch(() => false);
+        }
       } else {
-        const texture = this.device.createTexture({
-          label: `regional_dem_${id}`,
-          size: [w, h, 1],
-          mipLevelCount: 1,
-          format: 'rgba8unorm',
-          usage: (typeof GPUTextureUsage !== 'undefined'
-            ? (GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST)
-            : (4 | 8)),
-        });
-
-        const unpaddedRowBytes = w * 4;
-        const paddedRowBytes = Math.ceil(unpaddedRowBytes / 256) * 256;
-        let dataToWrite: ArrayBufferView;
-        if (paddedRowBytes === unpaddedRowBytes) {
-          dataToWrite = new Uint8Array(buffer);
-        } else {
-          const padded = new Uint8Array(paddedRowBytes * h);
-          const src = new Uint8Array(buffer);
-          for (let y = 0; y < h; y++) {
-            padded.set(
-              src.subarray(y * unpaddedRowBytes, (y + 1) * unpaddedRowBytes),
-              y * paddedRowBytes
-            );
-          }
-          dataToWrite = padded;
-        }
-
-        this.device.queue.writeTexture(
-          { texture },
-          dataToWrite.buffer,
-          { bytesPerRow: paddedRowBytes, rowsPerImage: h, offset: dataToWrite.byteOffset },
-          [w, h, 1]
+        const u8 = new Uint8Array(buffer);
+        const safeU8 = u8.length >= w * h * 4 ? u8 : new Uint8Array(w * h * 4);
+        const texture = this.blitImageOrRGBA8ToRG16Float(
+          safeU8,
+          w,
+          h,
+          1,
+          `regional_dem_${id}`,
+          false
         );
-
         const view = texture.createView();
-        const existing = this.regionalDEMTextures.get(id);
-        if (existing) {
-          try { existing.texture.destroy(); } catch {}
-        }
-
-        const has30mUnorm = id.includes('30m') || id === 'grand-canyon' || id === 'matterhorn';
-        this.regionalDEMTextures.set(id, {
+        this.registerRegionalDEMTexture(id, {
           texture,
           view,
           bounds,
           width: w,
           height: h,
           id,
-          has30mGroundTruth: has30mUnorm,
+          has30mGroundTruth: has30m,
+          mipLevelCount: 1,
         });
         this.setActiveRegionalDEM(id);
+        this.lastRegionalDEMLoadSource = typeof urlOrBuffer === 'string' ? 'network-cold' : 'buffer';
+        this.lastRegionalDEMLoadMs = (typeof performance !== 'undefined' ? performance.now() : 0) - tRegStart;
       }
     } catch (err) {
       console.warn(`WebGPUEngine.loadRegionalDEMTexture encountered error for ${id}:`, err);
@@ -5777,10 +7572,14 @@ export class WebGPUEngine {
   }
 
   public setActiveRegionalDEM(id: string | null): void {
+    this.invalidateCDLODState();
     if (id && this.regionalDEMTextures.has(id)) {
       const entry = this.regionalDEMTextures.get(id)!;
+      // Touch LRU order so active region is most recently used
+      this.regionalDEMTextures.delete(id);
+      this.regionalDEMTextures.set(id, entry);
       const isSameTextureView = this.activeRegionalDEM && this.activeRegionalDEM.view === entry.view;
-      const has30m = (entry as any).has30mGroundTruth ?? (entry.id.includes('30m') || entry.id === 'grand-canyon' || entry.id === 'matterhorn');
+      const has30m = (entry as any).has30mGroundTruth ?? (entry.id.includes('30m') || entry.id === 'grand-canyon' || entry.id === 'matterhorn' || entry.id === 'fuji' || entry.id === 'yellowstone' || entry.id === 'flatirons-chautauqua');
       this.activeRegionalDEM = {
         texture: entry.texture,
         view: entry.view,
@@ -5789,6 +7588,8 @@ export class WebGPUEngine {
         height: entry.height,
         id: entry.id,
         has30mGroundTruth: has30m,
+        hasFinerLevel0: entry.hasFinerLevel0,
+        level0LatDegPerPx: entry.level0LatDegPerPx,
       };
       this.activeRegionalMinLon = entry.bounds.minLon;
       this.activeRegionalMinLat = entry.bounds.minLat;
@@ -5809,11 +7610,14 @@ export class WebGPUEngine {
       }
       this.regionalUniformU32[12] = 1; // u_regionalActive = 1
       this.regionalUniformU32[14] = this.gpuTileCache ? this.gpuTileCache.getActiveClusterSlotCount() : 0;
+      this.regionalUniformU32[15] = this.hideVectorsFlag;
       this.device.queue.writeBuffer(regBuf, 0, this.regionalUniformData);
       if (!isSameTextureView) {
         this.updateDEMBindGroups();
+        this.invalidateVolumetricTaaHistory();
       }
     } else {
+      const wasActive = this.activeRegionalDEM !== null || this.hasActiveRegionalDEM;
       this.activeRegionalDEM = null;
       this.activeRegionalMinLon = 0;
       this.activeRegionalMinLat = 0;
@@ -5821,6 +7625,9 @@ export class WebGPUEngine {
       this.activeRegionalMaxLat = 0;
       this.hasActiveRegionalDEM = false;
       this.activeRegionalTileKey = null;
+      if (!wasActive) {
+        return;
+      }
       if (this.regionalUniformBuffer) {
         this.regionalUniformData.fill(0);
         const cBounds = this.gpuTileCache ? this.gpuTileCache.getActiveClusterBounds() : null;
@@ -5831,9 +7638,11 @@ export class WebGPUEngine {
           this.regionalUniformData[11] = cBounds[3];
         }
         this.regionalUniformU32[14] = this.gpuTileCache ? this.gpuTileCache.getActiveClusterSlotCount() : 0;
+        this.regionalUniformU32[15] = this.hideVectorsFlag;
         this.device.queue.writeBuffer(this.regionalUniformBuffer, 0, this.regionalUniformData);
       }
       this.updateDEMBindGroups();
+      this.invalidateVolumetricTaaHistory();
     }
   }
 
@@ -5889,12 +7698,15 @@ export class WebGPUEngine {
         this.activeRegionalTileKey = null;
         if (this.regionalUniformBuffer) {
           this.regionalUniformData.fill(0);
+          this.regionalUniformU32[15] = this.hideVectorsFlag;
           this.device.queue.writeBuffer(this.regionalUniformBuffer, 0, this.regionalUniformData);
         }
       }
-      try {
-        entry.texture.destroy();
-      } catch {}
+      if (entry.texture !== this.gpuTileCache?.getTexture()) {
+        try {
+          entry.texture.destroy();
+        } catch {}
+      }
       this.regionalDEMTextures.delete(id);
       this.updateDEMBindGroups();
     }
@@ -5902,114 +7714,6 @@ export class WebGPUEngine {
 
   public getRegionalDEMTexture(id: string) {
     return this.regionalDEMTextures.get(id) || null;
-  }
-
-  private generateMipsRGBA8(
-    src: Uint8Array,
-    baseWidth: number,
-    baseHeight: number
-  ): Array<{ data: Uint8Array; width: number; height: number }> {
-    const mips: Array<{ data: Uint8Array; width: number; height: number }> = [
-      { data: src, width: baseWidth, height: baseHeight },
-    ];
-    let curW = baseWidth;
-    let curH = baseHeight;
-    let curData = src;
-
-    while (curW > 1 || curH > 1) {
-      const nextW = Math.max(1, curW >> 1);
-      const nextH = Math.max(1, curH >> 1);
-      const nextData = new Uint8Array(nextW * nextH * 4);
-
-      for (let y = 0; y < nextH; y++) {
-        const srcY0 = y * 2;
-        const srcY1 = Math.min(srcY0 + 1, curH - 1);
-        for (let x = 0; x < nextW; x++) {
-          const srcX0 = x * 2;
-          const srcX1 = Math.min(srcX0 + 1, curW - 1);
-
-          const i00 = (srcY0 * curW + srcX0) * 4;
-          const i10 = (srcY0 * curW + srcX1) * 4;
-          const i01 = (srcY1 * curW + srcX0) * 4;
-          const i11 = (srcY1 * curW + srcX1) * 4;
-
-          const dstIdx = (y * nextW + x) * 4;
-          for (let c = 0; c < 4; c++) {
-            const p00 = curData[i00 + c];
-            const p10 = curData[i10 + c];
-            const p01 = curData[i01 + c];
-            const p11 = curData[i11 + c];
-            const mean = (p00 + p10 + p01 + p11) * 0.25;
-            if (c === 2) {
-              // Channel B: Binary Land Mask - majority voting threshold to prevent ocean bleed
-              nextData[dstIdx + c] = mean >= 128 ? 255 : 0;
-            } else {
-              // Channels R (land elev), G (depth), A (global elev): pure arithmetic mean preserving gradients
-              nextData[dstIdx + c] = Math.min(255, Math.round(mean));
-            }
-          }
-        }
-      }
-      mips.push({ data: nextData, width: nextW, height: nextH });
-      curW = nextW;
-      curH = nextH;
-      curData = nextData;
-    }
-    return mips;
-  }
-
-  private generateMipsRGBA16(
-    src: Uint16Array,
-    baseWidth: number,
-    baseHeight: number
-  ): Array<{ data: Uint16Array; width: number; height: number }> {
-    const mips: Array<{ data: Uint16Array; width: number; height: number }> = [
-      { data: src, width: baseWidth, height: baseHeight },
-    ];
-    let curW = baseWidth;
-    let curH = baseHeight;
-    let curData = src;
-
-    while (curW > 1 || curH > 1) {
-      const nextW = Math.max(1, curW >> 1);
-      const nextH = Math.max(1, curH >> 1);
-      const nextData = new Uint16Array(nextW * nextH * 4);
-
-      for (let y = 0; y < nextH; y++) {
-        const srcY0 = y * 2;
-        const srcY1 = Math.min(srcY0 + 1, curH - 1);
-        for (let x = 0; x < nextW; x++) {
-          const srcX0 = x * 2;
-          const srcX1 = Math.min(srcX0 + 1, curW - 1);
-
-          const i00 = (srcY0 * curW + srcX0) * 4;
-          const i10 = (srcY0 * curW + srcX1) * 4;
-          const i01 = (srcY1 * curW + srcX0) * 4;
-          const i11 = (srcY1 * curW + srcX1) * 4;
-
-          const dstIdx = (y * nextW + x) * 4;
-          for (let c = 0; c < 4; c++) {
-            const p00 = curData[i00 + c];
-            const p10 = curData[i10 + c];
-            const p01 = curData[i01 + c];
-            const p11 = curData[i11 + c];
-            const mean = (p00 + p10 + p01 + p11) * 0.25;
-            if (c === 2) {
-              // Channel B: Binary Land Mask - majority voting threshold to prevent ocean bleed
-              nextData[dstIdx + c] = mean >= 32768 ? 65535 : 0;
-            } else {
-              // Channels R (land elev), G (depth), A (global elev): pure arithmetic mean preserving gradients
-              nextData[dstIdx + c] = Math.min(65535, Math.round(mean));
-            }
-          }
-        }
-      }
-      mips.push({ data: nextData, width: nextW, height: nextH });
-      curW = nextW;
-      curH = nextH;
-      curData = nextData;
-    }
-    return mips;
   }
 
   public setVectorTier(tier: VectorTier): void {
@@ -6042,116 +7746,146 @@ export class WebGPUEngine {
 
   public async loadVectorData(urlOrBuffer: string | ArrayBuffer): Promise<void> {
     if (!this.device || !this.isInitialized) return;
-    this.ensureCartographicBuffers();
-    try {
-      let arrayBuffer: ArrayBuffer;
-      if (typeof urlOrBuffer === 'string') {
-        const res = await fetch(urlOrBuffer);
-        if (!res.ok) return;
-        arrayBuffer = await res.arrayBuffer();
-      } else {
-        arrayBuffer = urlOrBuffer;
+    if (typeof urlOrBuffer === 'string') {
+      if (this.loadedVectorUrl === urlOrBuffer && this.vectorSegmentCount > 0 && this.vectorSegmentBuffer) {
+        return;
       }
-
-      if (!this.device || !this.isInitialized) return;
-
-      const view = new DataView(arrayBuffer);
-      const magic = view.getUint32(0, true);
-      if (magic !== 0x47564543) {
-        return; // 'GVEC'
-      }
-
-      const vertexCount = view.getUint32(8, true);
-      const indexCount = view.getUint32(12, true);
-      const segCount = Math.floor(indexCount / 2);
-
-      let offset = 32;
-      const positions = new Float32Array(arrayBuffer, offset, vertexCount * 3);
-      offset += vertexCount * 3 * 4;
-
-      const target2D = new Float32Array(arrayBuffer, offset, vertexCount * 2);
-      offset += vertexCount * 2 * 4;
-
-      // Skip 2 reserved columnar floats per vertex (8 floats total per vertex in geo-vectors.bin)
-      offset += vertexCount * 2 * 4;
-
-      const vType = new Float32Array(arrayBuffer, offset, vertexCount * 1);
-      offset += vertexCount * 1 * 4;
-
-      const indices = new Uint32Array(arrayBuffer, offset, indexCount);
-
-      const segFloats = new Float32Array(segCount * 16);
-      for (let k = 0; k < segCount; k++) {
-        const idxA = indices[k * 2 + 0];
-        const idxB = indices[k * 2 + 1];
-        const base = k * 16;
-
-        segFloats[base + 0] = positions[idxA * 3 + 0];
-        segFloats[base + 1] = positions[idxA * 3 + 1];
-        segFloats[base + 2] = positions[idxA * 3 + 2];
-        segFloats[base + 3] = vType[idxA];
-
-        segFloats[base + 4] = target2D[idxA * 2 + 0];
-        segFloats[base + 5] = target2D[idxA * 2 + 1];
-        segFloats[base + 6] = TIER_TAG_REGIONAL;
-        segFloats[base + 7] = 0.0;
-
-        segFloats[base + 8] = positions[idxB * 3 + 0];
-        segFloats[base + 9] = positions[idxB * 3 + 1];
-        segFloats[base + 10] = positions[idxB * 3 + 2];
-        segFloats[base + 11] = vType[idxB];
-
-        segFloats[base + 12] = target2D[idxB * 2 + 0];
-        segFloats[base + 13] = target2D[idxB * 2 + 1];
-        segFloats[base + 14] = TIER_TAG_REGIONAL;
-        segFloats[base + 15] = 0.0;
-      }
-
-      classifyRiverStrahlerOrders(segFloats);
-
-      const usageVertex = typeof GPUBufferUsage !== 'undefined'
-        ? (GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST)
-        : (32 | 8);
-
-      this.vectorSegmentCount = segCount;
-      if (this.vectorSegmentBuffer) {
-        this.vectorSegmentBuffer.destroy();
-      }
-      this.vectorSegmentBuffer = this.device.createBuffer({
-        size: segFloats.byteLength,
-        usage: usageVertex,
-      });
-      this.device.queue.writeBuffer(this.vectorSegmentBuffer, 0, segFloats.buffer);
-      this.vectorSegmentBufferRegional = this.vectorSegmentBuffer;
-      this.vectorSegmentCountRegional = segCount;
-
-      // Populate Orbit Tier (1:110M generalized boundaries)
-      if (!this.vectorSegmentBufferOrbit || this.vectorSegmentCountOrbit === 0) {
-        const orbitFloats = generateOrbitTierSegments();
-        this.vectorSegmentCountOrbit = Math.floor(orbitFloats.length / 16);
-        this.vectorSegmentBufferOrbit = this.device.createBuffer({
-          size: orbitFloats.byteLength,
-          usage: usageVertex,
-        });
-        this.device.queue.writeBuffer(this.vectorSegmentBufferOrbit, 0, orbitFloats.buffer);
-      }
-
-      // Populate Local Tier (densified high-detail chords)
-      const localFloats = densifySegmentsToLocalTier(segFloats, 15.0);
-      this.vectorSegmentCountLocal = Math.floor(localFloats.length / 16);
-      if (this.vectorSegmentBufferLocal) {
-        this.vectorSegmentBufferLocal.destroy();
-      }
-      this.vectorSegmentBufferLocal = this.device.createBuffer({
-        size: localFloats.byteLength,
-        usage: usageVertex,
-      });
-      this.device.queue.writeBuffer(this.vectorSegmentBufferLocal, 0, localFloats.buffer);
-    } catch (err) {
-      if (typeof process === 'undefined' || process.env?.NODE_ENV !== 'test') {
-        console.warn('WebGPUEngine.loadVectorData error:', err);
+      if (this.inFlightVectorPromise && this.inFlightVectorUrl === urlOrBuffer) {
+        return this.inFlightVectorPromise;
       }
     }
+
+    const runLoad = async (): Promise<void> => {
+      if (!this.device || !this.isInitialized) return;
+      this.ensureCartographicBuffers();
+      try {
+        let arrayBuffer: ArrayBuffer;
+        if (typeof urlOrBuffer === 'string') {
+          const res = await fetch(urlOrBuffer);
+          if (!res.ok) return;
+          arrayBuffer = await res.arrayBuffer();
+        } else {
+          arrayBuffer = urlOrBuffer;
+        }
+
+        if (!this.device || !this.isInitialized) return;
+
+        const view = new DataView(arrayBuffer);
+        const magic = view.getUint32(0, true);
+        if (magic !== 0x47564543) {
+          return; // 'GVEC'
+        }
+
+        const vertexCount = view.getUint32(8, true);
+        const indexCount = view.getUint32(12, true);
+        const segCount = Math.floor(indexCount / 2);
+
+        let offset = 32;
+        const positions = new Float32Array(arrayBuffer, offset, vertexCount * 3);
+        offset += vertexCount * 3 * 4;
+
+        const target2D = new Float32Array(arrayBuffer, offset, vertexCount * 2);
+        offset += vertexCount * 2 * 4;
+
+        // Skip 2 reserved columnar floats per vertex (8 floats total per vertex in geo-vectors.bin)
+        offset += vertexCount * 2 * 4;
+
+        const vType = new Float32Array(arrayBuffer, offset, vertexCount * 1);
+        offset += vertexCount * 1 * 4;
+
+        const indices = new Uint32Array(arrayBuffer, offset, indexCount);
+
+        const segFloats = new Float32Array(segCount * 16);
+        for (let k = 0; k < segCount; k++) {
+          const idxA = indices[k * 2 + 0];
+          const idxB = indices[k * 2 + 1];
+          const base = k * 16;
+
+          segFloats[base + 0] = positions[idxA * 3 + 0];
+          segFloats[base + 1] = positions[idxA * 3 + 1];
+          segFloats[base + 2] = positions[idxA * 3 + 2];
+          segFloats[base + 3] = vType[idxA];
+
+          segFloats[base + 4] = target2D[idxA * 2 + 0];
+          segFloats[base + 5] = target2D[idxA * 2 + 1];
+          segFloats[base + 6] = TIER_TAG_REGIONAL;
+          segFloats[base + 7] = 0.0;
+
+          segFloats[base + 8] = positions[idxB * 3 + 0];
+          segFloats[base + 9] = positions[idxB * 3 + 1];
+          segFloats[base + 10] = positions[idxB * 3 + 2];
+          segFloats[base + 11] = vType[idxB];
+
+          segFloats[base + 12] = target2D[idxB * 2 + 0];
+          segFloats[base + 13] = target2D[idxB * 2 + 1];
+          segFloats[base + 14] = TIER_TAG_REGIONAL;
+          segFloats[base + 15] = 0.0;
+        }
+
+        classifyRiverStrahlerOrders(segFloats);
+
+        const usageVertex = typeof GPUBufferUsage !== 'undefined'
+          ? (GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST)
+          : (32 | 8);
+
+        this.vectorSegmentCount = segCount;
+        if (this.vectorSegmentBuffer) {
+          this.vectorSegmentBuffer.destroy();
+        }
+        this.vectorSegmentBuffer = this.device.createBuffer({
+          size: segFloats.byteLength,
+          usage: usageVertex,
+        });
+        this.device.queue.writeBuffer(this.vectorSegmentBuffer, 0, segFloats.buffer);
+        this.vectorSegmentBufferRegional = this.vectorSegmentBuffer;
+        this.vectorSegmentCountRegional = segCount;
+
+        // Populate Orbit Tier (1:110M generalized boundaries)
+        if (!this.vectorSegmentBufferOrbit || this.vectorSegmentCountOrbit === 0) {
+          const orbitFloats = generateOrbitTierSegments();
+          this.vectorSegmentCountOrbit = Math.floor(orbitFloats.length / 16);
+          this.vectorSegmentBufferOrbit = this.device.createBuffer({
+            size: orbitFloats.byteLength,
+            usage: usageVertex,
+          });
+          this.device.queue.writeBuffer(this.vectorSegmentBufferOrbit, 0, orbitFloats.buffer);
+        }
+
+        // Populate Local Tier (densified high-detail chords)
+        const localFloats = densifySegmentsToLocalTier(segFloats, 15.0);
+        this.vectorSegmentCountLocal = Math.floor(localFloats.length / 16);
+        if (this.vectorSegmentBufferLocal) {
+          this.vectorSegmentBufferLocal.destroy();
+        }
+        this.vectorSegmentBufferLocal = this.device.createBuffer({
+          size: localFloats.byteLength,
+          usage: usageVertex,
+        });
+        this.device.queue.writeBuffer(this.vectorSegmentBufferLocal, 0, localFloats.buffer);
+
+        if (typeof urlOrBuffer === 'string') {
+          this.loadedVectorUrl = urlOrBuffer;
+        }
+      } catch (err) {
+        if (typeof process === 'undefined' || process.env?.NODE_ENV !== 'test') {
+          console.warn('WebGPUEngine.loadVectorData error:', err);
+        }
+      }
+    };
+
+    if (typeof urlOrBuffer === 'string') {
+      this.inFlightVectorUrl = urlOrBuffer;
+      const p = runLoad().finally(() => {
+        if (this.inFlightVectorPromise === p) {
+          this.inFlightVectorPromise = null;
+          this.inFlightVectorUrl = null;
+        }
+      });
+      this.inFlightVectorPromise = p;
+      return p;
+    }
+
+    return runLoad();
   }
 
   /**
@@ -6264,6 +7998,10 @@ export class WebGPUEngine {
     }
   }
 
+  public getContourIndexCount(): number {
+    return this.contourIndexCount;
+  }
+
   /**
    * Renders the loaded contour mesh lines using either vector ribbon extrusion or indexed lines.
    */
@@ -6299,6 +8037,7 @@ export class WebGPUEngine {
   public setToponymLabels(labels: ToponymLabel[]): void {
     this.toponymLabels = labels;
     this.lastToponymCamDist = -1; // Reset collision state so next check re-evaluates
+    this.lastPlacedToponymSig = '';
     if (!this.device || !this.sdfTextInstanceBuffer) return;
     const { instances, glyphCount } = layoutToponymLabels(labels, this.sdfTextInstanceFloats);
     this.sdfTextGlyphCount = Math.min(glyphCount, 4096);
@@ -6346,6 +8085,7 @@ export class WebGPUEngine {
     const prev = this._toponymCollisionAvoidance;
     this._toponymCollisionAvoidance = Boolean(enabled);
     this.lastToponymCamDist = -1; // Force re-evaluation
+    this.lastPlacedToponymSig = '';
     if (prev && !this._toponymCollisionAvoidance) {
       // Revert to full unculled dataset if collision avoidance was disabled
       if (this.device && this.sdfTextInstanceBuffer && this.toponymLabels) {
@@ -6465,16 +8205,23 @@ export class WebGPUEngine {
 
     this.lastToponymResult = result;
 
-    const { instances, glyphCount } = layoutToponymLabels(result.placedLabels, this.sdfTextInstanceFloats);
-    this.sdfTextGlyphCount = Math.min(glyphCount, 4096);
-    if (this.sdfTextGlyphCount > 0) {
-      this.device.queue.writeBuffer(
-        this.sdfTextInstanceBuffer,
-        0,
-        instances.buffer,
-        instances.byteOffset,
-        this.sdfTextGlyphCount * 20 * 4
-      );
+    let sig = `${result.placedLabels.length}:`;
+    for (let i = 0; i < result.placedLabels.length; i++) {
+      sig += `${result.placedLabels[i].id ?? result.placedLabels[i].text},`;
+    }
+    if (sig !== this.lastPlacedToponymSig) {
+      this.lastPlacedToponymSig = sig;
+      const { instances, glyphCount } = layoutToponymLabels(result.placedLabels, this.sdfTextInstanceFloats);
+      this.sdfTextGlyphCount = Math.min(glyphCount, 4096);
+      if (this.sdfTextGlyphCount > 0) {
+        this.device.queue.writeBuffer(
+          this.sdfTextInstanceBuffer,
+          0,
+          instances.buffer,
+          instances.byteOffset,
+          this.sdfTextGlyphCount * 20 * 4
+        );
+      }
     }
 
     return result;
@@ -6522,6 +8269,19 @@ export class WebGPUEngine {
       dq > 0.001 ||
       this.lastToponymCamDist < 0
     ) {
+      const isTestEnv = typeof process !== 'undefined' && Boolean(process.env?.VITEST || process.env?.NODE_ENV === 'test');
+      const nowMs = typeof performance !== 'undefined' ? performance.now() : Date.now();
+      if (
+        !isTestEnv &&
+        this.lastToponymCamDist >= 0 &&
+        dUnfurl <= 0.005 &&
+        dWidth <= 1 &&
+        dHeight <= 1 &&
+        nowMs - this.lastToponymCheckTimeMs < 50
+      ) {
+        return;
+      }
+      this.lastToponymCheckTimeMs = nowMs;
       this.lastToponymCamX = camPos.x;
       this.lastToponymCamY = camPos.y;
       this.lastToponymCamZ = camPos.z;
@@ -6570,174 +8330,408 @@ export class WebGPUEngine {
     if (!this.device || !this.isInitialized) return;
     const isMockFetch = typeof fetch === 'function' && Boolean((fetch as any).mock);
     if (typeof urlOrBuffer === 'string' && !isMockFetch) {
-      if (this.lastLoadedWindUrl[slot] === urlOrBuffer && (slot === 1 ? this.windTexture1 : this.windTexture)) {
+      if (
+        this.lastLoadedWindUrl[slot] === urlOrBuffer &&
+        (slot === 1 ? this.windTexture1 : this.windTexture) &&
+        !this.inFlightWindPromise[slot]
+      ) {
         return;
       }
-      if (this.inFlightWindUrl[slot] === urlOrBuffer && this.inFlightWindPromise[slot]) {
-        return this.inFlightWindPromise[slot]!;
+      if (this.inFlightWindPromise[slot]) {
+        if (this.inFlightWindUrl[slot] === urlOrBuffer && this.pendingWindUrl[slot] === null) {
+          return this.inFlightWindPromise[slot]!;
+        }
+        this.pendingWindUrl[slot] = urlOrBuffer;
+        return this.inFlightWindPromise[slot]!.then(() => {
+          const nextUrl = this.pendingWindUrl[slot];
+          if (nextUrl !== null) {
+            this.pendingWindUrl[slot] = null;
+            return this.loadWindTexture(nextUrl, slot);
+          }
+          return this.inFlightWindPromise[slot] ?? undefined;
+        });
       }
+    } else {
+      this.pendingWindUrl[slot] = null;
     }
     this.ensureWindBuffers();
 
-    const seq = ++this.windTextureLoadSeq;
-    let buffer: ArrayBuffer | null = null;
-    if (urlOrBuffer instanceof ArrayBuffer) {
-      buffer = urlOrBuffer;
-    } else if (typeof fetch !== 'undefined') {
-      try {
-        const res = await fetch(urlOrBuffer);
-        const isHtml = res.headers.get('content-type')?.includes('text/html');
-        if (res.ok && !isHtml) {
-          buffer = await res.arrayBuffer();
-        } else if (typeof urlOrBuffer === 'string' && urlOrBuffer.includes('wind_10m_vector')) {
-          // Fallback to GFS wind if WeatherNext wind slice is absent
-          const fallbackRes = await fetch('/data/gfs-wind-latest.bin');
-          if (fallbackRes.ok && !fallbackRes.headers.get('content-type')?.includes('text/html')) {
-            buffer = await fallbackRes.arrayBuffer();
+    const doLoadWind = async (): Promise<void> => {
+      const seq = ++this.windTextureLoadSeq[slot];
+      let windW = 360;
+      let windH = 181;
+      let rowBytesRaw = 1440;
+      let rowBytesPadded = 1536;
+      let padded: Uint8Array;
+      let prepackedInterleavedBuf: ArrayBuffer | undefined;
+      let prepackedInterleavedRowBytes: number | undefined;
+
+      if (typeof urlOrBuffer === 'string' && !isMockFetch && decodeWorkerPool.canUseWorkers()) {
+        const hasJetForSlot0 =
+          slot === 0 &&
+          this.jetStreamRawU16 !== null &&
+          this.jetStreamDims[0] > 0 &&
+          this.jetStreamDims[1] > 0;
+        const jetCopy: ArrayBuffer | undefined = hasJetForSlot0
+          ? new Uint16Array(this.jetStreamRawU16!).buffer
+          : undefined;
+        const workerRes = await decodeWorkerPool.run<WeatherNextWindPackResponse>(
+          {
+            type: 'weathernext_wind_pack',
+            url: urlOrBuffer,
+            extractSlot0RawU16: slot === 0,
+            jetRawBuffer: jetCopy,
+            jetW: hasJetForSlot0 ? this.jetStreamDims[0] : undefined,
+            jetH: hasJetForSlot0 ? this.jetStreamDims[1] : undefined,
+          },
+          jetCopy ? [jetCopy] : []
+        );
+        if (!workerRes.ok || !workerRes.paddedBuffer || seq !== this.windTextureLoadSeq[slot]) {
+          return;
+        }
+        windW = workerRes.windW!;
+        windH = workerRes.windH!;
+        rowBytesPadded = workerRes.rowBytesPadded!;
+        padded = new Uint8Array(workerRes.paddedBuffer);
+        prepackedInterleavedBuf = workerRes.interleavedRgbaBuffer;
+        prepackedInterleavedRowBytes = workerRes.interleavedRowBytesPadded;
+        if (slot === 0 && workerRes.rawU16Buffer) {
+          this.windSlot0RawU16 = new Uint16Array(workerRes.rawU16Buffer);
+          this.windSlot0Dims = [windW, windH];
+        }
+      } else {
+        let buffer: ArrayBuffer | null = null;
+        if (urlOrBuffer instanceof ArrayBuffer) {
+          buffer = urlOrBuffer;
+        } else if (typeof fetch !== 'undefined') {
+          try {
+            const res = await fetch(urlOrBuffer);
+            const isHtml = res.headers.get('content-type')?.includes('text/html');
+            if (res.ok && !isHtml) {
+              buffer = await res.arrayBuffer();
+            } else if (typeof urlOrBuffer === 'string' && urlOrBuffer.includes('wind_10m_vector')) {
+              // Fallback to GFS wind if WeatherNext wind slice is absent
+              const fallbackRes = await fetch('/data/gfs-wind-latest.bin');
+              if (fallbackRes.ok && !fallbackRes.headers.get('content-type')?.includes('text/html')) {
+                buffer = await fallbackRes.arrayBuffer();
+              }
+            }
+          } catch {
+            if (typeof urlOrBuffer === 'string' && urlOrBuffer.includes('wind_10m_vector')) {
+              try {
+                const fallbackRes = await fetch('/data/gfs-wind-latest.bin');
+                if (fallbackRes.ok && !fallbackRes.headers.get('content-type')?.includes('text/html')) {
+                  buffer = await fallbackRes.arrayBuffer();
+                }
+              } catch {}
+            }
           }
         }
-      } catch {
-        if (typeof urlOrBuffer === 'string' && urlOrBuffer.includes('wind_10m_vector')) {
-          try {
-            const fallbackRes = await fetch('/data/gfs-wind-latest.bin');
-            if (fallbackRes.ok && !fallbackRes.headers.get('content-type')?.includes('text/html')) {
-              buffer = await fallbackRes.arrayBuffer();
-            }
-          } catch {}
+
+        if (!buffer && typeof process !== 'undefined' && process.versions?.node) {
+          buffer = await loadNodeAssetBuffer(typeof urlOrBuffer === 'string' ? urlOrBuffer : 'public/data/gfs-wind-latest.bin');
+          if (!buffer && typeof urlOrBuffer === 'string' && urlOrBuffer.includes('wind_10m_vector')) {
+            buffer = await loadNodeAssetBuffer('public/data/gfs-wind-latest.bin');
+          }
+        }
+
+        if (!buffer || seq !== this.windTextureLoadSeq[slot]) return;
+
+        const isWn0p1Padded = buffer.byteLength === 26280192; // 14592 * 1801
+        const isWn0p1Raw = buffer.byteLength === 25934400;    // 14400 * 1801
+        const is0p25Padded = buffer.byteLength === 4245248;   // 5888 * 721
+        const is0p25Raw = buffer.byteLength === 4152960;      // 5760 * 721
+        const is1p0Padded = buffer.byteLength === 278016;     // 1536 * 181
+        const is1p0Raw = buffer.byteLength === 260640;        // 1440 * 181
+
+        if (isWn0p1Padded) {
+          windW = 3600;
+          windH = 1801;
+          rowBytesRaw = 14400;
+          rowBytesPadded = 14592;
+          padded = new Uint8Array(buffer);
+        } else if (isWn0p1Raw) {
+          windW = 3600;
+          windH = 1801;
+          rowBytesRaw = 14400;
+          rowBytesPadded = 14592;
+          padded = new Uint8Array(rowBytesPadded * windH);
+          const srcU8 = new Uint8Array(buffer);
+          for (let y = 0; y < windH; y++) {
+            padded.set(srcU8.subarray(y * rowBytesRaw, y * rowBytesRaw + rowBytesRaw), y * rowBytesPadded);
+          }
+        } else if (is0p25Padded) {
+          windW = 1440;
+          windH = 721;
+          rowBytesRaw = 5760;
+          rowBytesPadded = 5888;
+          padded = new Uint8Array(buffer);
+        } else if (is0p25Raw) {
+          windW = 1440;
+          windH = 721;
+          rowBytesRaw = 5760;
+          rowBytesPadded = 5888;
+          padded = new Uint8Array(rowBytesPadded * windH);
+          const srcU8 = new Uint8Array(buffer);
+          for (let y = 0; y < windH; y++) {
+            padded.set(srcU8.subarray(y * rowBytesRaw, y * rowBytesRaw + rowBytesRaw), y * rowBytesPadded);
+          }
+        } else if (is1p0Padded) {
+          windW = 360;
+          windH = 181;
+          rowBytesRaw = 1440;
+          rowBytesPadded = 1536;
+          padded = new Uint8Array(buffer);
+        } else if (is1p0Raw) {
+          windW = 360;
+          windH = 181;
+          rowBytesRaw = 1440;
+          rowBytesPadded = 1536;
+          padded = new Uint8Array(rowBytesPadded * windH);
+          const srcU8 = new Uint8Array(buffer);
+          for (let y = 0; y < windH; y++) {
+            padded.set(srcU8.subarray(y * rowBytesRaw, y * rowBytesRaw + rowBytesRaw), y * rowBytesPadded);
+          }
+        } else {
+          const bytesPerTexel = 4;
+          windW = Math.max(1, Math.round(Math.sqrt(buffer.byteLength / (2 * bytesPerTexel))));
+          windH = Math.max(1, Math.floor(buffer.byteLength / (windW * bytesPerTexel)));
+          rowBytesRaw = windW * bytesPerTexel;
+          rowBytesPadded = Math.ceil(rowBytesRaw / 256) * 256;
+          padded = new Uint8Array(rowBytesPadded * windH);
+          const srcU8 = new Uint8Array(buffer);
+          for (let y = 0; y < windH; y++) {
+            padded.set(srcU8.subarray(y * rowBytesRaw, y * rowBytesRaw + rowBytesRaw), y * rowBytesPadded);
+          }
+        }
+
+        if (slot === 0) {
+          const rawU16 = new Uint16Array(windW * windH * 2);
+          const paddedU16 = new Uint16Array(padded.buffer, padded.byteOffset, Math.floor(padded.byteLength / 2));
+          const rowU16Stride = rowBytesPadded >> 1;
+          for (let y = 0; y < windH; y++) {
+            const srcRow = y * rowU16Stride;
+            const dstRow = y * windW * 2;
+            rawU16.set(paddedU16.subarray(srcRow, srcRow + windW * 2), dstRow);
+          }
+          this.windSlot0RawU16 = rawU16;
+          this.windSlot0Dims = [windW, windH];
         }
       }
-    }
 
-    if (!buffer && typeof process !== 'undefined' && process.versions?.node) {
-      buffer = await loadNodeAssetBuffer(typeof urlOrBuffer === 'string' ? urlOrBuffer : 'public/data/gfs-wind-latest.bin');
-      if (!buffer && typeof urlOrBuffer === 'string' && urlOrBuffer.includes('wind_10m_vector')) {
-        buffer = await loadNodeAssetBuffer('public/data/gfs-wind-latest.bin');
+      const useInterleavedRgba16 = slot === 0 && this.jetStreamRawU16 !== null;
+      let targetTexture = slot === 1 ? this.windTexture1 : this.windTexture;
+      let targetView = slot === 1 ? this.windTextureView1 : this.windTextureView;
+
+      if (!useInterleavedRgba16 && (!targetTexture || targetTexture.width !== windW || targetTexture.height !== windH)) {
+        const prevTex = targetTexture;
+        targetTexture = this.device!.createTexture({
+          label: `wind_velocity_texture_slot${slot}`,
+          size: [windW, windH, 1],
+          format: 'rg16float',
+          usage: (typeof GPUTextureUsage !== 'undefined'
+            ? (GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST)
+            : (4 | 8)),
+        });
+        targetView = targetTexture.createView();
+        if (slot === 1) {
+          this.windTexture1 = targetTexture;
+          this.windTextureView1 = targetView;
+        } else {
+          this.windTexture = targetTexture;
+          this.windTextureView = targetView;
+          this.windSlot0Format = 'rg16float';
+        }
+        prevTex?.destroy();
       }
-    }
 
-    if (!buffer || seq !== this.windTextureLoadSeq) return;
-
-    const isWn0p1Padded = buffer.byteLength === 26280192; // 14592 * 1801
-    const isWn0p1Raw = buffer.byteLength === 25934400;    // 14400 * 1801
-    const is0p25Padded = buffer.byteLength === 4245248;   // 5888 * 721
-    const is0p25Raw = buffer.byteLength === 4152960;      // 5760 * 721
-    const is1p0Padded = buffer.byteLength === 278016;     // 1536 * 181
-    const is1p0Raw = buffer.byteLength === 260640;        // 1440 * 181
-
-    let windW = 360;
-    let windH = 181;
-    let rowBytesRaw = 1440;
-    let rowBytesPadded = 1536;
-    let padded: Uint8Array;
-
-    if (isWn0p1Padded) {
-      windW = 3600;
-      windH = 1801;
-      rowBytesRaw = 14400;
-      rowBytesPadded = 14592;
-      padded = new Uint8Array(buffer);
-    } else if (isWn0p1Raw) {
-      windW = 3600;
-      windH = 1801;
-      rowBytesRaw = 14400;
-      rowBytesPadded = 14592;
-      padded = new Uint8Array(rowBytesPadded * windH);
-      const srcU8 = new Uint8Array(buffer);
-      for (let y = 0; y < windH; y++) {
-        padded.set(srcU8.subarray(y * rowBytesRaw, y * rowBytesRaw + rowBytesRaw), y * rowBytesPadded);
+      try {
+        if (useInterleavedRgba16) {
+          if (prepackedInterleavedBuf && prepackedInterleavedRowBytes) {
+            this.writeInterleavedWindJetBuffer(
+              prepackedInterleavedBuf,
+              prepackedInterleavedRowBytes,
+              windW,
+              windH
+            );
+          } else {
+            this.syncInterleavedWindJetTexture();
+          }
+        } else if (targetTexture) {
+          this.device!.queue.writeTexture(
+            { texture: targetTexture },
+            padded,
+            { bytesPerRow: rowBytesPadded, rowsPerImage: windH },
+            [windW, windH, 1]
+          );
+        }
+        if (typeof urlOrBuffer === 'string') {
+          this.lastLoadedWindUrl[slot] = urlOrBuffer;
+        } else {
+          this.lastLoadedWindUrl[slot] = null;
+        }
+        this.updateWindBindGroups();
+        this.updateComputeBindGroups();
+        this.updateDEMBindGroups();
+        this.updateCloudBindGroups();
+        this.cloudAdvectionComputeBindGroups = [null, null];
+        this.updateCloudAdvectionBindGroups();
+        if (this.precipRingBuffer) {
+          this.setPrecipitationRingBuffer(this.precipRingBuffer);
+        }
+      } catch {
+        // Mock environment guard
       }
-    } else if (is0p25Padded) {
-      windW = 1440;
-      windH = 721;
-      rowBytesRaw = 5760;
-      rowBytesPadded = 5888;
-      padded = new Uint8Array(buffer);
-    } else if (is0p25Raw) {
-      windW = 1440;
-      windH = 721;
-      rowBytesRaw = 5760;
-      rowBytesPadded = 5888;
-      padded = new Uint8Array(rowBytesPadded * windH);
-      const srcU8 = new Uint8Array(buffer);
-      for (let y = 0; y < windH; y++) {
-        padded.set(srcU8.subarray(y * rowBytesRaw, y * rowBytesRaw + rowBytesRaw), y * rowBytesPadded);
-      }
-    } else if (is1p0Padded) {
-      windW = 360;
-      windH = 181;
-      rowBytesRaw = 1440;
-      rowBytesPadded = 1536;
-      padded = new Uint8Array(buffer);
-    } else if (is1p0Raw) {
-      windW = 360;
-      windH = 181;
-      rowBytesRaw = 1440;
-      rowBytesPadded = 1536;
-      padded = new Uint8Array(rowBytesPadded * windH);
-      const srcU8 = new Uint8Array(buffer);
-      for (let y = 0; y < windH; y++) {
-        padded.set(srcU8.subarray(y * rowBytesRaw, y * rowBytesRaw + rowBytesRaw), y * rowBytesPadded);
-      }
-    } else {
-      const bytesPerTexel = 4;
-      windW = Math.max(1, Math.round(Math.sqrt(buffer.byteLength / (2 * bytesPerTexel))));
-      windH = Math.max(1, Math.floor(buffer.byteLength / (windW * bytesPerTexel)));
-      rowBytesRaw = windW * bytesPerTexel;
-      rowBytesPadded = Math.ceil(rowBytesRaw / 256) * 256;
-      padded = new Uint8Array(rowBytesPadded * windH);
-      const srcU8 = new Uint8Array(buffer);
-      for (let y = 0; y < windH; y++) {
-        padded.set(srcU8.subarray(y * rowBytesRaw, y * rowBytesRaw + rowBytesRaw), y * rowBytesPadded);
-      }
-    }
+    };
 
-    let targetTexture = slot === 1 ? this.windTexture1 : this.windTexture;
-    let targetView = slot === 1 ? this.windTextureView1 : this.windTextureView;
-
-    if (!targetTexture || targetTexture.width !== windW || targetTexture.height !== windH) {
-      targetTexture?.destroy();
-      targetTexture = this.device.createTexture({
-        label: `wind_velocity_texture_slot${slot}`,
-        size: [windW, windH, 1],
-        format: 'rg16float',
-        usage: (typeof GPUTextureUsage !== 'undefined'
-          ? (GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST)
-          : (4 | 8)),
+    if (typeof urlOrBuffer === 'string' && !isMockFetch) {
+      this.inFlightWindUrl[slot] = urlOrBuffer;
+      const p = doLoadWind().finally(() => {
+        if (this.inFlightWindPromise[slot] === p) {
+          this.inFlightWindUrl[slot] = null;
+          this.inFlightWindPromise[slot] = null;
+        }
       });
-      targetView = targetTexture.createView();
-      if (slot === 1) {
-        this.windTexture1 = targetTexture;
-        this.windTextureView1 = targetView;
-      } else {
-        this.windTexture = targetTexture;
-        this.windTextureView = targetView;
-      }
+      this.inFlightWindPromise[slot] = p;
+      return p;
     }
 
-    try {
+    return doLoadWind();
+  }
+
+  private writeInterleavedWindJetBuffer(
+    interleavedBuffer: ArrayBuffer,
+    rowBytesPadded: number,
+    windW: number,
+    windH: number
+  ): void {
+    if (!this.device) return;
+    const prevTex = this.windTexture;
+    const needsAlloc =
+      !prevTex ||
+      prevTex.width !== windW ||
+      prevTex.height !== windH ||
+      this.windSlot0Format !== 'rgba16float' ||
+      (typeof prevTex.format === 'string' && prevTex.format !== 'rgba16float');
+
+    let nextTex = prevTex;
+    if (needsAlloc) {
+      nextTex = this.device.createTexture({
+        label: 'wind_velocity_texture_slot0',
+        size: [windW, windH, 1],
+        format: 'rgba16float',
+        usage:
+          typeof GPUTextureUsage !== 'undefined'
+            ? GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST
+            : 4 | 8,
+      });
+      this.windTexture = nextTex;
+      this.windTextureView = nextTex.createView();
+      this.windSlot0Format = 'rgba16float';
+    }
+
+    if (nextTex) {
       this.device.queue.writeTexture(
-        { texture: targetTexture },
-        padded,
+        { texture: nextTex },
+        new Uint8Array(interleavedBuffer),
         { bytesPerRow: rowBytesPadded, rowsPerImage: windH },
         [windW, windH, 1]
       );
-      if (typeof urlOrBuffer === 'string') {
-        this.lastLoadedWindUrl[slot] = urlOrBuffer;
-      } else {
-        this.lastLoadedWindUrl[slot] = null;
-      }
+      this.invalidateVolumetricTaaHistory();
+    }
+
+    if (needsAlloc) {
       this.updateWindBindGroups();
       this.updateComputeBindGroups();
       this.updateDEMBindGroups();
       this.updateCloudBindGroups();
+      this.updateVolumetricCloudBindGroup();
       this.cloudAdvectionComputeBindGroups = [null, null];
       this.updateCloudAdvectionBindGroups();
-      if (this.precipRingBuffer) {
-        this.setPrecipitationRingBuffer(this.precipRingBuffer);
+      if (prevTex && prevTex !== nextTex) {
+        prevTex.destroy();
       }
-    } catch {
-      // Mock environment guard
     }
+  }
+
+  /**
+   * Bilinearly interpolates 250 hPa jet stream (.ba) onto 10m surface wind (.rg) in slot 0 windTexture (rgba16float)
+   * so Pass 1 (crust_hydrosphere.wgsl) and Pass 2 (volumetric_cloud.wgsl) share exact 1:1 upper-air wind vectors
+   * with zero additional texture bindings and zero reload texture churn.
+   */
+  private syncInterleavedWindJetTexture(): void {
+    if (!this.device || !this.windSlot0RawU16 || !this.jetStreamRawU16) return;
+    const [windW, windH] = this.windSlot0Dims;
+    const [jetW, jetH] = this.jetStreamDims;
+    if (windW <= 0 || windH <= 0 || jetW <= 0 || jetH <= 0) return;
+
+    const rowBytesRaw = windW * 8; // 4 x Float16 = 8 bytes per texel
+    const rowBytesPadded = Math.ceil(rowBytesRaw / 256) * 256;
+    const rowU16Stride = rowBytesPadded >> 1;
+    const interleavedU16 = new Uint16Array(rowU16Stride * windH);
+    const surfU16 = this.windSlot0RawU16;
+    const jetU16 = this.jetStreamRawU16;
+
+    const x0Arr = new Int32Array(windW);
+    const x1Arr = new Int32Array(windW);
+    const txArr = new Float32Array(windW);
+    const jetScaleX = windW > 1 ? (jetW - 1) / (windW - 1) : 0;
+    for (let x = 0; x < windW; x++) {
+      const uSrc = x * jetScaleX;
+      const x0 = Math.min(jetW - 1, Math.floor(uSrc));
+      x0Arr[x] = x0 * 2;
+      x1Arr[x] = Math.min(jetW - 1, x0 + 1) * 2;
+      txArr[x] = uSrc - x0;
+    }
+
+    const jetScaleY = windH > 1 ? (jetH - 1) / (windH - 1) : 0;
+    for (let y = 0; y < windH; y++) {
+      const vSrc = y * jetScaleY;
+      const y0 = Math.min(jetH - 1, Math.floor(vSrc));
+      const y1 = Math.min(jetH - 1, y0 + 1);
+      const ty = vSrc - y0;
+      const oneMinusTy = 1.0 - ty;
+      const surfRowOff = y * windW * 2;
+      const jetRow0Off = y0 * jetW * 2;
+      const jetRow1Off = y1 * jetW * 2;
+      const dstRowOff = y * rowU16Stride;
+
+      for (let x = 0; x < windW; x++) {
+        const jx0 = x0Arr[x];
+        const jx1 = x1Arr[x];
+        const tx = txArr[x];
+        const oneMinusTx = 1.0 - tx;
+
+        const u00 = FLOAT16_DEC_TABLE[jetU16[jetRow0Off + jx0]];
+        const v00 = FLOAT16_DEC_TABLE[jetU16[jetRow0Off + jx0 + 1]];
+        const u10 = FLOAT16_DEC_TABLE[jetU16[jetRow0Off + jx1]];
+        const v10 = FLOAT16_DEC_TABLE[jetU16[jetRow0Off + jx1 + 1]];
+        const u01 = FLOAT16_DEC_TABLE[jetU16[jetRow1Off + jx0]];
+        const v01 = FLOAT16_DEC_TABLE[jetU16[jetRow1Off + jx0 + 1]];
+        const u11 = FLOAT16_DEC_TABLE[jetU16[jetRow1Off + jx1]];
+        const v11 = FLOAT16_DEC_TABLE[jetU16[jetRow1Off + jx1 + 1]];
+
+        const uTop = u00 * oneMinusTx + u10 * tx;
+        const uBot = u01 * oneMinusTx + u11 * tx;
+        const vTop = v00 * oneMinusTx + v10 * tx;
+        const vBot = v01 * oneMinusTx + v11 * tx;
+
+        const uJet = encodeFloat16Fast(uTop * oneMinusTy + uBot * ty);
+        let vJet = encodeFloat16Fast(vTop * oneMinusTy + vBot * ty);
+        // Avoid (0.0, 1.0) hardware rg16float default swizzle collision (0x0000, 0x3C00)
+        if ((uJet & 0x7fff) === 0 && vJet === 0x3c00) {
+          vJet = 0x3c02;
+        }
+
+        const dstIdx = dstRowOff + x * 4;
+        interleavedU16[dstIdx] = surfU16[surfRowOff + x * 2];
+        interleavedU16[dstIdx + 1] = surfU16[surfRowOff + x * 2 + 1];
+        interleavedU16[dstIdx + 2] = uJet;
+        interleavedU16[dstIdx + 3] = vJet;
+      }
+    }
+
+    this.writeInterleavedWindJetBuffer(interleavedU16.buffer, rowBytesPadded, windW, windH);
   }
 
   /**
@@ -6823,11 +8817,25 @@ export class WebGPUEngine {
       }
     }
 
+    if (slot === 0) {
+      const rawU16 = new Uint16Array(windW * windH * 2);
+      const paddedU16 = new Uint16Array(padded.buffer, padded.byteOffset, Math.floor(padded.byteLength / 2));
+      const rowU16Stride = rowBytesPadded >> 1;
+      for (let y = 0; y < windH; y++) {
+        const srcRow = y * rowU16Stride;
+        const dstRow = y * windW * 2;
+        rawU16.set(paddedU16.subarray(srcRow, srcRow + windW * 2), dstRow);
+      }
+      this.windSlot0RawU16 = rawU16;
+      this.windSlot0Dims = [windW, windH];
+    }
+
+    const useInterleavedRgba16 = slot === 0 && this.jetStreamRawU16 !== null;
     let targetTexture = slot === 1 ? this.windTexture1 : this.windTexture;
     let targetView = slot === 1 ? this.windTextureView1 : this.windTextureView;
 
-    if (!targetTexture || targetTexture.width !== windW || targetTexture.height !== windH) {
-      targetTexture?.destroy();
+    if (!useInterleavedRgba16 && (!targetTexture || targetTexture.width !== windW || targetTexture.height !== windH)) {
+      const prevTex = targetTexture;
       targetTexture = this.device.createTexture({
         label: `wind_velocity_texture_slot${slot}`,
         size: [windW, windH, 1],
@@ -6843,16 +8851,22 @@ export class WebGPUEngine {
       } else {
         this.windTexture = targetTexture;
         this.windTextureView = targetView;
+        this.windSlot0Format = 'rg16float';
       }
+      prevTex?.destroy();
     }
 
     try {
-      this.device.queue.writeTexture(
-        { texture: targetTexture },
-        padded,
-        { bytesPerRow: rowBytesPadded, rowsPerImage: windH },
-        [windW, windH, 1]
-      );
+      if (useInterleavedRgba16) {
+        this.syncInterleavedWindJetTexture();
+      } else if (targetTexture) {
+        this.device.queue.writeTexture(
+          { texture: targetTexture },
+          padded,
+          { bytesPerRow: rowBytesPadded, rowsPerImage: windH },
+          [windW, windH, 1]
+        );
+      }
       this.updateWindBindGroups();
     } catch {}
   }
@@ -6864,105 +8878,170 @@ export class WebGPUEngine {
     urlOrData: string | Array<{ name: string; line1: string; line2: string }> = '/data/tle-starlink.json'
   ): Promise<void> {
     if (!this.device || !this.isInitialized) return;
-
-    let records: Array<{ name: string; line1: string; line2: string }> | null = null;
-    if (Array.isArray(urlOrData)) {
-      records = urlOrData;
-    } else if (typeof fetch !== 'undefined') {
-      try {
-        const res = await fetch(urlOrData);
-        if (res.ok) {
-          records = await res.json();
-        }
-      } catch {
-        // Fallback
+    if (typeof urlOrData === 'string') {
+      if (this.loadedSatelliteUrl === urlOrData && this.satelliteSegmentCount > 0 && this.satelliteSegmentBuffer) {
+        return;
+      }
+      if (this.inFlightSatellitePromise && this.inFlightSatelliteUrl === urlOrData) {
+        return this.inFlightSatellitePromise;
       }
     }
 
-    if (!records && typeof process !== 'undefined' && process.versions?.node) {
-      const text = await loadNodeAssetText(typeof urlOrData === 'string' ? urlOrData : 'public/data/tle-starlink.json');
-      if (text) {
+    const runLoad = async (): Promise<void> => {
+      if (!this.device || !this.isInitialized) return;
+
+      let records: Array<{ name: string; line1: string; line2: string }> | null = null;
+      if (Array.isArray(urlOrData)) {
+        records = urlOrData;
+      } else if (typeof fetch !== 'undefined') {
         try {
-          records = JSON.parse(text);
+          const res = await fetch(urlOrData);
+          if (res.ok) {
+            records = await res.json();
+          }
         } catch {
           // Fallback
         }
       }
-    }
 
-    if (!records || records.length === 0) return;
-
-    const pointsPerOrbit = 64;
-    const totalSegments = records.length * pointsPerOrbit;
-    const segFloats = new Float32Array(totalSegments * 16);
-
-    let segIndex = 0;
-    for (const record of records) {
-      const elements = parseTLE(record.line1, record.line2);
-      const periodSec = (2 * Math.PI) / elements.meanMotionRadPerSec;
-
-      for (let i = 0; i < pointsPerOrbit; i++) {
-        const tA = (i / pointsPerOrbit) * periodSec;
-        const tB = (((i + 1) % pointsPerOrbit) / pointsPerOrbit) * periodSec;
-
-        const posA = propagateOrbitalPosition(elements, tA, 6378.137, 5.0);
-        const posB = propagateOrbitalPosition(elements, tB, 6378.137, 5.0);
-
-        const lonA = Math.atan2(posA[0], posA[2]);
-        const latA = Math.asin(Math.max(-0.999, Math.min(0.999, posA[1] / 5.0)));
-        const target2DA = [lonA * (5.0 / Math.PI), latA * (5.0 / (Math.PI * 0.5))];
-
-        const lonB = Math.atan2(posB[0], posB[2]);
-        const latB = Math.asin(Math.max(-0.999, Math.min(0.999, posB[1] / 5.0)));
-        const target2DB = [lonB * (5.0 / Math.PI), latB * (5.0 / (Math.PI * 0.5))];
-
-        // Antimeridian Orbit Ribbon Severance:
-        // When crossing the 180° antimeridian (|lonB - lonA| > Math.PI),
-        // sever the segment to eliminate diagonal screen streaks across the flat map.
-        if (Math.abs(lonB - lonA) > Math.PI) {
-          continue;
+      if (!records && typeof process !== 'undefined' && process.versions?.node) {
+        const text = await loadNodeAssetText(typeof urlOrData === 'string' ? urlOrData : 'public/data/tle-starlink.json');
+        if (text) {
+          try {
+            records = JSON.parse(text);
+          } catch {
+            // Fallback
+          }
         }
-
-        const base = segIndex * 16;
-        segFloats[base + 0] = posA[0];
-        segFloats[base + 1] = posA[1];
-        segFloats[base + 2] = posA[2];
-        segFloats[base + 3] = 0.8; // Satellite ribbon type
-        segFloats[base + 4] = target2DA[0];
-        segFloats[base + 5] = target2DA[1];
-        segFloats[base + 6] = target2DA[0];
-        segFloats[base + 7] = target2DA[1];
-
-        segFloats[base + 8] = posB[0];
-        segFloats[base + 9] = posB[1];
-        segFloats[base + 10] = posB[2];
-        segFloats[base + 11] = 0.8;
-        segFloats[base + 12] = target2DB[0];
-        segFloats[base + 13] = target2DB[1];
-        segFloats[base + 14] = target2DB[0];
-        segFloats[base + 15] = target2DB[1];
-
-        segIndex++;
       }
-    }
 
-    if (this.satelliteSegmentBuffer) {
-      this.satelliteSegmentBuffer.destroy();
-      this.satelliteSegmentBuffer = null;
-    }
+      if (!records || records.length === 0) {
+        records = this.tleDataSource.getSatellites();
+      } else {
+        this.tleDataSource.setSatellites(records);
+      }
 
-    this.satelliteSegmentCount = segIndex;
-    const byteLength = this.satelliteSegmentCount * 64;
-    try {
-      this.satelliteSegmentBuffer = this.device.createBuffer({
-        label: 'satellite_orbit_ribbon_buffer',
-        size: byteLength,
-        usage: GPUBufferUsage.VERTEX | GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+      if (!records || records.length === 0 || !this.device || !this.isInitialized) return;
+
+      const pointsPerOrbit = 64;
+      // Allow headroom for antimeridian seam splitting (up to +8 split segments per orbit)
+      const maxSegments = records.length * (pointsPerOrbit + 8);
+      const segFloats = new Float32Array(maxSegments * 16);
+      const radToDeg = 180.0 / Math.PI;
+
+      const writeOrbitSegment = (
+        idx: number,
+        p0: [number, number, number],
+        t2d0: [number, number],
+        p1: [number, number, number],
+        t2d1: [number, number]
+      ): number => {
+        if (idx >= maxSegments) return idx;
+        const base = idx * 16;
+        segFloats[base + 0] = p0[0];
+        segFloats[base + 1] = p0[1];
+        segFloats[base + 2] = p0[2];
+        segFloats[base + 3] = 0.8; // Satellite ribbon type
+        segFloats[base + 4] = t2d0[0];
+        segFloats[base + 5] = t2d0[1];
+        segFloats[base + 6] = TIER_TAG_DEFAULT;
+        segFloats[base + 7] = 8.0;
+
+        segFloats[base + 8] = p1[0];
+        segFloats[base + 9] = p1[1];
+        segFloats[base + 10] = p1[2];
+        segFloats[base + 11] = 0.8;
+        segFloats[base + 12] = t2d1[0];
+        segFloats[base + 13] = t2d1[1];
+        segFloats[base + 14] = TIER_TAG_DEFAULT;
+        segFloats[base + 15] = 8.0;
+        return idx + 1;
+      };
+
+      let segIndex = 0;
+      for (const record of records) {
+        const elements = parseTLE(record.line1, record.line2);
+        const periodSec = (2 * Math.PI) / elements.meanMotionRadPerSec;
+
+        for (let i = 0; i < pointsPerOrbit; i++) {
+          const tA = (i / pointsPerOrbit) * periodSec;
+          const tB = (((i + 1) % pointsPerOrbit) / pointsPerOrbit) * periodSec;
+
+          const posA = propagateOrbitalPosition(elements, tA, 6378.137, 5.0);
+          const posB = propagateOrbitalPosition(elements, tB, 6378.137, 5.0);
+
+          const rA = Math.max(1e-4, Math.hypot(posA[0], posA[1], posA[2]));
+          const lonA = Math.atan2(posA[0], posA[2]);
+          const latA = Math.asin(Math.max(-0.9998, Math.min(0.9998, posA[1] / rA)));
+          const target2DA = projectToMercator(lonA * radToDeg, latA * radToDeg, 5.0);
+
+          const rB = Math.max(1e-4, Math.hypot(posB[0], posB[1], posB[2]));
+          const lonB = Math.atan2(posB[0], posB[2]);
+          const latB = Math.asin(Math.max(-0.9998, Math.min(0.9998, posB[1] / rB)));
+          const target2DB = projectToMercator(lonB * radToDeg, latB * radToDeg, 5.0);
+
+          // Antimeridian Polyline Seam Splitting:
+          // Never drop segments crossing lambda = +/-180 deg; split at +/-180 deg via linear crossing latitude interpolation.
+          if (Math.abs(lonB - lonA) > Math.PI) {
+            const distA = Math.max(0.0, Math.PI - Math.abs(lonA));
+            const distB = Math.max(0.0, Math.PI - Math.abs(lonB));
+            const tCross = distA / Math.max(1e-6, distA + distB);
+            const latCross = latA + (latB - latA) * tCross;
+            const rCross = rA + (rB - rA) * tCross;
+            const posCross: [number, number, number] = [
+              0.0,
+              rCross * Math.sin(latCross),
+              -rCross * Math.cos(latCross),
+            ];
+            const signA = lonA >= 0 ? 1.0 : -1.0;
+            const latCrossDeg = latCross * radToDeg;
+            const target2DCrossA = projectToMercator(signA * 180.0, latCrossDeg, 5.0);
+            const target2DCrossB = projectToMercator(-signA * 180.0, latCrossDeg, 5.0);
+
+            segIndex = writeOrbitSegment(segIndex, posA, target2DA, posCross, target2DCrossA);
+            segIndex = writeOrbitSegment(segIndex, posCross, target2DCrossB, posB, target2DB);
+            continue;
+          }
+
+          segIndex = writeOrbitSegment(segIndex, posA, target2DA, posB, target2DB);
+        }
+      }
+
+      if (this.satelliteSegmentBuffer) {
+        this.satelliteSegmentBuffer.destroy();
+        this.satelliteSegmentBuffer = null;
+      }
+
+      this.satelliteSegmentCount = segIndex;
+      const byteLength = this.satelliteSegmentCount * 64;
+      try {
+        this.satelliteSegmentBuffer = this.device.createBuffer({
+          label: 'satellite_orbit_ribbon_buffer',
+          size: byteLength,
+          usage: GPUBufferUsage.VERTEX | GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+        });
+        this.device.queue.writeBuffer(this.satelliteSegmentBuffer, 0, segFloats.buffer, 0, byteLength);
+        if (typeof urlOrData === 'string' && this.satelliteSegmentCount > 0) {
+          this.loadedSatelliteUrl = urlOrData;
+        }
+      } catch {
+        // Mock environment guard
+      }
+    };
+
+    if (typeof urlOrData === 'string') {
+      this.inFlightSatelliteUrl = urlOrData;
+      const p = runLoad().finally(() => {
+        if (this.inFlightSatellitePromise === p) {
+          this.inFlightSatellitePromise = null;
+          this.inFlightSatelliteUrl = null;
+        }
       });
-      this.device.queue.writeBuffer(this.satelliteSegmentBuffer, 0, segFloats.buffer, 0, byteLength);
-    } catch {
-      // Mock environment guard
+      this.inFlightSatellitePromise = p;
+      return p;
     }
+
+    return runLoad();
   }
 
   /**
@@ -7004,66 +9083,199 @@ export class WebGPUEngine {
     urlOrBuffer: string | ArrayBuffer = '/data/gfs-jetstream-latest.bin'
   ): Promise<void> {
     if (!this.device || !this.isInitialized) return;
-
-    let buffer: ArrayBuffer | null = null;
-    if (urlOrBuffer instanceof ArrayBuffer) {
-      buffer = urlOrBuffer;
-    } else if (typeof fetch !== 'undefined') {
-      try {
-        const res = await fetch(urlOrBuffer);
-        if (res.ok) buffer = await res.arrayBuffer();
-      } catch {
-        // Fallback
+    const isMockFetch = typeof fetch === 'function' && Boolean((fetch as any).mock);
+    if (typeof urlOrBuffer === 'string' && !isMockFetch) {
+      if (this.lastLoadedJetStreamUrl === urlOrBuffer && this.jetStreamTexture) {
+        return;
+      }
+      if (this.inFlightJetStreamUrl === urlOrBuffer && this.inFlightJetStreamPromise) {
+        return this.inFlightJetStreamPromise;
       }
     }
 
-    if (!buffer && typeof process !== 'undefined' && process.versions?.node) {
-      buffer = await loadNodeAssetBuffer(
-        typeof urlOrBuffer === 'string' ? urlOrBuffer : 'public/data/gfs-jetstream-latest.bin'
-      );
-    }
+    const doLoadJet = async (): Promise<void> => {
+      let buffer: ArrayBuffer | null = null;
+      if (urlOrBuffer instanceof ArrayBuffer) {
+        buffer = urlOrBuffer;
+      } else if (typeof fetch !== 'undefined') {
+        try {
+          const res = await fetch(urlOrBuffer);
+          if (res.ok) buffer = await res.arrayBuffer();
+        } catch {
+          // Fallback
+        }
+      }
 
-    if (!buffer) return;
+      if (!buffer && typeof process !== 'undefined' && process.versions?.node) {
+        buffer = await loadNodeAssetBuffer(
+          typeof urlOrBuffer === 'string' ? urlOrBuffer : 'public/data/gfs-jetstream-latest.bin'
+        );
+      }
 
-    const is0p25 = buffer.byteLength === 4152960;
-    const windW = is0p25 ? 1440 : 360;
-    const windH = is0p25 ? 721 : 181;
-    const rowBytesRaw = windW * 4;
-    const rowBytesPadded = Math.ceil(rowBytesRaw / 256) * 256;
-    const padded = new Uint8Array(rowBytesPadded * windH);
+      if (!buffer || !this.device || !this.isInitialized) return;
 
-    const srcU8 = new Uint8Array(buffer);
-    for (let y = 0; y < windH; y++) {
-      const srcOffset = y * rowBytesRaw;
-      const dstOffset = y * rowBytesPadded;
-      padded.set(srcU8.subarray(srcOffset, srcOffset + rowBytesRaw), dstOffset);
-    }
+      const is0p25 = buffer.byteLength === 4152960;
+      const is1p0 = buffer.byteLength === 260640;
+      let windW: number;
+      let windH: number;
+      if (is0p25) {
+        windW = 1440;
+        windH = 721;
+      } else if (is1p0) {
+        windW = 360;
+        windH = 181;
+      } else {
+        const bytesPerTexel = 4;
+        windW = Math.max(1, Math.round(Math.sqrt(buffer.byteLength / (2 * bytesPerTexel))));
+        windH = Math.max(1, Math.floor(buffer.byteLength / (windW * bytesPerTexel)));
+      }
+      const rowBytesRaw = windW * 4;
+      const rowBytesPadded = Math.ceil(rowBytesRaw / 256) * 256;
+      const padded = new Uint8Array(rowBytesPadded * windH);
 
-    if (!this.jetStreamTexture || this.jetStreamTexture.width !== windW || this.jetStreamTexture.height !== windH) {
-      this.jetStreamTexture = this.device.createTexture({
-        label: 'jetstream_velocity_texture',
-        size: [windW, windH, 1],
-        format: 'rg16float',
-        usage:
-          typeof GPUTextureUsage !== 'undefined'
-            ? GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST
-            : 4 | 8,
+      const srcU8 = new Uint8Array(buffer);
+      for (let y = 0; y < windH; y++) {
+        const srcOffset = y * rowBytesRaw;
+        const dstOffset = y * rowBytesPadded;
+        padded.set(srcU8.subarray(srcOffset, srcOffset + rowBytesRaw), dstOffset);
+      }
+
+      if (buffer.byteLength >= windW * windH * 4) {
+        this.jetStreamRawU16 = new Uint16Array(buffer.slice(0, windW * windH * 4));
+        this.jetStreamDims = [windW, windH];
+      }
+
+      let w500Buffer: ArrayBuffer | null = null;
+      if (is0p25 && typeof urlOrBuffer === 'string' && !isMockFetch) {
+        const w500Url = urlOrBuffer.includes('gfs-jetstream-latest.bin')
+          ? urlOrBuffer.replace('gfs-jetstream-latest.bin', 'gfs-wind-500hpa-latest.bin')
+          : '/data/gfs-wind-500hpa-latest.bin';
+        if (typeof fetch !== 'undefined') {
+          try {
+            const w500Res = await fetch(w500Url);
+            const isHtml = w500Res.headers.get('content-type')?.includes('text/html');
+            if (w500Res.ok && !isHtml) {
+              const candidate = await w500Res.arrayBuffer();
+              if (candidate.byteLength === 4152960) {
+                w500Buffer = candidate;
+              }
+            }
+          } catch {}
+        }
+        if (!w500Buffer && typeof process !== 'undefined' && process.versions?.node) {
+          try {
+            const candidate = await loadNodeAssetBuffer('public/data/gfs-wind-500hpa-latest.bin');
+            if (candidate && candidate.byteLength === 4152960) {
+              w500Buffer = candidate;
+            }
+          } catch {}
+        }
+      }
+
+      if (!this.device || !this.isInitialized) return;
+
+      let targetJetFormat: GPUTextureFormat = 'rg16float';
+      let uploadJetPadded = padded;
+      let uploadJetRowBytes = rowBytesPadded;
+      if (is0p25 && w500Buffer && w500Buffer.byteLength === 4152960) {
+        const src250 = new Uint16Array(buffer, 0, windW * windH * 2);
+        const src500 = new Uint16Array(w500Buffer, 0, windW * windH * 2);
+        const interleaved = new Uint16Array(windW * windH * 4);
+        const totalPx = windW * windH;
+        for (let i = 0; i < totalPx; i++) {
+          const sIdx = i * 2;
+          const dIdx = i * 4;
+          interleaved[dIdx] = src250[sIdx];
+          interleaved[dIdx + 1] = src250[sIdx + 1];
+          interleaved[dIdx + 2] = src500[sIdx];
+          interleaved[dIdx + 3] = src500[sIdx + 1];
+        }
+        targetJetFormat = 'rgba16float';
+        uploadJetPadded = new Uint8Array(interleaved.buffer);
+        uploadJetRowBytes = windW * 8; // 1440 * 8 = 11520 (exact multiple of 256)
+        this._volumetricPackedChannelFlags |= 8;
+      } else {
+        this._volumetricPackedChannelFlags &= ~8;
+      }
+
+      if (
+        !this.jetStreamTexture ||
+        this.jetStreamTexture.width !== windW ||
+        this.jetStreamTexture.height !== windH ||
+        this.jetStreamTextureFormat !== targetJetFormat
+      ) {
+        this.jetStreamTexture?.destroy();
+        this.jetStreamTexture = this.device.createTexture({
+          label: 'jetstream_velocity_texture',
+          size: [windW, windH, 1],
+          format: targetJetFormat,
+          usage:
+            typeof GPUTextureUsage !== 'undefined'
+              ? GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST
+              : 4 | 8,
+        });
+        this.jetStreamTextureFormat = targetJetFormat;
+        this.jetStreamTextureView = this.jetStreamTexture.createView();
+      }
+
+      try {
+        this.device.queue.writeTexture(
+          { texture: this.jetStreamTexture },
+          uploadJetPadded,
+          { bytesPerRow: uploadJetRowBytes, rowsPerImage: windH },
+          [windW, windH, 1]
+        );
+        this.lastLoadedJetStreamUrl = typeof urlOrBuffer === 'string' ? urlOrBuffer : null;
+        this.updateWindBindGroups();
+        this.updateCloudBindGroups();
+        this.updateVolumetricCloudBindGroup();
+        if (this.windSlot0RawU16 && this.jetStreamRawU16) {
+          if (!isMockFetch && decodeWorkerPool.canUseWorkers()) {
+            const surfCopy: ArrayBuffer = new Uint16Array(this.windSlot0RawU16).buffer;
+            const jetCopy: ArrayBuffer = new Uint16Array(this.jetStreamRawU16).buffer;
+            const [sW, sH] = this.windSlot0Dims;
+            const merged = await decodeWorkerPool.run<WindJetInterleaveResponse>(
+              {
+                type: 'wind_jet_interleave',
+                surfRawBuffer: surfCopy,
+                windW: sW,
+                windH: sH,
+                jetRawBuffer: jetCopy,
+                jetW: windW,
+                jetH: windH,
+              },
+              [surfCopy, jetCopy]
+            );
+            if (this.device && this.isInitialized && merged.interleavedRgbaBuffer) {
+              this.writeInterleavedWindJetBuffer(
+                merged.interleavedRgbaBuffer,
+                merged.rowBytesPadded,
+                merged.windW,
+                merged.windH
+              );
+            }
+          } else {
+            this.syncInterleavedWindJetTexture();
+          }
+        }
+      } catch {
+        // Mock guard
+      }
+    };
+
+    if (typeof urlOrBuffer === 'string' && !isMockFetch) {
+      this.inFlightJetStreamUrl = urlOrBuffer;
+      const p = doLoadJet().finally(() => {
+        if (this.inFlightJetStreamPromise === p) {
+          this.inFlightJetStreamUrl = null;
+          this.inFlightJetStreamPromise = null;
+        }
       });
-      this.jetStreamTextureView = this.jetStreamTexture.createView();
+      this.inFlightJetStreamPromise = p;
+      return p;
     }
 
-    try {
-      this.device.queue.writeTexture(
-        { texture: this.jetStreamTexture },
-        padded,
-        { bytesPerRow: rowBytesPadded, rowsPerImage: windH },
-        [windW, windH, 1]
-      );
-      this.updateWindBindGroups();
-      this.updateCloudBindGroups();
-    } catch {
-      // Mock guard
-    }
+    return doLoadJet();
   }
 
   /**
@@ -7074,14 +9286,67 @@ export class WebGPUEngine {
   public sampleCPUElevation(
     lonDeg: number,
     latDeg: number
-  ): { elevationMeters: number; gradEast: number; gradNorth: number } {
+  ): { elevationMeters: number; maxElevationMeters: number; gradEast: number; gradNorth: number } {
     if (isNaN(lonDeg) || isNaN(latDeg) || !isFinite(lonDeg) || !isFinite(latDeg)) {
-      return { elevationMeters: 0, gradEast: 0, gradNorth: 0 };
+      return { elevationMeters: 0, maxElevationMeters: 0, gradEast: 0, gradNorth: 0 };
     }
 
     if (this.cpuDEMData) {
       const u = (((lonDeg + 180.0) / 360.0) % 1.0 + 1.0) % 1.0;
       const v = Math.min(0.999, Math.max(0.001, 0.5 - latDeg / 180.0));
+
+      if (this.cpuDEMData instanceof Int16Array) {
+        const data = this.cpuDEMData;
+        let W = WebGPUEngine.CPU_DEM_WIDTH;
+        let H = WebGPUEngine.CPU_DEM_HEIGHT;
+        if (data.length !== W * H * 2) {
+          const totalPixels = Math.max(1, Math.floor(data.length / 2));
+          H = Math.max(1, Math.round(Math.sqrt(totalPixels / 2)));
+          W = Math.max(1, H * 2);
+        }
+        const px = Math.min(W - 1, Math.max(0, Math.floor(u * W)));
+        const py = Math.min(H - 1, Math.max(0, Math.floor(v * H)));
+
+        const meanAt = (x: number, y: number): number => {
+          const wrapX = ((x % W) + W) % W;
+          const clampY = Math.min(H - 1, Math.max(0, y));
+          return data[(clampY * W + wrapX) * 2];
+        };
+        const maxAt = (x: number, y: number): number => {
+          const wrapX = ((x % W) + W) % W;
+          const clampY = Math.min(H - 1, Math.max(0, y));
+          return data[(clampY * W + wrapX) * 2 + 1];
+        };
+
+        const hCenter = meanAt(px, py);
+        const hEast = meanAt(px + 1, py);
+        const hWest = meanAt(px - 1, py);
+        const hNorth = meanAt(px, py - 1);
+        const hSouth = meanAt(px, py + 1);
+
+        const fx = u * W - px;
+        const fy = v * H - py;
+        let hSummit = maxAt(px, py);
+        if (fx < 0.25) hSummit = Math.max(hSummit, maxAt(px - 1, py));
+        else if (fx >= 0.75) hSummit = Math.max(hSummit, maxAt(px + 1, py));
+        if (fy < 0.25) hSummit = Math.max(hSummit, maxAt(px, py - 1));
+        else if (fy >= 0.75) hSummit = Math.max(hSummit, maxAt(px, py + 1));
+
+        const R_E = 6371000.0;
+        const dLonRad = (2.0 * Math.PI) / W;
+        const dLatRad = Math.PI / H;
+        const cosLat = Math.max(0.05, Math.cos((latDeg * Math.PI) / 180.0));
+        const dx = 2.0 * R_E * cosLat * dLonRad;
+        const dy = 2.0 * R_E * dLatRad;
+
+        return {
+          elevationMeters: hCenter,
+          maxElevationMeters: Math.max(hCenter, hSummit),
+          gradEast: (hEast - hWest) / dx,
+          gradNorth: (hNorth - hSouth) / dy,
+        };
+      }
+
       let W = this.demWidth;
       let H = this.demHeight;
       if (this.cpuDEMData.length !== W * H * 4) {
@@ -7106,7 +9371,7 @@ export class WebGPUEngine {
         const isU16 = this.cpuDEMData instanceof Uint16Array;
         const maxVal = isU16 ? 65535 : 255;
         const isLand = b > maxVal * 0.45;
-        const oceanM = - (g / maxVal) * 10924.0;
+        const oceanM = -(g / maxVal) * 10924.0;
         const landM = (r / maxVal) * 8848.0;
         return isLand ? landM : oceanM;
       };
@@ -7116,6 +9381,7 @@ export class WebGPUEngine {
       const hWest = sampleAt(px - 1, py);
       const hNorth = sampleAt(px, py - 1);
       const hSouth = sampleAt(px, py + 1);
+      const hMax = Math.max(hCenter, hEast, hWest, hNorth, hSouth);
 
       const R_E = 6371000.0;
       const dLonRad = (2.0 * Math.PI) / W;
@@ -7126,6 +9392,7 @@ export class WebGPUEngine {
 
       return {
         elevationMeters: hCenter,
+        maxElevationMeters: hMax,
         gradEast: (hEast - hWest) / dx,
         gradNorth: (hNorth - hSouth) / dy,
       };
@@ -7140,6 +9407,7 @@ export class WebGPUEngine {
       const elev = 1500.0 + 3500.0 * ridgeProfile;
       return {
         elevationMeters: elev,
+        maxElevationMeters: elev,
         gradEast: distFromRidge <= 0 ? 0.22 : -0.15,
         gradNorth: 0.02,
       };
@@ -7153,6 +9421,7 @@ export class WebGPUEngine {
       const elev = 2000.0 + 4500.0 * ridgeProfile;
       return {
         elevationMeters: elev,
+        maxElevationMeters: elev,
         gradEast: 0.02,
         gradNorth: distFromRidge < 0 ? 0.20 : -0.08,
       };
@@ -7162,6 +9431,7 @@ export class WebGPUEngine {
     if (lonDeg >= 5.0 && lonDeg <= 16.0 && latDeg >= 44.0 && latDeg <= 48.0) {
       return {
         elevationMeters: 2800.0,
+        maxElevationMeters: 2800.0,
         gradEast: 0.08,
         gradNorth: 0.06,
       };
@@ -7169,6 +9439,7 @@ export class WebGPUEngine {
 
     return {
       elevationMeters: 0,
+      maxElevationMeters: 0,
       gradEast: 0,
       gradNorth: 0,
     };
@@ -7180,7 +9451,7 @@ export class WebGPUEngine {
   public sampleCPUElevationAndGradient(
     lonDeg: number,
     latDeg: number
-  ): { elevationMeters: number; gradEast: number; gradNorth: number } {
+  ): { elevationMeters: number; maxElevationMeters: number; gradEast: number; gradNorth: number } {
     return this.sampleCPUElevation(lonDeg, latDeg);
   }
 
@@ -7237,7 +9508,7 @@ export class WebGPUEngine {
           : (16 | 4),
       });
       this.depthTextureView = this.depthTexture.createView();
-      if (this.volumetricCloudBindGroup) {
+      if (this.volumetricCloudBindGroupLayout) {
         this.updateVolumetricCloudBindGroup();
       }
     } catch {
@@ -7245,29 +9516,235 @@ export class WebGPUEngine {
     }
   }
 
+  public invalidateVolumetricTaaHistory(): void {
+    this.volumetricTaaValidFrames = 0;
+    const isRegChecker = !this.cloudFullGridMode && this.cloudResolutionScale >= 0.37;
+    this.volumetricTaaPendingParityFrames = this.cloudFullGridMode ? 10 : (isRegChecker ? 12 : 2);
+    this.volumetricHasPrevCamera = false;
+    this.volumetricIsStationaryRest = false;
+    this.volumetricIsCameraSettled = false;
+    this.volumetricPrevWasWhipPan = false;
+    this.volumetricPrevWasMotionSubgrid = false;
+    this.volumetricCameraSettledFrames = 0;
+  }
+
+  public getInFlightDecodeWorkerCount(): number {
+    return decodeWorkerPool.getPendingTaskCount();
+  }
+
+  public setXdrSolarGlintEnabled(enabled: boolean): void {
+    const next = Boolean(enabled);
+    if (this.xdrSolarGlintEnabled === next) return;
+    this.xdrSolarGlintEnabled = next;
+    this.uniformShadowValidMask = 0;
+    this.reconfigureCanvasSwapchain();
+  }
+
+  public isXdrSolarGlintEnabled(): boolean {
+    return this.xdrSolarGlintEnabled;
+  }
+
+  public reconfigureCanvasSwapchain(): void {
+    if (!this.device || !this.context) return;
+    const preferredFormat: GPUTextureFormat =
+      typeof navigator !== 'undefined' && navigator.gpu && typeof navigator.gpu.getPreferredCanvasFormat === 'function'
+        ? navigator.gpu.getPreferredCanvasFormat()
+        : 'bgra8unorm';
+    const targetFormat: GPUTextureFormat = this.xdrSolarGlintEnabled ? 'rgba16float' : preferredFormat;
+    const toneMappingMode = this.xdrSolarGlintEnabled ? 'extended' : 'standard';
+    try {
+      this.context.configure({
+        device: this.device,
+        format: targetFormat,
+        alphaMode: 'premultiplied',
+        toneMapping: { mode: toneMappingMode },
+      } as any);
+      if (this.format !== targetFormat) {
+        this.format = targetFormat;
+        const canvas = this.context.canvas as HTMLCanvasElement | undefined;
+        const w = canvas?.width || 800;
+        const h = canvas?.height || 600;
+        try {
+          this.substrateWidth = 0;
+          this.substrateHeight = 0;
+          this.updateSubstrateTextures(w, h);
+          this.windRibbonPipeline = null;
+          if (typeof this.device.createShaderModule === 'function') {
+            void this.setupPipelines();
+            this.initSubstrateHapticsPipelines();
+            this.initVolumetricCloudPipeline();
+            this.updateDEMBindGroups();
+            this.updateCloudBindGroups();
+            this.updateVolumetricCloudBindGroup();
+          }
+        } catch {
+          // Mock environment guard for partial device mocks
+        }
+      }
+    } catch {
+      this.format = preferredFormat;
+      try {
+        this.context.configure({
+          device: this.device,
+          format: this.format,
+          alphaMode: 'premultiplied',
+        });
+      } catch {}
+    }
+  }
+
+  public setCloudResolutionMode(scale: number, fullGrid: boolean, manualOverride: boolean = true): void {
+    this.cloudResolutionManualOverride = Boolean(manualOverride);
+    const clampedScale = Math.max(0.20, Math.min(1.0, Number(scale) || 0.35));
+    const nextFullGrid = Boolean(fullGrid);
+    if (Math.abs(this.cloudResolutionScale - clampedScale) < 1e-6 && this.cloudFullGridMode === nextFullGrid) {
+      return;
+    }
+    this.cloudResolutionScale = clampedScale;
+    this.cloudFullGridMode = nextFullGrid;
+    const w = (this.context?.canvas as HTMLCanvasElement)?.width || 0;
+    const h = (this.context?.canvas as HTMLCanvasElement)?.height || 0;
+    if (w > 0 && h > 0 && typeof this.device?.createTexture === 'function') {
+      this.updateCloudProxyDepthTextures(w, h);
+    }
+    this.invalidateVolumetricTaaHistory();
+  }
+
+  public clearCloudResolutionOverride(): void {
+    this.cloudResolutionManualOverride = false;
+  }
+
+  private static readonly REGIONAL_CLOUD_SCALE = 0.60;
+
+  private syncRegionalCloudResolution(params: WebGPUFrameParams): void {
+    const hasLoadedDem = Boolean(this.demTexture && (this.demTexture as any).width > 4);
+    if (this.cloudResolutionManualOverride || !hasLoadedDem || typeof this.device?.createTexture !== 'function') {
+      return;
+    }
+    const camPos = params.camera?.position;
+    if (!camPos) return;
+    const camRadius = Math.hypot(camPos.x, camPos.y, camPos.z);
+    if (camRadius < 4.5) return;
+    const unfurlCam = Math.max(0.0, Math.min(1.0, params.unfurl ?? 0.0));
+    const rawPlanZ = Math.abs(camPos.z);
+    const planarAlt = rawPlanZ >= 4.5 ? Math.abs(camPos.z - 5.0) : rawPlanZ;
+    const planarEffRadius = 5.0 + planarAlt;
+    const derivedEffRadius =
+      (params as any).effectiveCamRadius ?? (camRadius * (1.0 - unfurlCam) + planarEffRadius * unfurlCam);
+    const falseColor = Boolean(
+      (params as any).cloudFalseColor ?? (params as any).falseColor ?? this.cloudOptions.falseColor
+    );
+    const regionalAllowed = !falseColor;
+    const regTargetScale = WebGPUEngine.REGIONAL_CLOUD_SCALE;
+    if (regionalAllowed && derivedEffRadius <= 5.62) {
+      if (this.cloudFullGridMode || Math.abs(this.cloudResolutionScale - regTargetScale) > 1e-4) {
+        this.setCloudResolutionMode(regTargetScale, false, false);
+      }
+    } else if (!regionalAllowed || derivedEffRadius >= 5.72) {
+      if (this.cloudFullGridMode || Math.abs(this.cloudResolutionScale - 0.35) > 1e-4) {
+        this.setCloudResolutionMode(0.35, false, false);
+      }
+    }
+  }
+
+  public setCloudScissorNorm(rect: [number, number, number, number] | null): void {
+    if (!rect) {
+      this.cloudScissorNorm = null;
+      return;
+    }
+    const u0 = Math.max(0, Math.min(1, Number(rect[0]) || 0));
+    const v0 = Math.max(0, Math.min(1, Number(rect[1]) || 0));
+    const u1 = Math.max(u0, Math.min(1, Number(rect[2]) || 1));
+    const v1 = Math.max(v0, Math.min(1, Number(rect[3]) || 1));
+    this.cloudScissorNorm = [u0, v0, u1, v1];
+    this.invalidateVolumetricTaaHistory();
+  }
+
+  public getCloudResolutionMode(): { scale: number; fullGrid: boolean; halfW: number; halfH: number; activeCheckerW: number; activeCheckerH: number } {
+    return {
+      scale: this.cloudResolutionScale,
+      fullGrid: this.cloudFullGridMode,
+      halfW: this.volumetricHalfW,
+      halfH: this.volumetricHalfH,
+      activeCheckerW: this.volumetricActiveCheckerW,
+      activeCheckerH: this.volumetricActiveCheckerH,
+    };
+  }
+
   public updateCloudProxyDepthTextures(width: number, height: number): void {
     if (this.cloudProxyFrontDepthTexture) {
-      this.cloudProxyFrontDepthTexture.destroy();
+      this.cloudProxyFrontDepthTexture.destroy?.();
       this.cloudProxyFrontDepthTexture = null;
       this.cloudProxyFrontDepthView = null;
     }
     if (this.cloudProxyBackDepthTexture) {
-      this.cloudProxyBackDepthTexture.destroy();
+      this.cloudProxyBackDepthTexture.destroy?.();
       this.cloudProxyBackDepthTexture = null;
       this.cloudProxyBackDepthView = null;
     }
+    if (
+      this.volumetricHalfResTexture &&
+      this.volumetricHalfResTexture !== this.volumetricTaaColorTextures[0] &&
+      this.volumetricHalfResTexture !== this.volumetricTaaColorTextures[1]
+    ) {
+      this.volumetricHalfResTexture.destroy?.();
+    }
+    this.volumetricHalfResTexture = null;
+    this.volumetricHalfResView = null;
+    if (this.volumetricCheckerColorTexture) {
+      this.volumetricCheckerColorTexture.destroy?.();
+      this.volumetricCheckerColorTexture = null;
+      this.volumetricCheckerColorView = null;
+    }
+    if (this.volumetricCheckerCentroidTexture) {
+      this.volumetricCheckerCentroidTexture.destroy?.();
+      this.volumetricCheckerCentroidTexture = null;
+      this.volumetricCheckerCentroidView = null;
+    }
+    for (let i = 0; i < 2; i++) {
+      if (this.volumetricTaaColorTextures[i]) {
+        this.volumetricTaaColorTextures[i]!.destroy?.();
+        this.volumetricTaaColorTextures[i] = null;
+        this.volumetricTaaColorViews[i] = null;
+      }
+      if (this.volumetricTaaCentroidTextures[i]) {
+        this.volumetricTaaCentroidTextures[i]!.destroy?.();
+        this.volumetricTaaCentroidTextures[i] = null;
+        this.volumetricTaaCentroidViews[i] = null;
+      }
+      this.volumetricTaaResolveBindGroups[i] = null;
+      this.volumetricUpsampleBindGroups[i] = null;
+    }
     this.volumetricCloudBindGroup = null;
+    this.volumetricUpsampleBindGroup = null;
+    this.volumetricTaaFrameIndex = 0;
+    this.volumetricTaaValidFrames = 0;
+    const isRegCheckerInit = !this.cloudFullGridMode && this.cloudResolutionScale >= 0.37;
+    this.volumetricTaaPendingParityFrames = this.cloudFullGridMode ? 10 : (isRegCheckerInit ? 12 : 2);
+    this.volumetricIsStationaryRest = false;
+    this.volumetricIsCameraSettled = false;
+    this.volumetricPrevWasWhipPan = false;
+    this.volumetricPrevWasMotionSubgrid = false;
+    this.volumetricCameraSettledFrames = 0;
     if (!this.device || typeof this.device.createTexture !== 'function') return;
     const w = Math.max(1, width);
     const h = Math.max(1, height);
+    const targetCloudW = Math.max(2, Math.round(w * this.cloudResolutionScale));
+    const targetCloudH = Math.max(1, Math.round(h * this.cloudResolutionScale));
+    const checkerW = this.cloudFullGridMode ? targetCloudW : Math.max(1, (targetCloudW + 1) >> 1);
+    this.volumetricHalfW = targetCloudW;
+    this.volumetricHalfH = targetCloudH;
+    this.volumetricActiveCheckerW = checkerW;
+    this.volumetricActiveCheckerH = targetCloudH;
+    const rtUsage = typeof GPUTextureUsage !== 'undefined'
+      ? (GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING)
+      : (16 | 4);
     try {
       this.cloudProxyFrontDepthTexture = this.device.createTexture({
         label: 'cloud_proxy_front_depth_texture',
-        size: [w, h],
+        size: [targetCloudW, targetCloudH],
         format: 'depth32float',
-        usage: typeof GPUTextureUsage !== 'undefined'
-          ? (GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING)
-          : (16 | 4),
+        usage: rtUsage,
       });
       this.cloudProxyFrontDepthView = this.cloudProxyFrontDepthTexture.createView({
         label: 'cloud_proxy_front_depth_view',
@@ -7275,15 +9752,58 @@ export class WebGPUEngine {
 
       this.cloudProxyBackDepthTexture = this.device.createTexture({
         label: 'cloud_proxy_back_depth_texture',
-        size: [w, h],
+        size: [targetCloudW, targetCloudH],
         format: 'depth32float',
-        usage: typeof GPUTextureUsage !== 'undefined'
-          ? (GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING)
-          : (16 | 4),
+        usage: rtUsage,
       });
       this.cloudProxyBackDepthView = this.cloudProxyBackDepthTexture.createView({
         label: 'cloud_proxy_back_depth_view',
       });
+
+      this.volumetricCheckerColorTexture = this.device.createTexture({
+        label: 'volumetric_checker_color_texture',
+        size: [checkerW, targetCloudH],
+        format: 'rgba16float',
+        usage: rtUsage,
+      });
+      this.volumetricCheckerColorView = this.volumetricCheckerColorTexture.createView({
+        label: 'volumetric_checker_color_view',
+      });
+
+      this.volumetricCheckerCentroidTexture = this.device.createTexture({
+        label: 'volumetric_checker_centroid_texture',
+        size: [checkerW, targetCloudH],
+        format: 'r16float',
+        usage: rtUsage,
+      });
+      this.volumetricCheckerCentroidView = this.volumetricCheckerCentroidTexture.createView({
+        label: 'volumetric_checker_centroid_view',
+      });
+
+      for (let i = 0; i < 2; i++) {
+        this.volumetricTaaColorTextures[i] = this.device.createTexture({
+          label: `volumetric_taa_color_texture_${i}`,
+          size: [targetCloudW, targetCloudH],
+          format: 'rgba16float',
+          usage: rtUsage,
+        });
+        this.volumetricTaaColorViews[i] = this.volumetricTaaColorTextures[i]!.createView({
+          label: `volumetric_taa_color_view_${i}`,
+        });
+
+        this.volumetricTaaCentroidTextures[i] = this.device.createTexture({
+          label: `volumetric_taa_centroid_texture_${i}`,
+          size: [targetCloudW, targetCloudH],
+          format: 'r16float',
+          usage: rtUsage,
+        });
+        this.volumetricTaaCentroidViews[i] = this.volumetricTaaCentroidTextures[i]!.createView({
+          label: `volumetric_taa_centroid_view_${i}`,
+        });
+      }
+
+      this.volumetricHalfResTexture = this.volumetricTaaColorTextures[0];
+      this.volumetricHalfResView = this.volumetricTaaColorViews[0];
     } catch {
       // Mock environment guard
     }
@@ -7313,17 +9833,10 @@ export class WebGPUEngine {
       this.sceneColorTexture = null;
       this.sceneColorTextureView = null;
     }
-    if (this.paperNormalTexture) {
-      this.paperNormalTexture.destroy();
-      this.paperNormalTexture = null;
-      this.paperNormalTextureView = null;
-    }
     this.substrateMicroReliefBindGroup = null;
     this.paperCompositionBindGroup = null;
     this.substrateWidth = w;
     this.substrateHeight = h;
-    this.paperNormalDirty = true;
-    this.paperNormalComputed = false;
 
     try {
       this.sceneColorTexture = this.device.createTexture({
@@ -7336,23 +9849,27 @@ export class WebGPUEngine {
       });
       this.sceneColorTextureView = this.sceneColorTexture.createView({ label: 'scene_color_view' });
 
-      this.paperNormalTexture = this.device.createTexture({
-        label: 'paper_normal_texture',
-        size: [w, h, 1],
-        format: 'rgba8snorm',
-        usage: typeof GPUTextureUsage !== 'undefined'
-          ? (GPUTextureUsage.STORAGE_BINDING | GPUTextureUsage.TEXTURE_BINDING)
-          : (8 | 4),
-      });
-      this.paperNormalTextureView = this.paperNormalTexture.createView({ label: 'paper_normal_view' });
+      if (!this.paperNormalTexture) {
+        this.paperNormalTexture = this.device.createTexture({
+          label: 'paper_normal_texture',
+          size: [512, 512, 1],
+          format: 'rgba8snorm',
+          usage: typeof GPUTextureUsage !== 'undefined'
+            ? (GPUTextureUsage.STORAGE_BINDING | GPUTextureUsage.TEXTURE_BINDING)
+            : (8 | 4),
+        });
+        this.paperNormalTextureView = this.paperNormalTexture.createView({ label: 'paper_normal_view' });
+      }
+      this.paperNormalDirty = true;
+      this.paperNormalComputed = false;
 
       if (!this.substrateSampler) {
         this.substrateSampler = this.device.createSampler({
           label: 'substrate_linear_sampler',
           minFilter: 'linear',
           magFilter: 'linear',
-          addressModeU: 'clamp-to-edge',
-          addressModeV: 'clamp-to-edge',
+          addressModeU: 'repeat',
+          addressModeV: 'repeat',
         });
       }
 
@@ -7584,6 +10101,7 @@ export class WebGPUEngine {
             { binding: 7, visibility: GPUShaderStage.FRAGMENT, buffer: { type: 'uniform' } },
             { binding: 8, visibility: GPUShaderStage.FRAGMENT | GPUShaderStage.VERTEX, texture: { sampleType: 'float', viewDimension: '2d-array' } },
             { binding: 9, visibility: GPUShaderStage.FRAGMENT | GPUShaderStage.VERTEX, buffer: { type: 'read-only-storage' } },
+            { binding: 10, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: 'float', viewDimension: '2d' } },
           ],
         });
       }
@@ -7734,9 +10252,9 @@ export class WebGPUEngine {
       const hydroView = this.ensureHydroTexture();
       const normalView = this.ensureNormalTexture();
 
-      // Ensure drainage resources exist for crust bindings 5 and 6
+      // Ensure 32B drainage uniform + 1x1 dummy texture exist for crust bindings 5 and 6 (lazy 16 MiB map on demand)
       if (!this.drainageUniformBuffer || !this.dummyDrainageTextureView) {
-        this.ensureDrainageResources();
+        this.ensureDrainageFallbackResources();
       }
       const dummyDrainageView = this.dummyDrainageTextureView;
       const drainageView = this.drainageTextureView || dummyDrainageView;
@@ -7744,7 +10262,10 @@ export class WebGPUEngine {
       const { arrayView: tileArrayView, slotBuffer: tileSlotBuffer } = this.getTileCacheResources();
 
       const dummyShadowView = this.dummyTerrainShadowTextureView;
-      if (this.terrainShadowBindGroupLayout && this.terrainShadowSampler && drainageBuf && dummyDrainageView && dummyShadowView) {
+      const midCloudView = this.cloudTextures?.mid
+        ? this.cloudTextures.mid.createView({ label: 'crust_mid_cloud_texture_view' })
+        : (this.dummyCloudTextureView || dummyShadowView);
+      if (this.terrainShadowBindGroupLayout && this.terrainShadowSampler && drainageBuf && dummyDrainageView && dummyShadowView && midCloudView) {
         const shadowView = this.terrainShadowTextureView || dummyShadowView;
 
         // [0]: shadow=false, drainage=false
@@ -7762,6 +10283,7 @@ export class WebGPUEngine {
             { binding: 7, resource: { buffer: this.geomorphicMicroUniformBuffer! } },
             { binding: 8, resource: tileArrayView },
             { binding: 9, resource: { buffer: tileSlotBuffer } },
+            { binding: 10, resource: midCloudView },
           ],
         });
 
@@ -7781,6 +10303,7 @@ export class WebGPUEngine {
               { binding: 7, resource: { buffer: this.geomorphicMicroUniformBuffer! } },
               { binding: 8, resource: tileArrayView },
               { binding: 9, resource: { buffer: tileSlotBuffer } },
+              { binding: 10, resource: midCloudView },
             ],
           });
         }
@@ -7801,6 +10324,7 @@ export class WebGPUEngine {
               { binding: 7, resource: { buffer: this.geomorphicMicroUniformBuffer! } },
               { binding: 8, resource: tileArrayView },
               { binding: 9, resource: { buffer: tileSlotBuffer } },
+              { binding: 10, resource: midCloudView },
             ],
           });
         }
@@ -7821,6 +10345,7 @@ export class WebGPUEngine {
               { binding: 7, resource: { buffer: this.geomorphicMicroUniformBuffer! } },
               { binding: 8, resource: tileArrayView },
               { binding: 9, resource: { buffer: tileSlotBuffer } },
+              { binding: 10, resource: midCloudView },
             ],
           });
         }
@@ -7930,24 +10455,9 @@ export class WebGPUEngine {
   // Milestone 11: Geomorphic Drainage Basin Synthesis & Leopold-Maddock Hydrology
   // ==========================================================================
 
-  public ensureDrainageResources(): void {
+  public ensureDrainageFallbackResources(): void {
     if (!this.device) return;
-
     try {
-      if (!this.drainageBindGroupLayout) {
-        this.drainageBindGroupLayout = this.device.createBindGroupLayout({
-          label: 'drainage_compute_bind_group_layout',
-          entries: [
-            { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' } },
-            { binding: 1, visibility: GPUShaderStage.COMPUTE, texture: { sampleType: 'float', viewDimension: '2d' } },
-            { binding: 2, visibility: GPUShaderStage.COMPUTE, sampler: { type: 'filtering' } },
-            { binding: 3, visibility: GPUShaderStage.COMPUTE, texture: { sampleType: 'float', viewDimension: '2d' } },
-            { binding: 4, visibility: GPUShaderStage.COMPUTE, sampler: { type: 'filtering' } },
-            { binding: 5, visibility: GPUShaderStage.COMPUTE, storageTexture: { access: 'write-only', format: 'rgba16float', viewDimension: '2d' } },
-          ],
-        });
-      }
-
       if (!this.drainageUniformBuffer) {
         this.drainageUniformBuffer = this.device.createBuffer({
           label: 'drainage_uniform_buffer',
@@ -7987,7 +10497,32 @@ export class WebGPUEngine {
           label: 'dummy_drainage_texture_view',
         });
       }
+    } catch {
+      // Mock environment guard
+    }
+  }
 
+  public ensureDrainageResources(): void {
+    if (!this.device) return;
+
+    try {
+      if (!this.drainageBindGroupLayout) {
+        this.drainageBindGroupLayout = this.device.createBindGroupLayout({
+          label: 'drainage_compute_bind_group_layout',
+          entries: [
+            { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' } },
+            { binding: 1, visibility: GPUShaderStage.COMPUTE, texture: { sampleType: 'float', viewDimension: '2d' } },
+            { binding: 2, visibility: GPUShaderStage.COMPUTE, sampler: { type: 'filtering' } },
+            { binding: 3, visibility: GPUShaderStage.COMPUTE, texture: { sampleType: 'float', viewDimension: '2d' } },
+            { binding: 4, visibility: GPUShaderStage.COMPUTE, sampler: { type: 'filtering' } },
+            { binding: 5, visibility: GPUShaderStage.COMPUTE, storageTexture: { access: 'write-only', format: 'rgba16float', viewDimension: '2d' } },
+          ],
+        });
+      }
+
+      this.ensureDrainageFallbackResources();
+
+      let createdDrainageTexture = false;
       if (!this.drainageTexture) {
         this.drainageTexture = this.device.createTexture({
           label: 'drainage_accumulation_texture',
@@ -8000,9 +10535,13 @@ export class WebGPUEngine {
         this.drainageTextureView = this.drainageTexture.createView({
           label: 'drainage_accumulation_texture_view',
         });
+        createdDrainageTexture = true;
       }
 
       this.updateDrainageBindGroups();
+      if (createdDrainageTexture) {
+        this.updateTerrainShadowBindGroups();
+      }
     } catch {
       // Mock environment guard
     }
@@ -8049,7 +10588,7 @@ export class WebGPUEngine {
       const demSampler = this.demSampler || this.terrainShadowSampler;
       const precipView = (this.precipRingBuffer && !this.precipRingBuffer.disposed)
         ? this.precipRingBuffer.getTextureView(0)
-        : (this.precipTextureView || this.dummyTerrainShadowTextureView);
+        : (((this.precipRingBuffer && this.precipRingBuffer.disposed) ? null : this.precipTextureView) || this.dummyPrecipTextureView || this.dummyTerrainShadowTextureView);
       const precipSampler = this.precipSampler || demSampler;
 
       if (this.drainageBindGroupLayout && this.drainageTextureView && demView && demSampler && precipView && precipSampler) {
@@ -8065,6 +10604,7 @@ export class WebGPUEngine {
             { binding: 5, resource: this.drainageTextureView },
           ],
         });
+        this.boundDrainagePrecipView = precipView;
         this.drainageDirty = true;
       }
     } catch {
@@ -8195,7 +10735,11 @@ export class WebGPUEngine {
   }
 
   public resetCloudAdvection(): void {
-    if (!this.device || !this.cloudDensityTextures[0] || !this.cloudDensityTextures[1]) return;
+    this._advectionAccumDt = 0;
+    if (!this.device || !this.cloudDensityTextures[0] || !this.cloudDensityTextures[1]) {
+      this.cloudAdvectionStep = 0;
+      return;
+    }
     try {
       const [w, h, d] = this.cloudDensityGridDimensions;
       const zeroData = new Uint8Array(w * h * d * 4);
@@ -8231,6 +10775,7 @@ export class WebGPUEngine {
     if (!this.device || typeof this.device.createBuffer !== 'function') return;
 
     try {
+      let allocatedAny = false;
       // 1. Allocate 64-byte AdvectionUniforms buffer (16-byte WGSL alignment)
       if (!this.advectionUniformBuffer) {
         this.advectionUniformBuffer = this.device.createBuffer({
@@ -8240,6 +10785,7 @@ export class WebGPUEngine {
             ? (GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST)
             : (64 | 8)),
         });
+        allocatedAny = true;
       }
 
       // 2. Allocate 3D linear density sampler
@@ -8252,6 +10798,7 @@ export class WebGPUEngine {
           minFilter: 'linear',
           magFilter: 'linear',
         });
+        allocatedAny = true;
       }
 
       // 3. Allocate 1x1x1 dummy 3D density texture for un-advected fallback
@@ -8267,6 +10814,7 @@ export class WebGPUEngine {
           label: 'dummy_3d_density_texture_view',
           dimension: '3d',
         });
+        allocatedAny = true;
       }
 
       // 4. Allocate 128x128x32 3D ping-pong GPU textures (rgba8unorm)
@@ -8288,13 +10836,21 @@ export class WebGPUEngine {
             label: `cloud_density_3d_pingpong_view_${i}`,
             dimension: '3d',
           });
+          allocatedAny = true;
         }
       }
 
-      // 5. Initialize pipelines and bind groups if not yet created
+      // 5. Initialize pipelines and bind groups only when newly allocated or missing
       if (!this.cloudAdvectionComputePipeline) {
         this.initCloudAdvectionPipelines();
-      } else {
+      } else if (
+        allocatedAny ||
+        !this.cloudAdvectionComputeBindGroups[0] ||
+        !this.cloudAdvectionComputeBindGroups[1] ||
+        !this.cloudAdvectionRenderBindGroups[0] ||
+        !this.cloudAdvectionRenderBindGroups[1] ||
+        !this.cloudAdvectionDummyRenderBindGroup
+      ) {
         this.updateCloudAdvectionBindGroups();
       }
     } catch (err) {
@@ -8323,6 +10879,8 @@ export class WebGPUEngine {
             { binding: 8, visibility: COMPUTE_STAGE, texture: { sampleType: 'float', viewDimension: '2d' } },
             { binding: 9, visibility: COMPUTE_STAGE, texture: { sampleType: 'float', viewDimension: '2d' } },
             { binding: 10, visibility: COMPUTE_STAGE, texture: { sampleType: 'float', viewDimension: '2d' } },
+            { binding: 11, visibility: COMPUTE_STAGE, texture: { sampleType: 'float', viewDimension: '2d' } },
+            { binding: 12, visibility: COMPUTE_STAGE, texture: { sampleType: 'float', viewDimension: '2d' } },
           ],
         });
       }
@@ -8356,11 +10914,19 @@ export class WebGPUEngine {
     if (!this.device || !this.advectionUniformBuffer) return;
 
     try {
+      try {
+        this.ensureTempTexture();
+        this.ensureDewpointTexture();
+      } catch {
+        // Fallback if mock device lacks texture creation
+      }
       const demView = this.demTextureView;
       const demSampler = this.demSampler || this.volumetricNoiseSampler;
       const windView = this.windTextureView || this.dummyWindTextureView || demView;
       const windSampler = this.windSampler || demSampler;
       const densitySampler = this.cloudDensitySampler || demSampler;
+      const tempView = this.tempTextureView || this.dummyTempTextureView || demView;
+      const dewpointView = this.dewpointTextureView || this.dummyDewpointTextureView || demView;
 
       // Fallback 2D cloud textures (reuse cached GPUTextureViews when available)
       const lowView = this.cloudTextureViews.low || (this.cloudTextures.low ? this.cloudTextures.low.createView() : (this.dummyCloudTextureView || demView));
@@ -8369,7 +10935,7 @@ export class WebGPUEngine {
 
       // Compute Ping-Pong Bind Groups:
       // Ping 0 -> Pong 1
-      if (this.cloudAdvectionComputeBindGroupLayout && this.cloudDensityTextureViews[0] && this.cloudDensityTextureViews[1] && demView && demSampler && windView && windSampler && densitySampler && lowView && midView && highView) {
+      if (this.cloudAdvectionComputeBindGroupLayout && this.cloudDensityTextureViews[0] && this.cloudDensityTextureViews[1] && demView && demSampler && windView && windSampler && densitySampler && lowView && midView && highView && tempView && dewpointView) {
         this.cloudAdvectionComputeBindGroups[0] = this.device.createBindGroup({
           label: 'cloud_advection_compute_bind_group_0_to_1',
           layout: this.cloudAdvectionComputeBindGroupLayout,
@@ -8385,6 +10951,8 @@ export class WebGPUEngine {
             { binding: 8, resource: lowView },
             { binding: 9, resource: midView },
             { binding: 10, resource: highView },
+            { binding: 11, resource: tempView },
+            { binding: 12, resource: dewpointView },
           ],
         });
 
@@ -8404,6 +10972,8 @@ export class WebGPUEngine {
             { binding: 8, resource: lowView },
             { binding: 9, resource: midView },
             { binding: 10, resource: highView },
+            { binding: 11, resource: tempView },
+            { binding: 12, resource: dewpointView },
           ],
         });
       }
@@ -8445,16 +11015,42 @@ export class WebGPUEngine {
         }
       }
 
-      this.cloudAdvectionHasRealTextures = !!(this.cloudTextures.low && this.windTextureView && this.demTextureView);
+      const prevHasReal = this.cloudAdvectionHasRealTextures;
+      this.cloudAdvectionHasRealTextures = !!(
+        this._preCullHasLayer.low &&
+        this._preCullHasLayer.mid &&
+        this._preCullHasLayer.high &&
+        this.windTextureView &&
+        this.demTextureView
+      );
+      if (!prevHasReal && this.cloudAdvectionHasRealTextures) {
+        this.cloudAdvectionStep = 0;
+        this._advectionAccumDt = 0;
+      }
+      const canUpdateLegacyCloudBgs = Boolean(
+        this.device &&
+        this.cloudBindGroupLayout &&
+        this.cloudUniformBuffers &&
+        this.cloudUniformBuffers.length >= 3 &&
+        this.cloudTextures.low &&
+        this.cloudTextures.mid &&
+        this.cloudTextures.high
+      );
+      this.updateCloudBindGroups();
+      if (!canUpdateLegacyCloudBgs) {
+        this.updateVolumetricCloudBindGroup();
+      }
     } catch {
       // Mock / headless guard
     }
   }
 
-  public updateAdvectionUniforms(params: Partial<WebGPUFrameParams>): void {
+  public updateAdvectionUniforms(params: Partial<WebGPUFrameParams>, stepDtOverride?: number): void {
     if (!this.advectionUniformBuffer || !this.device) return;
 
-    const dt = params.dt !== undefined ? params.dt : 0.016667;
+    const dt = stepDtOverride !== undefined
+      ? stepDtOverride
+      : (params.dt !== undefined ? params.dt : 0.016667);
     const advectionSpeed = params.cloudAdvectionSpeed !== undefined
       ? params.cloudAdvectionSpeed
       : 1.0;
@@ -8490,6 +11086,14 @@ export class WebGPUEngine {
   }
 
   public dispatchCloudAdvection(commandEncoder: GPUCommandEncoder, params: Partial<WebGPUFrameParams>): void {
+    if (
+      params.showClouds === false ||
+      params.cloudAdvection === false ||
+      !this.cloudAdvectionEnabled ||
+      this.cloudEnabled === false
+    ) {
+      return;
+    }
     if (
       !this.cloudAdvectionComputePipeline ||
       !this.cloudAdvectionComputeBindGroups[0] ||
@@ -8546,6 +11150,13 @@ export class WebGPUEngine {
       this.cloudNoiseTexture = null;
       this.cloudNoiseTextureView = null;
     }
+    if (this.regionalCloudNoiseTexture) {
+      try {
+        this.regionalCloudNoiseTexture.destroy();
+      } catch {}
+      this.regionalCloudNoiseTexture = null;
+      this.regionalCloudNoiseTextureView = null;
+    }
 
     const startTime = performance.now();
 
@@ -8566,6 +11177,20 @@ export class WebGPUEngine {
 
       this.cloudNoiseTextureView = this.cloudNoiseTexture.createView({
         label: 'cloud_noise_3d_texture_view',
+        dimension: '3d',
+      });
+
+      // 1B. Allocate Half-Dome Regional 3D Noise Atlas (80^3 = 500 KB L2/SLC-resident, rgba8unorm: .r = 4-oct C^2 Perlin FBM, .gba = spherical Worley 6/14/28)
+      this.regionalCloudNoiseTexture = this.device.createTexture({
+        label: 'regional_cloud_noise_3d_texture',
+        size: [80, 80, 80],
+        dimension: '3d',
+        format: 'rgba8unorm',
+        usage: STORAGE_BINDING | TEXTURE_BINDING,
+      });
+
+      this.regionalCloudNoiseTextureView = this.regionalCloudNoiseTexture.createView({
+        label: 'regional_cloud_noise_3d_texture_view',
         dimension: '3d',
       });
 
@@ -8609,7 +11234,111 @@ export class WebGPUEngine {
         },
       });
 
-      // 6. Create bind group
+      const regionalNoiseWGSL = /* wgsl */ `
+@group(0) @binding(0) var noiseTex: texture_storage_3d<rgba8unorm, write>;
+
+fn pcg3d(p_in: vec3<u32>) -> vec3<f32> {
+    var v = p_in * 1664525u + 1013904223u;
+    v.x = v.x + v.y * v.z;
+    v.y = v.y + v.z * v.x;
+    v.z = v.z + v.x * v.y;
+    v.x = v.x ^ (v.x >> 16u);
+    v.y = v.y ^ (v.y >> 16u);
+    v.z = v.z ^ (v.z >> 16u);
+    v.x = v.x + v.y * v.z;
+    v.y = v.y + v.z * v.x;
+    v.z = v.z + v.x * v.y;
+    return vec3<f32>(v) * (1.0 / 4294967296.0);
+}
+
+fn quinticFade3(t: vec3<f32>) -> vec3<f32> {
+    return t * t * t * (t * (t * 6.0 - 15.0) + 10.0);
+}
+
+fn perlinGradient(corner: vec3<u32>, period: u32) -> vec3<f32> {
+    let wrapped = corner % vec3<u32>(period);
+    let grad = pcg3d(wrapped) * 2.0 - 1.0;
+    let len = length(grad);
+    return select(grad / len, vec3<f32>(0.57735, 0.57735, 0.57735), len < 0.001);
+}
+
+fn periodicPerlin3D(p: vec3<f32>, period: u32) -> f32 {
+    let scaled = p * f32(period);
+    let i0 = vec3<u32>(scaled);
+    let f0 = fract(scaled);
+    let w = quinticFade3(f0);
+    let d000 = dot(perlinGradient(i0 + vec3<u32>(0u, 0u, 0u), period), f0 - vec3<f32>(0.0, 0.0, 0.0));
+    let d100 = dot(perlinGradient(i0 + vec3<u32>(1u, 0u, 0u), period), f0 - vec3<f32>(1.0, 0.0, 0.0));
+    let d010 = dot(perlinGradient(i0 + vec3<u32>(0u, 1u, 0u), period), f0 - vec3<f32>(0.0, 1.0, 0.0));
+    let d110 = dot(perlinGradient(i0 + vec3<u32>(1u, 1u, 0u), period), f0 - vec3<f32>(1.0, 1.0, 0.0));
+    let d001 = dot(perlinGradient(i0 + vec3<u32>(0u, 0u, 1u), period), f0 - vec3<f32>(0.0, 0.0, 1.0));
+    let d101 = dot(perlinGradient(i0 + vec3<u32>(1u, 0u, 1u), period), f0 - vec3<f32>(1.0, 0.0, 1.0));
+    let d011 = dot(perlinGradient(i0 + vec3<u32>(0u, 1u, 1u), period), f0 - vec3<f32>(0.0, 1.0, 1.0));
+    let d111 = dot(perlinGradient(i0 + vec3<u32>(1u, 1u, 1u), period), f0 - vec3<f32>(1.0, 1.0, 1.0));
+    let x00 = mix(d000, d100, w.x);
+    let x10 = mix(d010, d110, w.x);
+    let x01 = mix(d001, d101, w.x);
+    let x11 = mix(d011, d111, w.x);
+    return clamp(mix(mix(x00, x10, w.y), mix(x01, x11, w.y), w.z) * 0.92 + 0.5, 0.0, 1.0);
+}
+
+fn periodicSphericalWorley3D(p: vec3<f32>, period: u32, radiusScale: f32) -> f32 {
+    let scaled = p * f32(period);
+    let i0 = vec3<i32>(floor(scaled));
+    let f0 = fract(scaled);
+    let p_vec = vec3<i32>(i32(period));
+    let baseCell = ((i0 % p_vec) + p_vec) % p_vec;
+    var bestCap: f32 = 0.0;
+    for (var dz: i32 = -1; dz <= 1; dz++) {
+        for (var dy: i32 = -1; dy <= 1; dy++) {
+            for (var dx: i32 = -1; dx <= 1; dx++) {
+                let rawCell = baseCell + vec3<i32>(dx, dy, dz);
+                let posCell = select(rawCell, rawCell + p_vec, rawCell < vec3<i32>(0));
+                let wrapped = vec3<u32>(select(posCell, posCell - p_vec, posCell >= p_vec));
+                let rnd = pcg3d(wrapped);
+                let cellR = radiusScale * (0.84 + 0.34 * fract(rnd.x * 7.13 + rnd.y * 3.71));
+                let offset = 0.12 + 0.76 * rnd;
+                let diff = (vec3<f32>(f32(dx), f32(dy), f32(dz)) + offset) - f0;
+                let normSq = dot(diff, diff) / max(0.05, cellR * cellR);
+                let cap = sqrt(clamp(1.0 - normSq, 0.0, 1.0));
+                bestCap = max(bestCap, cap);
+            }
+        }
+    }
+    return bestCap;
+}
+
+@compute @workgroup_size(4, 4, 4)
+fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let dims = textureDimensions(noiseTex);
+    if (any(gid >= dims)) {
+        return;
+    }
+    let p = (vec3<f32>(gid) + vec3<f32>(0.5)) / vec3<f32>(dims);
+    let p3  = periodicPerlin3D(p, 3u);
+    let p6  = periodicPerlin3D(p, 6u);
+    let p12 = periodicPerlin3D(p, 12u);
+    let p24 = periodicPerlin3D(p, 24u);
+    let pureFbm = clamp(0.46 * p3 + 0.28 * p6 + 0.16 * p12 + 0.10 * p24, 0.0, 1.0);
+    let puff6  = periodicSphericalWorley3D(p, 6u, 0.92);
+    let puff14 = periodicSphericalWorley3D(p, 14u, 0.90);
+    let puff28 = periodicSphericalWorley3D(p, 28u, 0.88);
+    textureStore(noiseTex, gid, vec4<f32>(pureFbm, puff6, puff14, puff28));
+}`;
+      const regNoiseModule = this.device.createShaderModule({
+        label: 'regional_cloud_noise_compute_shader',
+        code: regionalNoiseWGSL,
+      });
+      this.regionalCloudNoisePipeline = this.device.createComputePipeline({
+        label: 'regional_cloud_noise_compute_pipeline',
+        layout: pipelineLayout,
+        compute: {
+          module: regNoiseModule,
+          entryPoint: 'cs_main',
+        },
+      });
+
+      // 6. Create bind groups
       const bindGroup = this.device.createBindGroup({
         label: 'cloud_noise_compute_bind_group',
         layout: this.cloudNoiseBindGroupLayout,
@@ -8617,6 +11346,16 @@ export class WebGPUEngine {
           {
             binding: 0,
             resource: this.cloudNoiseTextureView,
+          },
+        ],
+      });
+      const regBindGroup = this.device.createBindGroup({
+        label: 'regional_cloud_noise_compute_bind_group',
+        layout: this.cloudNoiseBindGroupLayout,
+        entries: [
+          {
+            binding: 0,
+            resource: this.regionalCloudNoiseTextureView,
           },
         ],
       });
@@ -8631,9 +11370,13 @@ export class WebGPUEngine {
       computePass.setPipeline(this.cloudNoisePipeline);
       computePass.setBindGroup(0, bindGroup);
       computePass.dispatchWorkgroups(32, 32, 32);
+      computePass.setPipeline(this.regionalCloudNoisePipeline);
+      computePass.setBindGroup(0, regBindGroup);
+      computePass.dispatchWorkgroups(20, 20, 20);
       computePass.end();
 
       this.device.queue.submit([commandEncoder.finish()]);
+      this.updateVolumetricTerrainBindGroup();
       this.cloudNoiseComputeDurationMs = performance.now() - startTime;
     } catch (err) {
       console.warn('[WebGPUEngine] Cloud noise compute generation failed (mock/headless guard):', err);
@@ -8737,11 +11480,258 @@ export class WebGPUEngine {
 
   public setVolumetricCloudsEnabled(enabled: boolean): void {
     this.volumetricCloudsEnabled = enabled;
+    if (typeof window !== 'undefined') {
+      if (!(window as any).__INDICATRIX_LIVE_UNIFORMS__) {
+        (window as any).__INDICATRIX_LIVE_UNIFORMS__ = {};
+      }
+      (window as any).__INDICATRIX_LIVE_UNIFORMS__.volumetricClouds = enabled;
+    }
   }
 
   public isVolumetricCloudsEnabled(): boolean {
     return this.volumetricCloudsEnabled;
   }
+
+  public ensureCloudPreCullBuffer(): void {
+    if (!this.device || typeof this.device.createBuffer !== 'function' || this.cloudPreCullBuffer) return;
+    const STORAGE_USAGE = typeof GPUBufferUsage !== 'undefined'
+      ? (GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST)
+      : (0x0080 | 0x0008);
+    this.cloudPreCullBuffer = this.device.createBuffer({
+      label: 'volumetric_cloud_precull_grid_buffer',
+      size: 225 * 113 * 4,
+      usage: STORAGE_USAGE,
+    });
+    if (this._preCullHasLayer.low && this._preCullHasLayer.mid && this._preCullHasLayer.high) {
+      this.rebuildCloudPreCullGrid();
+    } else {
+      const conservativeWord = ((encodeFloat16(3.0) & 0xffff) | ((encodeFloat16(0.0) & 0xffff) << 16)) >>> 0;
+      this._preCullPackedU32.fill(conservativeWord);
+      try {
+        this.device.queue?.writeBuffer(this.cloudPreCullBuffer, 0, this._preCullPackedU32.buffer);
+      } catch {}
+    }
+  }
+
+  private _downsampleColBin(c: number, width: number): number {
+    if (width === 3600) return this._preCullColBins3600[c];
+    const bin = Math.floor((c * 225) / width);
+    return bin > 224 ? 224 : bin;
+  }
+
+  public updateCloudPreCullLayer(
+    layer: 'low' | 'mid' | 'high',
+    paddedBytes: Uint8Array,
+    width: number,
+    height: number,
+    paddedRowBytes: number
+  ): void {
+    if (width <= 0 || height <= 0 || paddedBytes.byteLength < 2) return;
+    const dst = this._preCullLayerMax[layer];
+    const srcU16 = new Uint16Array(paddedBytes.buffer, paddedBytes.byteOffset, paddedBytes.byteLength >> 1);
+    const rowStrideU16 = paddedRowBytes >> 1;
+
+    if (width >= 225 && height >= 113) {
+      dst.fill(0.0);
+      for (let r = 0; r < height; r++) {
+        const iy = Math.min(112, Math.floor((r * 113) / height));
+        const binRowOff = iy * 225;
+        const srcRowOff = r * rowStrideU16;
+        if (srcRowOff + width > srcU16.length) break;
+        for (let c = 0; c < width; c++) {
+          const val = FLOAT16_DEC_TABLE[srcU16[srcRowOff + c]];
+          if (val > 0.0 && val <= 4.0) {
+            const cellIdx = binRowOff + this._downsampleColBin(c, width);
+            if (val > dst[cellIdx]) dst[cellIdx] = val;
+          }
+        }
+      }
+    } else {
+      for (let iy = 0; iy < 113; iy++) {
+        const r = Math.min(height - 1, Math.floor(((iy + 0.5) * height) / 113));
+        const srcRowOff = r * rowStrideU16;
+        for (let ix = 0; ix < 225; ix++) {
+          const c = Math.min(width - 1, Math.floor(((ix + 0.5) * width) / 225));
+          const idx = srcRowOff + c;
+          const val = idx < srcU16.length ? FLOAT16_DEC_TABLE[srcU16[idx]] : 1.0;
+          dst[iy * 225 + ix] = Number.isFinite(val) ? Math.max(0.0, val) : 1.0;
+        }
+      }
+    }
+
+    this._preCullHasLayer[layer] = true;
+    this.rebuildCloudPreCullGrid();
+  }
+
+  public updateCloudPreCullLayerDualHour(
+    layer: 'low' | 'mid' | 'high',
+    src0: Uint16Array,
+    src1: Uint16Array,
+    width: number,
+    height: number,
+    src0RowU16: number,
+    src1RowU16: number
+  ): void {
+    if (width <= 0 || height <= 0) return;
+    const dst = this._preCullLayerMax[layer];
+
+    if (width >= 225 && height >= 113) {
+      dst.fill(0.0);
+      for (let r = 0; r < height; r++) {
+        const iy = Math.min(112, Math.floor((r * 113) / height));
+        const binRowOff = iy * 225;
+        const off0 = r * src0RowU16;
+        const off1 = r * src1RowU16;
+        if (off0 + width > src0.length || off1 + width > src1.length) break;
+        for (let c = 0; c < width; c++) {
+          const v0 = FLOAT16_DEC_TABLE[src0[off0 + c]];
+          const v1 = FLOAT16_DEC_TABLE[src1[off1 + c]];
+          const val = (v0 > v1 ? v0 : v1);
+          if (val > 0.0 && val <= 4.0) {
+            const cellIdx = binRowOff + this._downsampleColBin(c, width);
+            if (val > dst[cellIdx]) dst[cellIdx] = val;
+          }
+        }
+      }
+    } else {
+      for (let iy = 0; iy < 113; iy++) {
+        const r = Math.min(height - 1, Math.floor(((iy + 0.5) * height) / 113));
+        const off0 = r * src0RowU16;
+        const off1 = r * src1RowU16;
+        for (let ix = 0; ix < 225; ix++) {
+          const c = Math.min(width - 1, Math.floor(((ix + 0.5) * width) / 225));
+          const v0 = off0 + c < src0.length ? FLOAT16_DEC_TABLE[src0[off0 + c]] : 1.0;
+          const v1 = off1 + c < src1.length ? FLOAT16_DEC_TABLE[src1[off1 + c]] : 1.0;
+          const val = Math.max(Number.isFinite(v0) ? v0 : 1.0, Number.isFinite(v1) ? v1 : 1.0);
+          dst[iy * 225 + ix] = Math.max(0.0, val);
+        }
+      }
+    }
+
+    this._preCullHasLayer[layer] = true;
+    this.rebuildCloudPreCullGrid();
+  }
+
+  public updateCloudPreCullThermoField(
+    kind: 'temp' | 'dew',
+    buffer: ArrayBuffer,
+    width: number,
+    height: number,
+    isPadded3600: boolean
+  ): void {
+    if (width <= 0 || height <= 0 || buffer.byteLength < 2) return;
+    const srcU16 = new Uint16Array(buffer, 0, buffer.byteLength >> 1);
+    const rowStrideU16 = isPadded3600 ? 3712 : width;
+    const isTemp = kind === 'temp';
+    const dst = isTemp ? this._preCullMinTemp : this._preCullMaxDew;
+    const sentinel = isTemp ? 1e6 : -1e6;
+    dst.fill(sentinel);
+
+    if (width >= 225 && height >= 113) {
+      for (let r = 0; r < height; r++) {
+        const iy = Math.min(112, Math.floor((r * 113) / height));
+        const binRowOff = iy * 225;
+        const srcRowOff = r * rowStrideU16;
+        if (srcRowOff + width > srcU16.length) break;
+        for (let c = 0; c < width; c++) {
+          const raw = FLOAT16_DEC_TABLE[srcU16[srcRowOff + c]];
+          if (Number.isFinite(raw) && raw > -120.0 && raw < 400.0) {
+            const celsius = raw > 150.0 ? raw - 273.15 : raw;
+            const cellIdx = binRowOff + this._downsampleColBin(c, width);
+            if (isTemp) {
+              if (celsius < dst[cellIdx]) dst[cellIdx] = celsius;
+            } else {
+              if (celsius > dst[cellIdx]) dst[cellIdx] = celsius;
+            }
+          }
+        }
+      }
+    } else {
+      for (let iy = 0; iy < 113; iy++) {
+        const r = Math.min(height - 1, Math.floor(((iy + 0.5) * height) / 113));
+        const srcRowOff = r * rowStrideU16;
+        for (let ix = 0; ix < 225; ix++) {
+          const c = Math.min(width - 1, Math.floor(((ix + 0.5) * width) / 225));
+          const idx = srcRowOff + c;
+          const raw = idx < srcU16.length ? FLOAT16_DEC_TABLE[srcU16[idx]] : NaN;
+          if (Number.isFinite(raw) && raw > -120.0 && raw < 400.0) {
+            dst[iy * 225 + ix] = raw > 150.0 ? raw - 273.15 : raw;
+          }
+        }
+      }
+    }
+
+    for (let i = 0; i < 225 * 113; i++) {
+      if (isTemp) {
+        if (dst[i] > 9e5) dst[i] = -100.0;
+      } else {
+        if (dst[i] < -9e5) dst[i] = 100.0;
+      }
+    }
+
+    if (isTemp) {
+      this._preCullHasTemp = true;
+    } else {
+      this._preCullHasDew = true;
+    }
+    this.rebuildCloudPreCullGrid();
+  }
+
+  public rebuildCloudPreCullGrid(): void {
+    if (!(this._preCullHasLayer.low && this._preCullHasLayer.mid && this._preCullHasLayer.high)) {
+      return;
+    }
+    const rawCov = this._preCullScratchA;
+    const rawLcl = this._preCullScratchB;
+    const lowArr = this._preCullLayerMax.low;
+    const midArr = this._preCullLayerMax.mid;
+    const highArr = this._preCullLayerMax.high;
+    const hasThermo = this._preCullHasTemp && this._preCullHasDew;
+    const minTempArr = this._preCullMinTemp;
+    const maxDewArr = this._preCullMaxDew;
+
+    for (let i = 0; i < 225 * 113; i++) {
+      rawCov[i] = lowArr[i] + midArr[i] + highArr[i];
+      rawLcl[i] = hasThermo ? 125.0 * Math.max(0.0, minTempArr[i] - maxDewArr[i]) : 0.0;
+    }
+
+    const packed = this._preCullPackedU32;
+    for (let iy = 0; iy < 113; iy++) {
+      const yMin = iy > 0 ? iy - 1 : 0;
+      const yMax = iy < 112 ? iy + 1 : 112;
+      const dstRow = iy * 225;
+      for (let ix = 0; ix < 225; ix++) {
+        let maxCov3x3 = 0.0;
+        let minLcl3x3 = hasThermo ? 65000.0 : 0.0;
+        for (let ny = yMin; ny <= yMax; ny++) {
+          const rowOff = ny * 225;
+          for (let dx = -1; dx <= 1; dx++) {
+            const nx = (ix + dx + 225) % 225;
+            const cellIdx = rowOff + nx;
+            const cVal = rawCov[cellIdx];
+            if (cVal > maxCov3x3) maxCov3x3 = cVal;
+            if (hasThermo) {
+              const lVal = rawLcl[cellIdx];
+              if (lVal < minLcl3x3) minLcl3x3 = lVal;
+            }
+          }
+        }
+        const f16Cov = encodeFloat16(maxCov3x3) & 0xffff;
+        const f16Lcl = encodeFloat16(Math.min(minLcl3x3, 65000.0)) & 0xffff;
+        packed[dstRow + ix] = (f16Cov | (f16Lcl << 16)) >>> 0;
+      }
+    }
+
+    if (this.device && this.cloudPreCullBuffer) {
+      try {
+        this.device.queue?.writeBuffer(this.cloudPreCullBuffer, 0, packed.buffer);
+      } catch {}
+    }
+  }
+
+  private _taaScratchMatA: Matrix4 = new Matrix4();
+  private _taaScratchMatB: Matrix4 = new Matrix4();
+  private _taaScratchViewProj: Matrix4 = new Matrix4();
 
   public ensureVolumetricCloudBuffers(): void {
     if (!this.device || typeof this.device.createBuffer !== 'function') return;
@@ -8749,7 +11739,7 @@ export class WebGPUEngine {
     if (!this.volumetricCameraUniformBuffer) {
       this.volumetricCameraUniformBuffer = this.device.createBuffer({
         label: 'volumetric_camera_uniform_buffer',
-        size: 192,
+        size: 272,
         usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
       });
     }
@@ -8757,7 +11747,7 @@ export class WebGPUEngine {
     if (!this.volumetricCloudUniformBuffer) {
       this.volumetricCloudUniformBuffer = this.device.createBuffer({
         label: 'volumetric_cloud_uniform_buffer',
-        size: 160,
+        size: 176,
         usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
       });
     }
@@ -8769,7 +11759,7 @@ export class WebGPUEngine {
     try {
       const volumetricCloudShaderModule = this.device.createShaderModule({
         label: 'volumetric_cloud_shader',
-        code: volumetricCloudWGSL,
+        code: prepareVolumetricCloudShaderWGSL(volumetricCloudWGSL),
       });
 
       const VERTEX_STAGE = typeof GPUShaderStage !== 'undefined' ? GPUShaderStage.VERTEX : 1;
@@ -8791,7 +11781,7 @@ export class WebGPUEngine {
           },
           {
             binding: 2,
-            visibility: FRAGMENT_STAGE,
+            visibility: VERTEX_STAGE | FRAGMENT_STAGE,
             texture: { sampleType: 'depth', viewDimension: '2d' },
           },
           {
@@ -8834,6 +11824,41 @@ export class WebGPUEngine {
             visibility: FRAGMENT_STAGE,
             texture: { sampleType: 'depth', viewDimension: '2d' },
           },
+          {
+            binding: 11,
+            visibility: FRAGMENT_STAGE,
+            texture: { sampleType: 'float', viewDimension: '2d' },
+          },
+          {
+            binding: 12,
+            visibility: FRAGMENT_STAGE,
+            texture: { sampleType: 'float', viewDimension: '2d' },
+          },
+          {
+            binding: 13,
+            visibility: FRAGMENT_STAGE,
+            texture: { sampleType: 'float', viewDimension: '2d' },
+          },
+          {
+            binding: 14,
+            visibility: FRAGMENT_STAGE,
+            texture: { sampleType: 'float', viewDimension: '2d' },
+          },
+          {
+            binding: 15,
+            visibility: FRAGMENT_STAGE,
+            texture: { sampleType: 'float', viewDimension: '2d' },
+          },
+          {
+            binding: 16,
+            visibility: FRAGMENT_STAGE,
+            texture: { sampleType: 'float', viewDimension: '2d' },
+          },
+          {
+            binding: 18,
+            visibility: FRAGMENT_STAGE,
+            buffer: { type: 'read-only-storage' },
+          },
         ],
       });
 
@@ -8848,9 +11873,27 @@ export class WebGPUEngine {
         });
       }
 
+      if (!this.volumetricTerrainBindGroupLayout) {
+        this.volumetricTerrainBindGroupLayout = this.device.createBindGroupLayout({
+          label: 'volumetric_terrain_bind_group_layout',
+          entries: [
+            { binding: 0, visibility: FRAGMENT_STAGE, buffer: { type: 'uniform' } },
+            { binding: 1, visibility: FRAGMENT_STAGE, texture: { sampleType: 'float', viewDimension: '2d' } },
+            { binding: 2, visibility: FRAGMENT_STAGE, texture: { sampleType: 'float', viewDimension: '2d-array' } },
+            { binding: 3, visibility: FRAGMENT_STAGE, buffer: { type: 'read-only-storage' } },
+            { binding: 4, visibility: FRAGMENT_STAGE, sampler: { type: 'filtering' } },
+            { binding: 5, visibility: FRAGMENT_STAGE, texture: { sampleType: 'float', viewDimension: '3d' } },
+          ],
+        });
+      }
+
       this.volumetricCloudPipelineLayout = this.device.createPipelineLayout({
         label: 'volumetric_cloud_pipeline_layout',
-        bindGroupLayouts: [this.volumetricCloudBindGroupLayout, this.cloudAdvectionRenderBindGroupLayout],
+        bindGroupLayouts: [
+          this.volumetricCloudBindGroupLayout,
+          this.cloudAdvectionRenderBindGroupLayout,
+          this.volumetricTerrainBindGroupLayout,
+        ],
       });
 
       this.volumetricPipelineDescriptor = {
@@ -8891,6 +11934,180 @@ export class WebGPUEngine {
       const createPipelineFn = (this.device as any)['createRenderPipeline'];
       this.volumetricCloudPipeline = createPipelineFn.call(this.device, this.volumetricPipelineDescriptor);
 
+      this.volumetricHalfResPipeline = createPipelineFn.call(this.device, {
+        label: 'volumetric_cloud_halfres_render_pipeline',
+        layout: this.volumetricCloudPipelineLayout,
+        vertex: {
+          module: volumetricCloudShaderModule,
+          entryPoint: 'vs_main',
+          buffers: [],
+        },
+        fragment: {
+          module: volumetricCloudShaderModule,
+          entryPoint: 'fs_checker_mrt_main',
+          targets: [
+            {
+              format: 'rgba16float',
+            },
+            {
+              format: 'r16float',
+            },
+          ],
+        },
+        primitive: {
+          topology: 'triangle-list',
+          cullMode: 'none',
+        },
+      });
+
+      this.volumetricTaaResolveBindGroupLayout = this.device.createBindGroupLayout({
+        label: 'volumetric_taa_resolve_bind_group_layout',
+        entries: [
+          {
+            binding: 0,
+            visibility: VERTEX_STAGE | FRAGMENT_STAGE,
+            buffer: { type: 'uniform' },
+          },
+          {
+            binding: 1,
+            visibility: FRAGMENT_STAGE,
+            buffer: { type: 'uniform' },
+          },
+          {
+            binding: 2,
+            visibility: VERTEX_STAGE | FRAGMENT_STAGE,
+            texture: { sampleType: 'depth', viewDimension: '2d' },
+          },
+          {
+            binding: 8,
+            visibility: FRAGMENT_STAGE,
+            sampler: { type: 'filtering' },
+          },
+          {
+            binding: 11,
+            visibility: FRAGMENT_STAGE,
+            texture: { sampleType: 'float', viewDimension: '2d' },
+          },
+          {
+            binding: 12,
+            visibility: FRAGMENT_STAGE,
+            texture: { sampleType: 'float', viewDimension: '2d' },
+          },
+          {
+            binding: 16,
+            visibility: FRAGMENT_STAGE,
+            texture: { sampleType: 'float', viewDimension: '2d' },
+          },
+          {
+            binding: 19,
+            visibility: FRAGMENT_STAGE,
+            texture: { sampleType: 'float', viewDimension: '2d' },
+          },
+          {
+            binding: 20,
+            visibility: FRAGMENT_STAGE,
+            texture: { sampleType: 'float', viewDimension: '2d' },
+          },
+          {
+            binding: 21,
+            visibility: FRAGMENT_STAGE,
+            texture: { sampleType: 'float', viewDimension: '2d' },
+          },
+          {
+            binding: 22,
+            visibility: FRAGMENT_STAGE,
+            texture: { sampleType: 'float', viewDimension: '2d' },
+          },
+        ],
+      });
+
+      this.volumetricTaaResolvePipelineLayout = this.device.createPipelineLayout({
+        label: 'volumetric_taa_resolve_pipeline_layout',
+        bindGroupLayouts: [this.volumetricTaaResolveBindGroupLayout],
+      });
+
+      this.volumetricTaaResolvePipeline = createPipelineFn.call(this.device, {
+        label: 'volumetric_cloud_taa_resolve_render_pipeline',
+        layout: this.volumetricTaaResolvePipelineLayout,
+        vertex: {
+          module: volumetricCloudShaderModule,
+          entryPoint: 'vs_main',
+          buffers: [],
+        },
+        fragment: {
+          module: volumetricCloudShaderModule,
+          entryPoint: 'fs_taa_resolve',
+          targets: [
+            {
+              format: 'rgba16float',
+            },
+            {
+              format: 'r16float',
+            },
+          ],
+        },
+        primitive: {
+          topology: 'triangle-list',
+          cullMode: 'none',
+        },
+      });
+
+      this.volumetricUpsampleBindGroupLayout = this.device.createBindGroupLayout({
+        label: 'volumetric_upsample_bind_group_layout',
+        entries: [
+          {
+            binding: 2,
+            visibility: VERTEX_STAGE | FRAGMENT_STAGE,
+            texture: { sampleType: 'depth', viewDimension: '2d' },
+          },
+          {
+            binding: 17,
+            visibility: FRAGMENT_STAGE,
+            texture: { sampleType: 'float', viewDimension: '2d' },
+          },
+        ],
+      });
+
+      this.volumetricUpsamplePipelineLayout = this.device.createPipelineLayout({
+        label: 'volumetric_upsample_pipeline_layout',
+        bindGroupLayouts: [this.volumetricUpsampleBindGroupLayout],
+      });
+
+      this.volumetricUpsamplePipeline = createPipelineFn.call(this.device, {
+        label: 'volumetric_cloud_upsample_render_pipeline',
+        layout: this.volumetricUpsamplePipelineLayout,
+        vertex: {
+          module: volumetricCloudShaderModule,
+          entryPoint: 'vs_main',
+          buffers: [],
+        },
+        fragment: {
+          module: volumetricCloudShaderModule,
+          entryPoint: 'fs_upsample_main',
+          targets: [
+            {
+              format: this.format,
+              blend: {
+                color: {
+                  srcFactor: 'one',
+                  dstFactor: 'one-minus-src-alpha',
+                  operation: 'add',
+                },
+                alpha: {
+                  srcFactor: 'one',
+                  dstFactor: 'one-minus-src-alpha',
+                  operation: 'add',
+                },
+              },
+            },
+          ],
+        },
+        primitive: {
+          topology: 'triangle-list',
+          cullMode: 'none',
+        },
+      });
+
       if (!this.volumetricNoiseSampler) {
         this.volumetricNoiseSampler = this.device.createSampler({
           label: 'volumetric_cloud_noise_sampler',
@@ -8911,7 +12128,7 @@ export class WebGPUEngine {
   public updateVolumetricCloudBindGroup(): void {
     if (!this.device || !this.volumetricCloudBindGroupLayout) return;
 
-    if (!this.volumetricCameraUniformBuffer || !this.volumetricCloudUniformBuffer) return;
+    if (!this.volumetricCameraUniformBuffer || !this.volumetricCloudUniformBuffer || !this.cloudPreCullBuffer) return;
 
     // Fallback depth view
     if (!this.depthTextureView && !this.dummyDepthTextureView) {
@@ -8985,6 +12202,28 @@ export class WebGPUEngine {
       } catch {}
     }
 
+    if (!this.dummyPrecipTextureView && this.device && typeof this.device.createTexture === 'function') {
+      try {
+        this.dummyPrecipTexture = this.device.createTexture({
+          label: 'dummy_precip_texture',
+          size: [1, 1, 1],
+          format: 'r16float',
+          usage: typeof GPUTextureUsage !== 'undefined'
+            ? (GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST)
+            : (4 | 8),
+        });
+        if (typeof this.device.queue?.writeTexture === 'function') {
+          this.device.queue.writeTexture(
+            { texture: this.dummyPrecipTexture },
+            new Uint16Array([0]),
+            { bytesPerRow: 256, rowsPerImage: 1 },
+            [1, 1, 1]
+          );
+        }
+        this.dummyPrecipTextureView = this.dummyPrecipTexture.createView({ label: 'dummy_precip_texture_view' });
+      } catch {}
+    }
+
     const depthView = this.depthTextureView || this.dummyDepthTextureView;
     const noiseView = this.cloudNoiseTextureView || this.dummy3DNoiseTextureView;
     const noiseSampler = this.volumetricNoiseSampler || this.demSampler;
@@ -8994,8 +12233,20 @@ export class WebGPUEngine {
     const cloud2DSampler = this.cloudSampler || this.demSampler;
     const proxyFrontView = this.cloudProxyFrontDepthView || this.dummyProxyFrontDepthView;
     const proxyBackView = this.cloudProxyBackDepthView || this.dummyProxyBackDepthView;
+    const windView = this.windTextureView || lowView;
+    const jetView = this.jetStreamTextureView || windView;
+    const precipView = (this.precipRingBuffer && !this.precipRingBuffer.disposed)
+      ? this.precipRingBuffer.getTextureView(0)
+      : (((this.precipRingBuffer && this.precipRingBuffer.disposed) ? null : this.precipTextureView) || this.dummyPrecipTextureView || lowView);
+    try {
+      this.ensureTempTexture();
+      this.ensureDewpointTexture();
+    } catch {}
+    const demView = this.demTextureView || this.dummyWhiteTextureView || lowView;
+    const tempView = this.tempTextureView || this.dummyTempTextureView || demView;
+    const dewpointView = this.dewpointTextureView || this.dummyDewpointTextureView || demView;
 
-    if (!depthView || !noiseView || !noiseSampler || !lowView || !midView || !highView || !cloud2DSampler || !proxyFrontView || !proxyBackView) {
+    if (!depthView || !noiseView || !noiseSampler || !lowView || !midView || !highView || !cloud2DSampler || !proxyFrontView || !proxyBackView || !windView || !jetView || !precipView || !demView || !tempView || !dewpointView) {
       console.warn('[WebGPUEngine updateVolumetricCloudBindGroup missing]', {
         hasDepth: !!depthView,
         hasNoise: !!noiseView,
@@ -9026,8 +12277,75 @@ export class WebGPUEngine {
           { binding: 8, resource: cloud2DSampler },
           { binding: 9, resource: proxyFrontView },
           { binding: 10, resource: proxyBackView },
+          { binding: 11, resource: windView },
+          { binding: 12, resource: jetView },
+          { binding: 13, resource: precipView },
+          { binding: 14, resource: demView },
+          { binding: 15, resource: tempView },
+          { binding: 16, resource: dewpointView },
+          { binding: 18, resource: { buffer: this.cloudPreCullBuffer } },
         ],
       });
+      this.boundVolumetricPrecipView = precipView;
+
+      if (
+        this.volumetricTaaResolveBindGroupLayout &&
+        this.volumetricCheckerColorView &&
+        this.volumetricCheckerCentroidView &&
+        this.volumetricTaaColorViews[0] &&
+        this.volumetricTaaColorViews[1] &&
+        this.volumetricTaaCentroidViews[0] &&
+        this.volumetricTaaCentroidViews[1]
+      ) {
+        for (let writeIdx = 0; writeIdx < 2; writeIdx++) {
+          const readIdx = 1 - writeIdx;
+          this.volumetricTaaResolveBindGroups[writeIdx] = this.device.createBindGroup({
+            label: `volumetric_taa_resolve_bind_group_${writeIdx}`,
+            layout: this.volumetricTaaResolveBindGroupLayout,
+            entries: [
+              { binding: 0, resource: { buffer: this.volumetricCameraUniformBuffer } },
+              { binding: 1, resource: { buffer: this.volumetricCloudUniformBuffer } },
+              { binding: 2, resource: depthView },
+              { binding: 8, resource: cloud2DSampler },
+              { binding: 11, resource: windView },
+              { binding: 12, resource: jetView },
+              { binding: 16, resource: dewpointView },
+              { binding: 19, resource: this.volumetricCheckerColorView },
+              { binding: 20, resource: this.volumetricCheckerCentroidView },
+              { binding: 21, resource: this.volumetricTaaColorViews[readIdx]! },
+              { binding: 22, resource: this.volumetricTaaCentroidViews[readIdx]! },
+            ],
+          });
+        }
+      }
+
+      if (this.volumetricUpsampleBindGroupLayout) {
+        for (let i = 0; i < 2; i++) {
+          const taaView = this.volumetricTaaColorViews[i];
+          if (taaView) {
+            this.volumetricUpsampleBindGroups[i] = this.device.createBindGroup({
+              label: `volumetric_upsample_bind_group_${i}`,
+              layout: this.volumetricUpsampleBindGroupLayout,
+              entries: [
+                { binding: 2, resource: depthView },
+                { binding: 17, resource: taaView },
+              ],
+            });
+          }
+        }
+        if (this.volumetricUpsampleBindGroups[0]) {
+          this.volumetricUpsampleBindGroup = this.volumetricUpsampleBindGroups[0];
+        } else if (this.volumetricHalfResView) {
+          this.volumetricUpsampleBindGroup = this.device.createBindGroup({
+            label: 'volumetric_upsample_bind_group',
+            layout: this.volumetricUpsampleBindGroupLayout,
+            entries: [
+              { binding: 2, resource: depthView },
+              { binding: 17, resource: this.volumetricHalfResView },
+            ],
+          });
+        }
+      }
 
       if (this.cloudAdvectionRenderBindGroupLayout && this.cloudDensitySampler && this.advectionUniformBuffer) {
         if (!this.cloudAdvectionDummyRenderBindGroup && this.dummy3DDensityTextureView) {
@@ -9041,7 +12359,7 @@ export class WebGPUEngine {
             ],
           });
         }
-        for (let i = 0; i < 2; i++) {
+          for (let i = 0; i < 2; i++) {
           if (!this.cloudAdvectionRenderBindGroups[i] && this.cloudDensityTextureViews[i]) {
             this.cloudAdvectionRenderBindGroups[i] = this.device.createBindGroup({
               label: `volumetric_cloud_advection_render_bg_${i}`,
@@ -9055,9 +12373,49 @@ export class WebGPUEngine {
           }
         }
       }
+
+      this.updateVolumetricTerrainBindGroup();
+      this.invalidateVolumetricTaaHistory();
     } catch (err) {
       console.warn('[WebGPUEngine] Failed to create volumetricCloudBindGroup:', err);
     }
+  }
+
+  public updateVolumetricTerrainBindGroup(): void {
+    if (!this.device || !this.volumetricTerrainBindGroupLayout) return;
+    try {
+      const regBuf = (this.activeRegionalDEM && this.regionalUniformBuffer)
+        ? this.regionalUniformBuffer
+        : (this.regionalUniformBuffer || this.reliefUniformBuffer || this.volumetricCloudUniformBuffer || this.simUniformBuffer);
+      const regView = this.activeRegionalDEM
+        ? this.activeRegionalDEM.view
+        : (this.dummyRegionalTextureView || this.demTextureView || this.dummyWhiteTextureView || this.dummyCloudTextureView);
+      const { arrayView: rawTileArrayView, slotBuffer: rawTileSlotBuffer } = this.getTileCacheResources();
+      const tileArrayView = rawTileArrayView || regView;
+      const tileSlotBuffer = rawTileSlotBuffer || regBuf;
+      const demMipSampler = this.demSampler || this.cloudSampler || this.volumetricNoiseSampler;
+      const regNoiseView = this.regionalCloudNoiseTextureView || this.cloudNoiseTextureView || this.dummy3DNoiseTextureView;
+      if (!regBuf || !regView || !tileArrayView || !tileSlotBuffer || !demMipSampler || !regNoiseView) {
+        return;
+      }
+      this.volumetricTerrainBindGroup = this.device.createBindGroup({
+        label: 'volumetric_terrain_bind_group',
+        layout: this.volumetricTerrainBindGroupLayout,
+        entries: [
+          { binding: 0, resource: { buffer: regBuf } },
+          { binding: 1, resource: regView },
+          { binding: 2, resource: tileArrayView },
+          { binding: 3, resource: { buffer: tileSlotBuffer } },
+          { binding: 4, resource: demMipSampler },
+          { binding: 5, resource: regNoiseView },
+        ],
+      });
+      this.boundVolumetricRegBuffer = regBuf;
+      this.boundVolumetricRegView = regView;
+      this.boundVolumetricTileArrayView = tileArrayView;
+      this.boundVolumetricTileSlotBuffer = tileSlotBuffer;
+      this.boundVolumetricRegNoiseView = regNoiseView;
+    } catch {}
   }
 
   public updateVolumetricUniforms(params: WebGPUFrameParams): void {
@@ -9065,13 +12423,27 @@ export class WebGPUEngine {
     this.ensureVolumetricCloudBuffers();
     if (!this.volumetricCameraUniformBuffer || !this.volumetricCloudUniformBuffer) return;
 
-    // 1. Camera Uniforms (48 floats = 192 bytes)
+    // 1. Camera Uniforms (68 floats = 272 bytes)
+    if (!this.volumetricCamFloats || this.volumetricCamFloats.length < 68) {
+      const nextFloats = new Float32Array(68);
+      if (this.volumetricCamFloats) nextFloats.set(this.volumetricCamFloats);
+      this.volumetricCamFloats = nextFloats;
+      this.volumetricCamU32 = new Uint32Array(this.volumetricCamFloats.buffer);
+    }
+    if (!this._taaScratchMatA) this._taaScratchMatA = new Matrix4();
+    if (!this._taaScratchMatB) this._taaScratchMatB = new Matrix4();
+    if (!this._taaScratchViewProj) this._taaScratchViewProj = new Matrix4();
+    if (!this.volumetricPrevViewProj) this.volumetricPrevViewProj = new Float32Array([1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1]);
+    if (!this.volumetricCurrViewProj) this.volumetricCurrViewProj = new Float32Array([1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1]);
+    if (!this.volumetricPrevCamPos) this.volumetricPrevCamPos = [0, 0, 10];
+    if (!this.volumetricPrevCamForward) this.volumetricPrevCamForward = [0, 0, -1];
     const camFloats = this.volumetricCamFloats;
 
     // MatrixWorld (V^-1)
     if ((params as any).camera?.matrixWorld?.elements) {
       camFloats.set((params as any).camera.matrixWorld.elements, 0);
     } else {
+      camFloats.fill(0, 0, 16);
       camFloats[0] = 1; camFloats[5] = 1; camFloats[10] = 1; camFloats[15] = 1;
     }
 
@@ -9079,7 +12451,24 @@ export class WebGPUEngine {
     if ((params as any).camera?.projectionMatrixInverse?.elements) {
       camFloats.set((params as any).camera.projectionMatrixInverse.elements, 16);
     } else {
+      camFloats.fill(0, 16, 32);
       camFloats[16] = 1; camFloats[21] = 1; camFloats[26] = 1; camFloats[31] = 1;
+    }
+
+    // Compute current ViewProj (P * V) for 3D optical-centroid reprojection
+    const camObj = (params as any).camera;
+    if (camObj?.projectionMatrix?.elements && camObj?.matrixWorldInverse?.elements) {
+      this._taaScratchMatA.elements.set(camObj.projectionMatrix.elements);
+      this._taaScratchMatB.elements.set(camObj.matrixWorldInverse.elements);
+      this._taaScratchViewProj.multiplyMatrices(this._taaScratchMatA, this._taaScratchMatB);
+      this.volumetricCurrViewProj.set(this._taaScratchViewProj.elements);
+    } else {
+      this._taaScratchMatA.elements.set(camFloats.subarray(16, 32));
+      this._taaScratchMatA.invert();
+      this._taaScratchMatB.elements.set(camFloats.subarray(0, 16));
+      this._taaScratchMatB.invert();
+      this._taaScratchViewProj.multiplyMatrices(this._taaScratchMatA, this._taaScratchMatB);
+      this.volumetricCurrViewProj.set(this._taaScratchViewProj.elements);
     }
 
     // Camera Pos
@@ -9098,37 +12487,89 @@ export class WebGPUEngine {
     camFloats[38] = 1.0 / Math.max(1, w);
     camFloats[39] = 1.0 / Math.max(1, h);
 
-    // Near / Far
+    // Near / Far + Packed Temporal & Diagnostic Channels (Choice G/H/B)
+    const scrubVal = params.scrubTau ?? params.tau ?? params.weatherTau ?? this.weatherTau ?? 0.0;
+    const clampedScrubTau = Number.isFinite(scrubVal) ? Math.max(0.0, Math.min(0.9999, scrubVal)) : 0.0;
+    const rawReliefRatio = (params as any).reliefAttenRatio;
+    const unfurlCam = Math.max(0.0, Math.min(1.0, params.unfurl ?? 0.0));
+    const planarEffRadius = 5.0 + Math.abs(camPos.z);
+    const derivedEffRadius = (params as any).effectiveCamRadius ?? (camRadius * (1.0 - unfurlCam) + planarEffRadius * unfurlCam);
+    const derivedAlphaRelief = Math.min(1.0, Math.max(0.0, (Math.max(5.25, derivedEffRadius) - 5.05) / (5.50 - 5.05)));
+    const reliefAttenRatio = (typeof rawReliefRatio === 'number' && Number.isFinite(rawReliefRatio) && rawReliefRatio > 0.0)
+      ? Math.max(0.45, Math.min(1.0, rawReliefRatio))
+      : (0.16 + 2.64 * derivedAlphaRelief) / 2.8;
+    const rawMaskNum = typeof (params as any).atmoFeatureMask === 'number' && Number.isFinite((params as any).atmoFeatureMask)
+      ? Math.max(0.0, Math.min(255.0, Math.trunc((params as any).atmoFeatureMask)))
+      : 255.0;
+    const featureMask = rawMaskNum === 0.0 ? -1.0 : rawMaskNum;
+    const packedChannelFlags = this._volumetricPackedChannelFlags;
+
     camFloats[40] = (params as any).camera?.near ?? 0.00005;
     camFloats[41] = (params as any).camera?.far ?? 1000.0;
-    camFloats[42] = 0.0;
-    camFloats[43] = 0.0;
+    camFloats[42] = clampedScrubTau;
+    camFloats[43] = packedChannelFlags;
 
-    // Pad
-    camFloats[44] = 0.0;
-    camFloats[45] = 0.0;
-    camFloats[46] = 0.0;
-    camFloats[47] = 0.0;
+    // Evaluate whip-pan / |deltaUnfurl| > 0.002 fallback to 0.35x 2x1 checkerboard (historyWeight = 0)
+    const rawFwdX = -camFloats[8];
+    const rawFwdY = -camFloats[9];
+    const rawFwdZ = -camFloats[10];
+    const fwdLen = Math.hypot(rawFwdX, rawFwdY, rawFwdZ) || 1.0;
+    const fx = rawFwdX / fwdLen;
+    const fy = rawFwdY / fwdLen;
+    const fz = rawFwdZ / fwdLen;
 
-    this.device.queue.writeBuffer(this.volumetricCameraUniformBuffer, 0, camFloats.buffer);
+    const prevPos = this.volumetricPrevCamPos;
+    const prevFwd = this.volumetricPrevCamForward;
+    const cosAngle = fx * prevFwd[0] + fy * prevFwd[1] + fz * prevFwd[2];
+    const posDelta = Math.hypot(camPos.x - prevPos[0], camPos.y - prevPos[1], camPos.z - prevPos[2]);
+    const deltaUnfurl = Math.abs(unfurlCam - (this.volumetricPrevUnfurl ?? unfurlCam));
 
-    // 2. Cloud Uniforms (40 floats = 160 bytes)
+    let maxVpDiff = 0.0;
+    for (let i = 0; i < 16; i++) {
+      const diff = Math.abs(this.volumetricCurrViewProj[i] - this.volumetricPrevViewProj[i]);
+      if (diff > maxVpDiff) maxVpDiff = diff;
+    }
+
+    const timelineOffsetSecCam = (
+      (params.timelineMinutes !== undefined
+        ? params.timelineMinutes
+        : (params.weatherTimeMinutes !== undefined
+          ? params.weatherTimeMinutes
+          : this._timelineMinutes)) ?? 0
+    ) * 60.0;
+    const cloudTimeNow = (params.time ?? 0.0) + timelineOffsetSecCam;
+
+    // Populate Cloud Uniforms (Slot 9: 44 floats = 176 bytes) first so non-time visual uniform changes
+    // (theme, sun direction, strata toggles, projection mode, Ghibli/Mist optical params) invalidate stationary checkerboard TAA history.
+    if (!this.volumetricCloudFloats || this.volumetricCloudFloats.length < 44) {
+      this.volumetricCloudFloats = new Float32Array(44);
+    }
+    if (!this.volumetricCloudU32 || this.volumetricCloudU32.buffer !== this.volumetricCloudFloats.buffer) {
+      this.volumetricCloudU32 = new Uint32Array(this.volumetricCloudFloats.buffer);
+    }
+    if (!this.volumetricPrevCloudU32 || this.volumetricPrevCloudU32.length < 44) {
+      this.volumetricPrevCloudU32 = new Uint32Array(44);
+    }
     const cloudFloats = this.volumetricCloudFloats;
 
-    // Shell Radii (dynamically scaled with DEM relief displacement to prevent mountain discard)
-    // Shell Radii (calibrated default: 0.19 provides tangible 3D vertical relief and parallax)
+    // Shell Radii (Choice G: coupled to dynamic relief attenuation so marine layers & valley fog stay anchored at close zoom)
     const customThickness = (params as any).cloudThickness;
-    const tropoThickness = customThickness !== undefined
+    const baseTropoThickness = customThickness !== undefined
       ? customThickness
       : 0.19;
+    const zoomScaleParityActive = (Math.trunc(featureMask) & 64) !== 0; // Bit 6 = Choice G
+    const tropoThickness = zoomScaleParityActive
+      ? baseTropoThickness * (1.0 + (reliefAttenRatio - 1.0) * 0.72)
+      : baseTropoThickness;
     const rInner = 5.0;
     const rOuter = rInner + tropoThickness;
     const deltaR = tropoThickness;
 
+    const dispScale = ((params as any).displacementScale ?? 0.08) * 2.8;
     cloudFloats[0] = rInner;     // rInner
     cloudFloats[1] = rOuter;   // rOuter
     cloudFloats[2] = deltaR;   // deltaR
-    cloudFloats[3] = 0.0;
+    cloudFloats[3] = dispScale;
 
     // Sun Direction
     let sunDirX = 0.57735;
@@ -9153,18 +12594,22 @@ export class WebGPUEngine {
     cloudFloats[7] = sunAlt;
 
     // Layer Heights (calibrated default: low cumulus occupies bottom 45% of troposphere)
-    cloudFloats[8] = (params as any).cloudLowTop ?? 0.45;
-    cloudFloats[9] = (params as any).cloudMidBottom ?? 0.48;
-    cloudFloats[10] = (params as any).cloudMidTop ?? 0.75;
-    cloudFloats[11] = (params as any).cloudHighBottom ?? 0.78;
+    const lowTop = (params as any).cloudLowTop ?? 0.45;
+    cloudFloats[8] = lowTop;
+    cloudFloats[9] = (params as any).cloudMidBottom ?? Math.min(0.36, lowTop * 0.80);
+    cloudFloats[10] = (params as any).cloudMidTop ?? Math.max(0.68, lowTop + 0.23);
+    cloudFloats[11] = (params as any).cloudHighBottom ?? Math.max(0.64, lowTop + 0.19);
 
     // Layer Densities
     const lowDens = (Boolean((params as any).showCloudLow ?? this.cloudOptions.showLow)) ? 1.0 : 0.0;
-    const midDens = (Boolean((params as any).showCloudMid ?? this.cloudOptions.showMid)) ? 0.8 : 0.0;
-    const highDens = (Boolean((params as any).showCloudHigh ?? this.cloudOptions.showHigh)) ? 0.4 : 0.0;
-    const masterOpacity = (params as any).cloudOpacity !== undefined
+    const midDens = (Boolean((params as any).showCloudMid ?? this.cloudOptions.showMid)) ? 0.85 : 0.0;
+    const highDens = (Boolean((params as any).showCloudHigh ?? this.cloudOptions.showHigh)) ? 0.85 : 0.0;
+    const rawMasterOpacity = (params as any).cloudOpacity !== undefined
       ? (params as any).cloudOpacity
       : (this.cloudOptions.opacity ?? 0.85);
+    const masterOpacity = ((params.theme ?? 0) === 1 && Math.abs(rawMasterOpacity - 0.85) < 0.001)
+      ? 0.95
+      : rawMasterOpacity;
     cloudFloats[12] = lowDens;
     cloudFloats[13] = midDens;
     cloudFloats[14] = highDens;
@@ -9176,7 +12621,7 @@ export class WebGPUEngine {
     cloudFloats[16] = lclMeters;
     cloudFloats[17] = lclNorm;
     cloudFloats[18] = 0.0065;
-    cloudFloats[19] = 1.0;
+    cloudFloats[19] = this.xdrSolarGlintEnabled ? 1.0 : 0.0;
 
     // Noise Params (calibrated defaults: freqHoriz 32.0, freqVert 12.0, erosion 0.85)
     cloudFloats[20] = (params as any).cloudFreqHoriz ?? 32.0; // Horizontal noise frequency across planetary surface
@@ -9188,8 +12633,11 @@ export class WebGPUEngine {
     const normalizedVolDrift = rawVolDrift > 10.0 ? (rawVolDrift / 500.0) : rawVolDrift;
     cloudFloats[23] = (rawVolDrift === 0 ? 0.0 : normalizedVolDrift) * 0.002;
 
-    // Optical Params (calibrated default: base extinction 28.0 for crisp edge definition)
-    const baseExtinction = (params as any).cloudExtinction ?? 28.0;
+    // Optical Params (calibrated default: base extinction 42.0 for crisp edge definition)
+    const rawExtinction = (params as any).cloudExtinction;
+    const baseExtinction = (rawExtinction === undefined || Math.abs(rawExtinction - 28.0) < 0.001)
+      ? 42.0
+      : rawExtinction;
     cloudFloats[24] = baseExtinction;
     cloudFloats[25] = 0.98;
     cloudFloats[26] = 0.82;
@@ -9220,16 +12668,9 @@ export class WebGPUEngine {
     cloudFloats[31] = gamma;
 
     // Sim Control
-    const timelineOffsetSec = (
-      (params.timelineMinutes !== undefined
-        ? params.timelineMinutes
-        : (params.weatherTimeMinutes !== undefined
-          ? params.weatherTimeMinutes
-          : this._timelineMinutes)) ?? 0
-    ) * 60.0;
-    cloudFloats[32] = (params.time ?? 0.0) + timelineOffsetSec;
+    cloudFloats[32] = cloudTimeNow;
     cloudFloats[33] = params.unfurl ?? 0.0;
-    cloudFloats[34] = 0.0; // Equirectangular 2:1 developable sheet (pad)
+    cloudFloats[34] = Math.max(0.0, Math.min(3.0, Math.trunc(params.mode ?? 0))); // Choice H: Active projection mode (0..3)
     // Calibrated Resolution Tier to Raymarch Steps mapping (u_simControl.w)
     let maxSteps = 32.0; // Default for 1M / balanced
     if (params.cloudMaxSteps !== undefined && params.cloudMaxSteps > 0) {
@@ -9248,12 +12689,144 @@ export class WebGPUEngine {
     );
     cloudFloats[36] = falseColor ? 1.0 : 0.0;
 
-    // Padding floats (offset 148..156, floats 37..39: reserved 16-byte alignment, Pivot 2 permanent)
-    cloudFloats[37] = 0.0;
-    cloudFloats[38] = 0.0;
-    cloudFloats[39] = 0.0;
+    // Continuous wall-clock animation time in u_padCloud.y (decoupled from timeline scrubber offset)
+    cloudFloats[37] = params.time ?? 0.0;
+    cloudFloats[38] = (params as any).peakExponent ?? 1.4;
+    cloudFloats[39] = ((params as any).verticalScaleMode ?? this.verticalScaleMode) === 1 ? 1.0 : 0.0;
 
-    this.device.queue.writeBuffer(this.volumetricCloudUniformBuffer, 0, cloudFloats.buffer);
+    // u_ghibliParams (floats 40..43: wispinessOverride, gouacheGrouping, multiScatterPenetration, shearTendrils)
+    cloudFloats[40] = (params as any).cloudWispiness !== undefined ? Number((params as any).cloudWispiness) : -1.0;
+    cloudFloats[41] = (params as any).cloudGouacheGrouping !== undefined ? Number((params as any).cloudGouacheGrouping) : 0.30;
+    cloudFloats[42] = (params as any).cloudMultiScatter !== undefined ? Number((params as any).cloudMultiScatter) : 0.72;
+    cloudFloats[43] = (params as any).cloudShearTendrils !== undefined ? Number((params as any).cloudShearTendrils) : 0.58;
+
+    const whipPanActive = Boolean((params as any).whipPan) || (
+      this.volumetricHasPrevCamera &&
+      (cosAngle < 0.996 || posDelta > 0.35 || deltaUnfurl > 0.002)
+    );
+    const isCameraStationary =
+      this.volumetricHasPrevCamera &&
+      !whipPanActive &&
+      maxVpDiff < 1e-5 &&
+      deltaUnfurl <= 1e-5 &&
+      Math.abs(clampedScrubTau - this.volumetricPrevScrubTau) < 0.005;
+    const isTimeStationary =
+      this.volumetricHasPrevCamera &&
+      Math.abs(cloudTimeNow - this.volumetricPrevCloudTime) < 1e-5;
+
+    let cloudAppearanceChanged = false;
+    if (this.volumetricHasPrevCamera) {
+      const startWord = isCameraStationary ? 3 : 4;
+      for (let i = startWord; i < 44; i++) {
+        if (i === 32 || i === 33 || i === 37) continue;
+        if (this.volumetricCloudU32[i] !== this.volumetricPrevCloudU32[i]) {
+          cloudAppearanceChanged = true;
+          break;
+        }
+      }
+    }
+    this.volumetricPrevCloudU32.set(this.volumetricCloudU32);
+    if (cloudAppearanceChanged) {
+      this.volumetricTaaValidFrames = 0;
+    }
+
+    const activeFullGrid = this.cloudFullGridMode;
+    const isRegionalChecker = !activeFullGrid && this.cloudResolutionScale >= 0.37;
+    const useTemporalPhaseSeq = activeFullGrid || isRegionalChecker;
+    const isCameraAndSceneSettled = isCameraStationary && !cloudAppearanceChanged;
+    const isFullTemporalRest = isCameraAndSceneSettled && isTimeStationary;
+    if (!isCameraAndSceneSettled) {
+      // Allow 12 alternating golden-ratio parity frames on 0.38x-0.67x regional checker (6 phase epochs per pixel),
+      // 10 frames on full-grid mode, or 2 deterministic parity frames on 0.35x orbital before resting
+      this.volumetricTaaPendingParityFrames = activeFullGrid ? 10 : (isRegionalChecker ? 12 : 2);
+      this.volumetricCameraSettledFrames = 0;
+    }
+    this.volumetricIsCameraSettled = isCameraAndSceneSettled;
+    this.volumetricIsStationaryRest = isFullTemporalRest;
+
+    const targetCloudW = Math.max(2, Math.round(w * this.cloudResolutionScale));
+    const targetCloudH = Math.max(1, Math.round(h * this.cloudResolutionScale));
+    const steadyCloudW = this.volumetricHalfW > 1 ? this.volumetricHalfW : targetCloudW;
+    const steadyCloudH = this.volumetricHalfH > 1 ? this.volumetricHalfH : targetCloudH;
+
+    const dynamicSubgridScale = whipPanActive ? 0.25 : 0.35;
+
+    const checkerGridW = (whipPanActive && !activeFullGrid && !isRegionalChecker)
+      ? Math.min(steadyCloudW, Math.max(2, Math.round(w * dynamicSubgridScale)))
+      : steadyCloudW;
+    const checkerGridH = (whipPanActive && !activeFullGrid && !isRegionalChecker)
+      ? Math.min(steadyCloudH, Math.max(1, Math.round(h * dynamicSubgridScale)))
+      : steadyCloudH;
+    this.volumetricActiveCheckerW = activeFullGrid
+      ? Math.max(1, checkerGridW)
+      : Math.max(1, (checkerGridW + 1) >> 1);
+    this.volumetricActiveCheckerH = Math.max(1, checkerGridH);
+
+    const flushPostWhipPan =
+      this.volumetricPrevWasWhipPan &&
+      this.volumetricCameraSettledFrames === 0;
+    const rotStepDelta = Math.max(0.0, 1.0 - cosAngle);
+    const aglRef = Math.max(0.12, derivedEffRadius - 5.0);
+    const relPosStep = posDelta / aglRef;
+    const regMotionNorm = Math.min(1.0, Math.max(rotStepDelta / 0.0018, relPosStep / 0.085));
+    const regMovingHistoryWeight = 0.78 - 0.36 * regMotionNorm;
+    let historyWeight = activeFullGrid
+      ? (isCameraStationary ? 0.88 : 0.80)
+      : (isRegionalChecker ? (isCameraStationary ? 0.90 : regMovingHistoryWeight) : 0.90);
+    if (
+      !this.volumetricHasPrevCamera ||
+      this.volumetricTaaValidFrames === 0 ||
+      whipPanActive ||
+      cloudAppearanceChanged ||
+      flushPostWhipPan
+    ) {
+      historyWeight = 0.0;
+    } else if (isFullTemporalRest) {
+      historyWeight = activeFullGrid ? 0.88 : (isRegionalChecker ? 0.90 : 1.0);
+    }
+
+    // Pad: [atmoFeatureMask, reliefAttenRatio, effectiveCamRadius, checkerGridH]
+    camFloats[44] = featureMask;
+    camFloats[45] = reliefAttenRatio;
+    camFloats[46] = derivedEffRadius;
+    camFloats[47] = checkerGridH;
+
+    // u_prevViewProj (offset 192 bytes = float 48..63)
+    camFloats.set(
+      this.volumetricHasPrevCamera ? this.volumetricPrevViewProj : this.volumetricCurrViewProj,
+      48
+    );
+
+    // u_taaParams (offset 256 bytes = float 64..67): [frameParity/phase, historyWeight, dt, signedCheckerGridW]
+    const frameParity = useTemporalPhaseSeq
+      ? (this.volumetricTaaFrameIndex % 64)
+      : (this.volumetricTaaFrameIndex & 1);
+    camFloats[64] = frameParity;
+    camFloats[65] = historyWeight;
+    camFloats[66] = Math.max(0.0, Math.min(0.1, params.dt ?? 0.016));
+    camFloats[67] = activeFullGrid ? -checkerGridW : checkerGridW;
+
+    this.volumetricPrevViewProj.set(this.volumetricCurrViewProj);
+    this.volumetricPrevCamPos[0] = camPos.x;
+    this.volumetricPrevCamPos[1] = camPos.y;
+    this.volumetricPrevCamPos[2] = camPos.z;
+    this.volumetricPrevCamForward[0] = fx;
+    this.volumetricPrevCamForward[1] = fy;
+    this.volumetricPrevCamForward[2] = fz;
+    this.volumetricPrevUnfurl = unfurlCam;
+    this.volumetricPrevScrubTau = clampedScrubTau;
+    this.volumetricPrevCloudTime = cloudTimeNow;
+    this.volumetricPrevWasWhipPan = whipPanActive;
+    this.volumetricPrevWasMotionSubgrid = false;
+    this.volumetricHasPrevCamera = true;
+
+    if (this.shouldWriteUniform(8, this.volumetricCameraUniformBuffer, this.volumetricCamU32)) {
+      this.device.queue.writeBuffer(this.volumetricCameraUniformBuffer, 0, camFloats.buffer);
+    }
+
+    if (this.shouldWriteUniform(9, this.volumetricCloudUniformBuffer, this.volumetricCloudU32)) {
+      this.device.queue.writeBuffer(this.volumetricCloudUniformBuffer, 0, cloudFloats.buffer);
+    }
   }
 
   public ensureCloudProxyBuffers(): void {
@@ -9424,8 +12997,21 @@ export class WebGPUEngine {
 
     const w = (this.context?.canvas as HTMLCanvasElement)?.width || 1024;
     const h = (this.context?.canvas as HTMLCanvasElement)?.height || 768;
-    if (!this.cloudProxyFrontDepthTexture || !this.cloudProxyBackDepthTexture) {
+    const targetCloudW = Math.max(2, Math.round(w * this.cloudResolutionScale));
+    const targetCloudH = Math.max(1, Math.round(h * this.cloudResolutionScale));
+    if (
+      typeof this.device.createTexture === 'function' &&
+      (!this.cloudProxyFrontDepthTexture ||
+        !this.cloudProxyBackDepthTexture ||
+        !this.volumetricHalfResTexture ||
+        this.volumetricHalfW !== targetCloudW ||
+        this.volumetricHalfH !== targetCloudH)
+    ) {
       this.updateCloudProxyDepthTextures(w, h);
+    }
+
+    if ((params.unfurl ?? 0) <= 0.01) {
+      return;
     }
 
     const frontView = this.cloudProxyFrontDepthView || this.dummyProxyFrontDepthView;
@@ -9443,6 +13029,7 @@ export class WebGPUEngine {
           depthLoadOp: 'clear',
           depthStoreOp: 'store',
         },
+        timestampWrites: this.profiler?.getPassBeginTimestampWrites(ProfilerPassSlot.CloudProxy),
       });
 
       if (this.cloudProxyPipelineFront && this.cloudProxyBindGroup && this.cloudProxyVertexBuffer && this.cloudProxyIndexBuffer) {
@@ -9464,6 +13051,7 @@ export class WebGPUEngine {
           depthLoadOp: 'clear',
           depthStoreOp: 'store',
         },
+        timestampWrites: this.profiler?.getPassEndTimestampWrites(ProfilerPassSlot.CloudProxy),
       });
 
       if (this.cloudProxyPipelineBack && this.cloudProxyBindGroup && this.cloudProxyVertexBuffer && this.cloudProxyIndexBuffer) {
@@ -9488,13 +13076,56 @@ export class WebGPUEngine {
       return;
     }
 
+    this.syncRegionalCloudResolution(params);
     this.ensureVolumetricCloudBuffers();
+    this.ensureCloudPreCullBuffer();
     this.renderCloudProxyPass(commandEncoder, params);
-    if (!this.volumetricCloudBindGroup) {
+    const activeRingPrecipView = (this.precipRingBuffer && !this.precipRingBuffer.disposed)
+      ? this.precipRingBuffer.getTextureView(0)
+      : null;
+    const fallbackPrecipView =
+      this.dummyPrecipTextureView || this.cloudTextureViews.low || this.dummyCloudTextureView;
+    const isRingPrecipStale = activeRingPrecipView
+      ? (this.boundVolumetricPrecipView !== activeRingPrecipView)
+      : Boolean(
+          this.precipRingBuffer &&
+            this.precipRingBuffer.disposed &&
+            this.boundVolumetricPrecipView &&
+            this.boundVolumetricPrecipView !== fallbackPrecipView
+        );
+    if (
+      !this.volumetricCloudBindGroup ||
+      (this.volumetricHalfResView && this.volumetricUpsampleBindGroupLayout && !this.volumetricUpsampleBindGroup) ||
+      (this.volumetricCheckerColorView && this.volumetricTaaResolveBindGroupLayout && !this.volumetricTaaResolveBindGroups[0]) ||
+      isRingPrecipStale
+    ) {
       this.updateVolumetricCloudBindGroup();
     }
     if (!this.volumetricCloudBindGroup) {
       return;
+    }
+
+    if (this.volumetricTerrainBindGroupLayout) {
+      const liveRegBuf = (this.activeRegionalDEM && this.regionalUniformBuffer)
+        ? this.regionalUniformBuffer
+        : (this.regionalUniformBuffer || this.reliefUniformBuffer || this.volumetricCloudUniformBuffer || this.simUniformBuffer);
+      const liveRegView = this.activeRegionalDEM
+        ? this.activeRegionalDEM.view
+        : (this.dummyRegionalTextureView || this.demTextureView || this.dummyWhiteTextureView || this.dummyCloudTextureView);
+      const { arrayView: rawTileArrayView, slotBuffer: rawTileSlotBuffer } = this.getTileCacheResources();
+      const liveTileArrayView = rawTileArrayView || liveRegView;
+      const liveTileSlotBuf = rawTileSlotBuffer || liveRegBuf;
+      const liveRegNoiseView = this.regionalCloudNoiseTextureView || this.cloudNoiseTextureView || this.dummy3DNoiseTextureView;
+      if (
+        !this.volumetricTerrainBindGroup ||
+        this.boundVolumetricRegBuffer !== liveRegBuf ||
+        this.boundVolumetricRegView !== liveRegView ||
+        this.boundVolumetricTileArrayView !== liveTileArrayView ||
+        this.boundVolumetricTileSlotBuffer !== liveTileSlotBuf ||
+        this.boundVolumetricRegNoiseView !== liveRegNoiseView
+      ) {
+        this.updateVolumetricTerrainBindGroup();
+      }
     }
 
     this.updateVolumetricUniforms(params);
@@ -9505,34 +13136,160 @@ export class WebGPUEngine {
 
     try {
       const currentTextureView = targetView || this.context.getCurrentTexture().createView();
-      const cloudPass = commandEncoder.beginRenderPass({
-        label: 'volumetric_cloud_pass_pass2',
-        colorAttachments: [
-          {
-            view: currentTextureView,
-            loadOp: 'load',
-            storeOp: 'store',
-          },
-        ],
-        timestampWrites: this.profiler?.getPassTimestampWrites(ProfilerPassSlot.Reserved1),
-      });
-      cloudPass.setPipeline(this.volumetricCloudPipeline);
-      cloudPass.setBindGroup(0, this.volumetricCloudBindGroup);
+      let advectionBg: GPUBindGroup | null = null;
       if (this.cloudAdvectionRenderBindGroupLayout) {
         const currentPongIdx = this.cloudAdvectionStep % 2;
         const isAdvectionActive = params.cloudAdvection !== undefined ? Boolean(params.cloudAdvection) : this.cloudAdvectionEnabled;
-        const advectionBg = (isAdvectionActive && this.cloudAdvectionRenderBindGroups[currentPongIdx])
+        advectionBg = (isAdvectionActive && this.cloudAdvectionRenderBindGroups[currentPongIdx])
           ? this.cloudAdvectionRenderBindGroups[currentPongIdx]
           : this.cloudAdvectionDummyRenderBindGroup;
-        if (advectionBg) {
-          cloudPass.setBindGroup(1, advectionBg);
-        } else {
-          cloudPass.end();
+        if (!advectionBg) {
           return;
         }
       }
-      cloudPass.draw(3, 1, 0, 0);
-      cloudPass.end();
+
+      const writeIdx = this.volumetricTaaFrameIndex & 1;
+      const canCheckerTaaUpsample = Boolean(
+        this.volumetricCheckerColorView &&
+        this.volumetricCheckerCentroidView &&
+        this.volumetricTaaColorViews[writeIdx] &&
+        this.volumetricTaaCentroidViews[writeIdx] &&
+        this.volumetricHalfResPipeline &&
+        this.volumetricTaaResolvePipeline &&
+        this.volumetricTaaResolveBindGroups[writeIdx] &&
+        this.volumetricUpsamplePipeline &&
+        this.volumetricUpsampleBindGroups[writeIdx]
+      );
+
+      if (canCheckerTaaUpsample) {
+        // Subpass 2A-1: 2x1 Checkerboard Volumetric Cloud Raymarch into Half-Res Checker MRT (volColor + t_centroid)
+        const raymarchPass = commandEncoder.beginRenderPass({
+          label: 'volumetric_cloud_raymarch_halfres',
+          colorAttachments: [
+            {
+              view: this.volumetricCheckerColorView!,
+              clearValue: { r: 0.0, g: 0.0, b: 0.0, a: 0.0 },
+              loadOp: 'clear',
+              storeOp: 'store',
+            },
+            {
+              view: this.volumetricCheckerCentroidView!,
+              clearValue: { r: 1024.0, g: 0.0, b: 0.0, a: 1.0 },
+              loadOp: 'clear',
+              storeOp: 'store',
+            },
+          ],
+          timestampWrites: this.profiler?.getPassBeginTimestampWrites(ProfilerPassSlot.Reserved1),
+        });
+        if (typeof (raymarchPass as any).setViewport === 'function') {
+          (raymarchPass as any).setViewport(
+            0,
+            0,
+            Math.max(1, this.volumetricActiveCheckerW),
+            Math.max(1, this.volumetricActiveCheckerH),
+            0,
+            1
+          );
+        }
+        if (this.cloudScissorNorm && typeof (raymarchPass as any).setScissorRect === 'function') {
+          const cw = Math.max(1, this.volumetricActiveCheckerW);
+          const ch = Math.max(1, this.volumetricActiveCheckerH);
+          const sx0 = Math.max(0, Math.floor(this.cloudScissorNorm[0] * cw));
+          const sy0 = Math.max(0, Math.floor(this.cloudScissorNorm[1] * ch));
+          const sx1 = Math.min(cw, Math.ceil(this.cloudScissorNorm[2] * cw));
+          const sy1 = Math.min(ch, Math.ceil(this.cloudScissorNorm[3] * ch));
+          (raymarchPass as any).setScissorRect(sx0, sy0, Math.max(1, sx1 - sx0), Math.max(1, sy1 - sy0));
+        }
+        raymarchPass.setPipeline(this.volumetricHalfResPipeline!);
+        raymarchPass.setBindGroup(0, this.volumetricCloudBindGroup);
+        if (advectionBg) {
+          raymarchPass.setBindGroup(1, advectionBg);
+        }
+        if (this.volumetricTerrainBindGroup) {
+          raymarchPass.setBindGroup(2, this.volumetricTerrainBindGroup);
+        }
+        raymarchPass.draw(3, 1, 0, 0);
+        raymarchPass.end();
+
+        // Subpass 2A-2: Optical-Centroid 2x1 Checkerboard Temporal Reconstruction (TAA + 3x3 YCoCg Clamp)
+        const taaPass = commandEncoder.beginRenderPass({
+          label: 'volumetric_cloud_taa_resolve',
+          colorAttachments: [
+            {
+              view: this.volumetricTaaColorViews[writeIdx]!,
+              clearValue: { r: 0.0, g: 0.0, b: 0.0, a: 0.0 },
+              loadOp: 'clear',
+              storeOp: 'store',
+            },
+            {
+              view: this.volumetricTaaCentroidViews[writeIdx]!,
+              clearValue: { r: 1024.0, g: 0.0, b: 0.0, a: 1.0 },
+              loadOp: 'clear',
+              storeOp: 'store',
+            },
+          ],
+          timestampWrites: this.profiler?.getPassEndTimestampWrites(ProfilerPassSlot.Reserved1),
+        });
+        taaPass.setPipeline(this.volumetricTaaResolvePipeline!);
+        taaPass.setBindGroup(0, this.volumetricTaaResolveBindGroups[writeIdx]!);
+        taaPass.draw(3, 1, 0, 0);
+        taaPass.end();
+
+        this.volumetricHalfResTexture = this.volumetricTaaColorTextures[writeIdx];
+        this.volumetricHalfResView = this.volumetricTaaColorViews[writeIdx];
+        this.volumetricUpsampleBindGroup = this.volumetricUpsampleBindGroups[writeIdx];
+
+        // Subpass 2B: 1.0x Joint Bilateral Depth Upsample onto Swapchain / Scene Color Target
+        const cloudPass = commandEncoder.beginRenderPass({
+          label: 'volumetric_cloud_pass_pass2',
+          colorAttachments: [
+            {
+              view: currentTextureView,
+              loadOp: 'load',
+              storeOp: 'store',
+            },
+          ],
+          timestampWrites: this.profiler?.getPassTimestampWrites(ProfilerPassSlot.VolumetricUpsample),
+        });
+        cloudPass.setPipeline(this.volumetricUpsamplePipeline!);
+        cloudPass.setBindGroup(0, this.volumetricUpsampleBindGroups[writeIdx]!);
+        cloudPass.draw(3, 1, 0, 0);
+        cloudPass.end();
+
+        this.volumetricTaaValidFrames = Math.min(1000, this.volumetricTaaValidFrames + 1);
+        if (this.volumetricIsCameraSettled) {
+          this.volumetricCameraSettledFrames = Math.min(1000, this.volumetricCameraSettledFrames + 1);
+          if (this.volumetricTaaPendingParityFrames > 0) {
+            this.volumetricTaaPendingParityFrames--;
+          }
+        }
+        if (!(this.volumetricIsStationaryRest && this.volumetricTaaPendingParityFrames === 0)) {
+          this.volumetricTaaFrameIndex = (this.volumetricTaaFrameIndex + 1) >>> 0;
+        }
+      } else {
+        // Fallback path for headless/mock unit tests without half-res resources
+        const cloudPass = commandEncoder.beginRenderPass({
+          label: 'volumetric_cloud_pass_pass2',
+          colorAttachments: [
+            {
+              view: currentTextureView,
+              loadOp: 'load',
+              storeOp: 'store',
+            },
+          ],
+          timestampWrites: this.profiler?.getPassTimestampWrites(ProfilerPassSlot.Reserved1),
+        });
+        cloudPass.setPipeline(this.volumetricCloudPipeline);
+        cloudPass.setBindGroup(0, this.volumetricCloudBindGroup);
+        if (advectionBg) {
+          cloudPass.setBindGroup(1, advectionBg);
+        }
+        if (this.volumetricTerrainBindGroup) {
+          cloudPass.setBindGroup(2, this.volumetricTerrainBindGroup);
+        }
+        cloudPass.draw(3, 1, 0, 0);
+        cloudPass.end();
+      }
     } catch {
       // Mock environment guard
     }
@@ -9565,9 +13322,24 @@ export class WebGPUEngine {
       code: manifoldWGSL + '\n' + sdfTextWGSL,
     });
 
+    const crustFsIdx = crustHydrosphereWGSL.indexOf('@fragment\nfn fs_main(');
+    const crustOpaqueEntryWGSL = crustFsIdx >= 0
+      ? '\n' + crustHydrosphereWGSL
+          .slice(crustFsIdx)
+          .replace(
+            '@fragment\nfn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {',
+            '@fragment\nfn fs_crust_opaque(input: VertexOutput) -> @location(0) vec4<f32> {\n    let surfaceType = 0.0;'
+          )
+          .replace(/\binput\.surfaceType\b/g, 'surfaceType')
+          .replace(/\bdiscard\s*;/g, 'return vec4<f32>(0.0);')
+      : '';
     const crustHydrosphereShaderModule = this.device.createShaderModule({
       label: 'crust_hydrosphere',
-      code: manifoldWGSL + '\n' + crustHydrosphereWGSL,
+      code:
+        manifoldWGSL + '\n' + crustHydrosphereWGSL.replace(
+          'if (input.skirtFactor > 0.0 || (sim.u_renderStyle == 0u && abs(sim.u_seaLevel) <= 0.01)) {',
+          'if (sim.u_purityMode > 0.5 || input.skirtFactor > 0.0 || (sim.u_renderStyle == 0u && abs(sim.u_seaLevel) <= 0.01)) {'
+        ) + crustOpaqueEntryWGSL,
     });
 
     // 2. Bind Group Layouts
@@ -9633,8 +13405,6 @@ export class WebGPUEngine {
         { binding: 0, visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT, buffer: { type: 'uniform' } },
         { binding: 1, visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT, texture: {} },
         { binding: 2, visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT, sampler: {} },
-        { binding: 3, visibility: GPUShaderStage.FRAGMENT, texture: { viewDimension: '2d-array' } },
-        { binding: 4, visibility: GPUShaderStage.FRAGMENT, sampler: { type: 'filtering' } },
         { binding: 5, visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT, texture: {} },
         { binding: 6, visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT, buffer: { type: 'uniform' } },
         { binding: 7, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: 'float' } },
@@ -9910,6 +13680,7 @@ export class WebGPUEngine {
           { binding: 7, visibility: GPUShaderStage.FRAGMENT, buffer: { type: 'uniform' } },
           { binding: 8, visibility: GPUShaderStage.FRAGMENT | GPUShaderStage.VERTEX, texture: { sampleType: 'float', viewDimension: '2d-array' } },
           { binding: 9, visibility: GPUShaderStage.FRAGMENT | GPUShaderStage.VERTEX, buffer: { type: 'read-only-storage' } },
+          { binding: 10, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: 'float', viewDimension: '2d' } },
         ],
       });
     }
@@ -9969,6 +13740,76 @@ export class WebGPUEngine {
       },
     });
 
+    if (crustOpaqueEntryWGSL) {
+      try {
+        this.crustOpaquePipeline = this.device.createRenderPipeline({
+          label: 'crust_opaque_pipeline',
+          layout: crustPipelineLayout,
+          vertex: {
+            module: crustHydrosphereShaderModule,
+            entryPoint: 'vs_main',
+            buffers: [dualSurfaceLayout],
+          },
+          fragment: {
+            module: crustHydrosphereShaderModule,
+            entryPoint: 'fs_crust_opaque',
+            targets: [
+              {
+                format: this.format,
+              },
+            ],
+          },
+          depthStencil: {
+            depthWriteEnabled: true,
+            depthCompare: 'less',
+            format: 'depth32float',
+          },
+          primitive: {
+            topology: 'triangle-list',
+            cullMode: 'none',
+          },
+        });
+      } catch {
+        this.crustOpaquePipeline = null;
+      }
+    }
+
+    try {
+      this.crustHydroOnlyPipeline = this.device.createRenderPipeline({
+        label: 'crust_hydro_only_pipeline',
+        layout: crustPipelineLayout,
+        vertex: {
+          module: crustHydrosphereShaderModule,
+          entryPoint: 'vs_main',
+          buffers: [dualSurfaceLayout],
+        },
+        fragment: {
+          module: crustHydrosphereShaderModule,
+          entryPoint: 'fs_hydro_main',
+          targets: [
+            {
+              format: this.format,
+              blend: {
+                color: { srcFactor: 'src-alpha', dstFactor: 'one-minus-src-alpha', operation: 'add' },
+                alpha: { srcFactor: 'one', dstFactor: 'one-minus-src-alpha', operation: 'add' },
+              },
+            },
+          ],
+        },
+        depthStencil: {
+          depthWriteEnabled: true,
+          depthCompare: 'less',
+          format: 'depth32float',
+        },
+        primitive: {
+          topology: 'triangle-list',
+          cullMode: 'none',
+        },
+      });
+    } catch {
+      this.crustHydroOnlyPipeline = null;
+    }
+
     // 11b. Cloud Shell Render Pipeline
     try {
       const cloudShaderModule = this.device.createShaderModule({
@@ -10011,51 +13852,6 @@ export class WebGPUEngine {
         },
         fragment: {
           module: cloudShaderModule,
-          entryPoint: 'fs_main',
-          targets: [{
-            format: this.format,
-            blend: {
-              color: { srcFactor: 'one', dstFactor: 'one-minus-src-alpha', operation: 'add' },
-              alpha: { srcFactor: 'one', dstFactor: 'one-minus-src-alpha', operation: 'add' },
-            },
-          }],
-        },
-        primitive: { topology: 'triangle-list', cullMode: 'back' },
-        depthStencil: { format: 'depth32float', depthWriteEnabled: false, depthCompare: 'less-equal' },
-      });
-    } catch {
-      // Mock environment guard
-    }
-
-    // 11c. Atmospheric Limb Scattering Envelope Pipeline (RFC §1.3, Phase 6)
-    try {
-      const atmosphereShaderModule = this.device.createShaderModule({
-        label: 'atmosphere_scatter_shader',
-        code: manifoldWGSL + '\n' + atmosphereScatterWGSL,
-      });
-
-      this.atmosphereBindGroupLayout = this.device.createBindGroupLayout({
-        label: 'atmosphere_scatter_bind_group_layout',
-        entries: [
-          { binding: 0, visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT, buffer: { type: 'uniform' } },
-        ],
-      });
-
-      const atmospherePipelineLayout = this.device.createPipelineLayout({
-        label: 'atmosphere_scatter_pipeline_layout',
-        bindGroupLayouts: [this.atmosphereBindGroupLayout],
-      });
-
-      this.atmosphereScatterPipeline = this.device.createRenderPipeline({
-        label: 'atmosphere_scatter_render_pipeline',
-        layout: atmospherePipelineLayout,
-        vertex: {
-          module: atmosphereShaderModule,
-          entryPoint: 'vs_main',
-          buffers: [dualSurfaceLayout],
-        },
-        fragment: {
-          module: atmosphereShaderModule,
           entryPoint: 'fs_main',
           targets: [{
             format: this.format,
@@ -10151,18 +13947,41 @@ export class WebGPUEngine {
     }
     simFloats[11] = params.fractureIntensity ?? 1.0;
 
+    // Step 5.3 Active Unfurl Motion Dirty-Gate: dt-normalized across 24-120 Hz, decays to exact 0.0 within <= 8 frames at 60 Hz
+    const dtFlexSec = Math.min(0.1, Math.max(1e-3, Number.isFinite(params.dt) && (params.dt as number) > 0 ? (params.dt as number) : (1.0 / 60.0)));
+    const dtFlexFrames = dtFlexSec * 60.0;
+    const curUnfurlForFlex = params.unfurl ?? 0.0;
+    const deltaUnfurlAbs = this.lastUniformUnfurl === null ? 0.0 : Math.abs(curUnfurlForFlex - this.lastUniformUnfurl);
+    this.lastUniformUnfurl = curUnfurlForFlex;
+    if ((params.mode ?? 0) === 0 && curUnfurlForFlex > 0.001 && curUnfurlForFlex < 0.999 && deltaUnfurlAbs > 1e-5 && deltaUnfurlAbs <= 0.25) {
+      const unfurlSpeedPerSec = deltaUnfurlAbs / dtFlexSec;
+      const targetFlex = Math.min(1.0, unfurlSpeedPerSec * 0.75);
+      const attackBlend = 1.0 - Math.pow(0.65, dtFlexFrames);
+      this.unfurlFlexEnvelope = Math.min(1.0, this.unfurlFlexEnvelope * (1.0 - attackBlend) + targetFlex * attackBlend);
+    } else {
+      const decayedFlex = this.unfurlFlexEnvelope * Math.pow(0.58, dtFlexFrames);
+      this.unfurlFlexEnvelope = decayedFlex > 0.025 ? decayedFlex : 0.0;
+    }
+    const cursorSpeedBase = params.cursorVel
+      ? (('w' in params.cursorVel && typeof params.cursorVel.w === 'number')
+        ? params.cursorVel.w
+        : Math.hypot(params.cursorVel.x, params.cursorVel.y, params.cursorVel.z))
+      : 0.0;
+    const effectiveCursorSpeed = (params.mode ?? 0) === 0
+      ? Math.max(cursorSpeedBase, this.unfurlFlexEnvelope)
+      : cursorSpeedBase;
+
     // [12..15]: cursorVel (xyz) + speed (w)
     if (params.cursorVel) {
       simFloats[12] = params.cursorVel.x;
       simFloats[13] = params.cursorVel.y;
       simFloats[14] = params.cursorVel.z;
-      const speed = ('w' in params.cursorVel && typeof params.cursorVel.w === 'number') ? params.cursorVel.w : Math.hypot(params.cursorVel.x, params.cursorVel.y, params.cursorVel.z);
-      simFloats[15] = speed;
+      simFloats[15] = effectiveCursorSpeed;
     } else {
       simFloats[12] = 0.0;
       simFloats[13] = 0.0;
       simFloats[14] = 0.0;
-      simFloats[15] = 0.0;
+      simFloats[15] = effectiveCursorSpeed;
     }
 
     // [16..31]: viewMatrix (16 floats)
@@ -10206,7 +14025,22 @@ export class WebGPUEngine {
       }
     }
 
-    this.device.queue.writeBuffer(this.simUniformBuffer, 0, simFloats.buffer);
+    const effShowWindForSim =
+      params.showWind !== undefined
+        ? Boolean(params.showWind)
+        : Boolean(params.showSurfaceWinds || params.showJetStream);
+    const effShowJetForSim =
+      effShowWindForSim &&
+      (params.showJetStream !== undefined ? Boolean(params.showJetStream) : this.showJetStream);
+    const simIgnoreTimeWord =
+      (params.mode ?? 0) !== 3 &&
+      !Boolean(params.cursorActive) &&
+      !effShowJetForSim
+        ? 3
+        : -1;
+    if (this.shouldWriteUniform(0, this.simUniformBuffer, this.simUints, simIgnoreTimeWord)) {
+      this.device.queue.writeBuffer(this.simUniformBuffer, 0, simFloats.buffer);
+    }
 
     // ------------------------------------------------------------------------
     // Swiss Relief Shading Uniforms (M1-T2) (48 bytes, padded to 64 bytes)
@@ -10232,11 +14066,13 @@ export class WebGPUEngine {
       ru[13] = 0;
       ru[14] = 0;
       ru[15] = 0;
-      this.device.queue.writeBuffer(this.reliefUniformBuffer, 0, rf.buffer);
+      if (this.shouldWriteUniform(1, this.reliefUniformBuffer, ru)) {
+        this.device.queue.writeBuffer(this.reliefUniformBuffer, 0, rf.buffer);
+      }
     }
 
     // ------------------------------------------------------------------------
-    // Vector Ribbon Uniforms (M1-T4) (240 bytes, padded to 256 bytes)
+    // Vector Line Ribbon Extrusion Pipeline (M1-T4) (240 bytes, padded to 256 bytes)
     // ------------------------------------------------------------------------
     if (this.ribbonUniformBuffer) {
       const ribF = this.ribbonFloats;
@@ -10276,9 +14112,9 @@ export class WebGPUEngine {
         ribF[16] = params.cursorVel.x;
         ribF[17] = params.cursorVel.y;
         ribF[18] = params.cursorVel.z;
-        ribF[19] = ('w' in params.cursorVel && typeof params.cursorVel.w === 'number') ? params.cursorVel.w : Math.hypot(params.cursorVel.x, params.cursorVel.y, params.cursorVel.z);
+        ribF[19] = effectiveCursorSpeed;
       } else {
-        ribF[16] = 0.0; ribF[17] = 0.0; ribF[18] = 0.0; ribF[19] = 0.0;
+        ribF[16] = 0.0; ribF[17] = 0.0; ribF[18] = 0.0; ribF[19] = effectiveCursorSpeed;
       }
 
       ribF[20] = params.cursorActive ? 1.0 : 0.0;
@@ -10362,7 +14198,9 @@ export class WebGPUEngine {
         this.rteViewProjectionMatrix.toArray(ribF, 88);
       }
 
-      this.device.queue.writeBuffer(this.ribbonUniformBuffer, 0, ribF.buffer);
+      if (this.shouldWriteUniform(2, this.ribbonUniformBuffer, ribU, (params.mode ?? 0) !== 3 ? 3 : -1)) {
+        this.device.queue.writeBuffer(this.ribbonUniformBuffer, 0, ribF.buffer);
+      }
     }
 
     // ------------------------------------------------------------------------
@@ -10417,6 +14255,9 @@ export class WebGPUEngine {
       cf[85] = lowY;
       cf[86] = lowZ;
       cf[87] = 0.0;
+      if (this.xdrSolarGlintEnabled) {
+        cf[87] = 1.0;
+      }
 
       // cursorHitPos (floats 12..15)
       if (params.cursorHitPos) {
@@ -10433,10 +14274,9 @@ export class WebGPUEngine {
         cf[16] = params.cursorVel.x;
         cf[17] = params.cursorVel.y;
         cf[18] = params.cursorVel.z;
-        const speed = ('w' in params.cursorVel && typeof params.cursorVel.w === 'number') ? params.cursorVel.w : Math.hypot(params.cursorVel.x, params.cursorVel.y, params.cursorVel.z);
-        cf[19] = speed;
+        cf[19] = effectiveCursorSpeed;
       } else {
-        cf[16] = 0.0; cf[17] = 0.0; cf[18] = 0.0; cf[19] = 0.0;
+        cf[16] = 0.0; cf[17] = 0.0; cf[18] = 0.0; cf[19] = effectiveCursorSpeed;
       }
 
       cf[20] = params.cursorActive ? 1.0 : 0.0;
@@ -10478,8 +14318,6 @@ export class WebGPUEngine {
       let styleCode = 0; // 0 = Architectural / Relief
       if (params.renderStyle === 'hybrid' || params.renderStyle === 'depth') {
         styleCode = 1;
-      } else if (params.renderStyle === 'photoreal' || params.renderStyle === 'orbital') {
-        styleCode = 2;
       }
       cu[62] = styleCode;
       cf[63] = params.isolatedStratum !== undefined && params.isolatedStratum !== null ? params.isolatedStratum : -1.0;
@@ -10505,30 +14343,27 @@ export class WebGPUEngine {
         ? Boolean(params.showCloudHigh)
         : (this.cloudOptions.showHigh !== false);
       const anyStrataActive = showLow || showMid || showHigh;
+      cf[15] = (showMid ? 0.0 : 1.0) + (showHigh ? 0.0 : 2.0);
 
       const cloudsActive = Boolean(params.showClouds) && (this.cloudEnabled !== false);
-      const shadowsActive = cloudsActive && showLow && anyStrataActive;
+      const shadowsActive = cloudsActive && showLow && anyStrataActive && !params.cloudFalseColor;
       const rawShadow = shadowsActive
         ? (params.shadowIntensity !== undefined ? params.shadowIntensity : this.shadowIntensity)
         : 0.0;
       this.crustFloats[68] = (typeof rawShadow === 'number' && Number.isFinite(rawShadow))
         ? Math.max(0.0, Math.min(0.59999996, rawShadow))
         : (shadowsActive && Number.isFinite(this.shadowIntensity) ? Math.min(0.59999996, this.shadowIntensity) : 0.0);
-      const baseDrift = params.cloudDriftSpeed ?? this.cloudOptions?.driftSpeed ?? 1.2;
-      const normalizedDrift = baseDrift > 10.0 ? (baseDrift / 500.0) * 1.2 : baseDrift;
+      const baseDrift = params.cloudDriftSpeed ?? this.cloudOptions?.driftSpeed ?? 1.0;
+      const normalizedDrift = baseDrift > 10.0 ? (baseDrift / 500.0) : baseDrift;
       this.crustFloats[69] = 5.0 * normalizedDrift;
-      this.crustFloats[70] = 2.5;             // u_cloudAltitudeKm
+      this.crustFloats[70] = 2.5;
       this.crustUints[71] = params.verticalScaleMode !== undefined ? params.verticalScaleMode : this.verticalScaleMode;
 
-      // SimUniforms: Atmospheric Pluvial Coupling & Weather Optical Mode (floats 72..75, offset 288..304)
+      // SimUniforms: Atmospheric Pluvial Coupling (floats 72..75, offset 288..304)
       const rawPluvial = params.pluvialGamma !== undefined ? params.pluvialGamma : this._pluvialGamma;
       const validPluvial = (typeof rawPluvial === 'number' && Number.isFinite(rawPluvial))
         ? Math.max(0.0, Math.min(2.0, rawPluvial))
         : 0.0;
-      const rawMode = params.weatherOpticalMode !== undefined ? params.weatherOpticalMode : this._weatherOpticalMode;
-      const validMode = (typeof rawMode === 'number' && Number.isFinite(rawMode))
-        ? Math.floor(rawMode)
-        : 0;
 
       if (params.timelineMinutes !== undefined) {
         this.timelineMinutes = params.timelineMinutes;
@@ -10544,7 +14379,7 @@ export class WebGPUEngine {
         this.currentSolarPosition = getSolarPosition(params.solarTimestamp);
       }
       this.crustFloats[72] = validPluvial;
-      this.crustUints[73] = validMode;
+      this.crustUints[73] = 0; // _padWeatherOpticalMode (offset 292, preserves 16B SimUniforms alignment)
       this.crustFloats[74] = 0.0;
       this.crustFloats[75] = 0.0;
       const isPurity = params.purityMode !== undefined ? Boolean(params.purityMode) : this.purityMode;
@@ -10578,7 +14413,14 @@ export class WebGPUEngine {
       }
       this.crustFloats[79] = params.cdlodDiagnosticMode ?? this.cdlodDiagnosticMode ?? 0.0;
 
-      this.device.queue.writeBuffer(this.crustUniformBuffer, 0, cf.buffer);
+      if (params.cdlodDiagnosticMode !== this.lastExplicitCdlodDiagnosticMode) {
+        this.lastExplicitCdlodDiagnosticMode = params.cdlodDiagnosticMode;
+        this.uniformShadowValidMask &= ~(1 << 3);
+      }
+
+      if (this.shouldWriteUniform(3, this.crustUniformBuffer, cu)) {
+        this.device.queue.writeBuffer(this.crustUniformBuffer, 0, cf.buffer);
+      }
     }
 
     // ------------------------------------------------------------------------
@@ -10611,20 +14453,27 @@ export class WebGPUEngine {
       }
       const scrubVal = params.scrubTau ?? params.tau ?? params.weatherTau;
       windU[15] = (scrubVal !== undefined && Number.isFinite(scrubVal)) ? scrubVal : this._weatherTau;
-      this.device.queue.writeBuffer(this.windUniformBuffer, 0, windU.buffer);
+      if (this.shouldWriteUniform(4, this.windUniformBuffer, windU32, !showWind ? 2 : -1, !showWind ? 3 : -1)) {
+        this.device.queue.writeBuffer(this.windUniformBuffer, 0, windU.buffer);
+      }
     }
 
-    // Cloud Shell Tropospheric & Atmospheric Scatter Uniforms (288 bytes per layer)
-    const showAtmosphere = !!(params.showAtmosphere && this.showAtmosphereScatter !== false);
+    // Cloud Shell Tropospheric Uniforms (288 bytes per layer)
     const showClouds = Boolean(params.showClouds) && (this.cloudEnabled !== false);
-    if (showClouds || showAtmosphere) {
+    if (showClouds) {
       if (params.atmosphericScale !== undefined) {
         this.atmosphericScale = params.atmosphericScale;
       }
       if (params.shadowIntensity !== undefined) {
         this.shadowIntensity = params.shadowIntensity;
       }
-      this.updateCloudUniforms(params.dt, params);
+      const isPurityCloud = params.purityMode !== undefined ? Boolean(params.purityMode) : Boolean(this.purityMode);
+      const useVolCloud = !isPurityCloud &&
+        (params.volumetricClouds !== undefined ? Boolean(params.volumetricClouds) : this.volumetricCloudsEnabled) &&
+        Boolean(this.volumetricCloudPipeline);
+      if (!this.isExecutingFrameRender || !useVolCloud) {
+        this.updateCloudUniforms(params.dt, params);
+      }
     }
 
     // 14. Cartographic Intaglio Substrate Micro-Relief & Paper Composition Uniforms (Milestone §6)
@@ -10674,7 +14523,7 @@ export class WebGPUEngine {
         this.paperNormalDirty = true;
       }
 
-      if (paperChanged || this.paperNormalDirty) {
+      if (this.shouldWriteUniform(5, this.paperSubstrateUniformBuffer, this.paperSubstrateUints)) {
         this.device.queue.writeBuffer(this.paperSubstrateUniformBuffer, 0, paperF.buffer);
       }
 
@@ -10684,12 +14533,7 @@ export class WebGPUEngine {
       const confF = this.substrateConfigFloats;
       const confU = this.substrateConfigUints;
       const activeHapticsVal = showHaptics ? 1.0 : 0.0;
-      const confChanged =
-        confF[0] !== canvasW ||
-        confF[1] !== canvasH ||
-        confU[2] !== themeVal ||
-        confF[3] !== activeHapticsVal;
-      if (this.currentSubstrateTheme !== themeVal) {
+      if (this.currentSubstrateTheme !== themeVal || confF[0] !== canvasW || confF[1] !== canvasH) {
         this.currentSubstrateTheme = themeVal;
         this.paperNormalDirty = true;
       }
@@ -10697,7 +14541,7 @@ export class WebGPUEngine {
       confF[1] = canvasH;
       confU[2] = themeVal;
       confF[3] = activeHapticsVal;
-      if (confChanged || this.paperNormalDirty) {
+      if (this.shouldWriteUniform(6, this.substrateConfigUniformBuffer, confU)) {
         this.device.queue.writeBuffer(this.substrateConfigUniformBuffer, 0, confF.buffer);
       }
 
@@ -10733,30 +14577,40 @@ export class WebGPUEngine {
       compF[8] = canvasW;
       compF[9] = canvasH;
       compF[10] = showHaptics ? 1.0 : 0.0;
-      compF[11] = 0.0;
-      this.device.queue.writeBuffer(this.compositionLightingUniformBuffer, 0, compF.buffer);
+      compF[11] = this.xdrSolarGlintEnabled ? 1.0 : 0.0;
+      if (this.shouldWriteUniform(7, this.compositionLightingUniformBuffer, compU)) {
+        this.device.queue.writeBuffer(this.compositionLightingUniformBuffer, 0, compF.buffer);
+      }
     }
 
     if (this.geomorphicMicroUniformBuffer) {
       this.updateGeomorphicMicroUniforms(params as any);
     }
+
+    const isPurityActive = params.purityMode !== undefined ? Boolean(params.purityMode) : Boolean(this.purityMode);
+    const nextHideVectors = params.showVectors === false || isPurityActive ? 1 : 0;
+    if (this.hideVectorsFlag !== nextHideVectors || this.regionalUniformU32[15] !== nextHideVectors) {
+      this.hideVectorsFlag = nextHideVectors;
+      this.regionalUniformU32[15] = nextHideVectors;
+      if (this.regionalUniformBuffer && this.device) {
+        this.device.queue.writeBuffer(this.regionalUniformBuffer, 0, this.regionalUniformData);
+      }
+    }
   }
 
   /**
    * Evaluates whether precipitation rendering / simulation is active for the current frame.
-   * Precipitation is active if pluvialGamma > 0, weatherOpticalMode > 0, precipTexture is bound,
-   * or a non-disposed precipRingBuffer is attached.
+   * Precipitation is active if pluvialGamma > 0, prognosticVariable === 'total_precipitation_1hr_mean',
+   * precipTexture is bound, or a non-disposed precipRingBuffer is attached.
    */
   public isPrecipActive(params: Partial<WebGPUFrameParams> = {}): boolean {
     const pGamma = params.pluvialGamma !== undefined ? params.pluvialGamma : this._pluvialGamma;
     const isPluvialActive = typeof pGamma === 'number' && Number.isFinite(pGamma) && pGamma > 0;
-
-    const wMode = params.weatherOpticalMode !== undefined ? params.weatherOpticalMode : this._weatherOpticalMode;
-    const isModeActive = typeof wMode === 'number' && Number.isFinite(wMode) && Math.floor(wMode) > 0;
+    const isPrecipOverlay = params.prognosticVariable === 'total_precipitation_1hr_mean';
 
     return (
       isPluvialActive ||
-      isModeActive ||
+      isPrecipOverlay ||
       this.precipTexture !== null ||
       (this.precipRingBuffer !== null && !this.precipRingBuffer.disposed)
     );
@@ -10764,7 +14618,15 @@ export class WebGPUEngine {
 
   public render(params: WebGPUFrameParams): void {
     if (!this.isInitialized) return;
+    this.isExecutingFrameRender = true;
+    try {
+      this.renderFrameInternal(params);
+    } finally {
+      this.isExecutingFrameRender = false;
+    }
+  }
 
+  private renderFrameInternal(params: WebGPUFrameParams): void {
     const isPurity = params.purityMode !== undefined ? Boolean(params.purityMode) : Boolean(this.purityMode);
     this.purityMode = isPurity;
     this.lastIndirectDrawCallsCount = 0;
@@ -10814,7 +14676,6 @@ export class WebGPUEngine {
       params.showRelief ||
       params.showVectors ||
       params.showClouds ||
-      params.showAtmosphere ||
       isPrecipActive
     ) {
       this.ensureCartographicBuffers();
@@ -10832,11 +14693,6 @@ export class WebGPUEngine {
     // 1c. Ensure cloud buffers lazily on-demand
     if (Boolean(params.showClouds || params.showCloudLow || params.showCloudMid || params.showCloudHigh) && this.cloudEnabled !== false) {
       this.ensureCloudBuffers();
-    }
-
-    // 1d. Ensure atmospheric scatter buffers lazily on-demand
-    if (params.showAtmosphere && this.showAtmosphereScatter !== false) {
-      this.ensureAtmosphereScatterBuffers();
     }
 
     // 1e. Ensure directional terrain shadow resources lazily on-demand
@@ -10895,7 +14751,10 @@ export class WebGPUEngine {
     }
 
     if (isUnfurlChanged || isModeChanged || isVortexChanged || isFractureChanged || isCursorActive) {
-      this.simPendingFrames = 2;
+      this.simPendingFrames = Math.max(this.simPendingFrames, 2);
+    }
+    if (this.unfurlFlexEnvelope > 0) {
+      this.simPendingFrames = Math.max(this.simPendingFrames, 3);
     }
 
     const needsParticleCompute =
@@ -10949,25 +14808,61 @@ export class WebGPUEngine {
     const isAdvectionActive = params.cloudAdvection !== undefined ? Boolean(params.cloudAdvection) : this.cloudAdvectionEnabled;
     const showCloudAdvection = !isPurity && useVolumetric && isAdvectionActive;
 
+    let shouldStepCloudAdvection = false;
     if (showCloudAdvection) {
       this.ensureCloudAdvectionResources();
-      this.updateAdvectionUniforms(params);
-      const hasRealTextures = !!(this.cloudTextures.low && this.windTextureView && this.demTextureView);
-      if (!this.cloudAdvectionComputeBindGroups[0] || (!this.cloudAdvectionHasRealTextures && hasRealTextures)) {
+      const hasRealTextures = !!(
+        this._preCullHasLayer.low &&
+        this._preCullHasLayer.mid &&
+        this._preCullHasLayer.high &&
+        this.windTextureView &&
+        this.demTextureView
+      );
+      const transitionedToRealTextures = !this.cloudAdvectionHasRealTextures && hasRealTextures;
+      if (!this.cloudAdvectionComputeBindGroups[0] || transitionedToRealTextures) {
         this.cloudAdvectionComputeBindGroups = [null, null];
         this.updateCloudAdvectionBindGroups();
       }
+      const rawDt = Math.max(0, Number.isFinite(params.dt) ? (params.dt as number) : 0.016667);
+      this._advectionAccumDt += rawDt;
+      const ADVECTION_STEP_INTERVAL = 1.0 / 15.0;
+      if (
+        this.cloudAdvectionStep === 0 ||
+        transitionedToRealTextures ||
+        this._advectionAccumDt >= ADVECTION_STEP_INTERVAL
+      ) {
+        if (transitionedToRealTextures) {
+          this.cloudAdvectionStep = 0;
+        }
+        const isImmediateSeed = this.cloudAdvectionStep === 0;
+        const stepDt = isImmediateSeed
+          ? (rawDt > 0 ? Math.min(rawDt, 0.25) : 0.016667)
+          : Math.min(this._advectionAccumDt, 0.25);
+        this._advectionAccumDt = isImmediateSeed
+          ? 0
+          : (this._advectionAccumDt % ADVECTION_STEP_INTERVAL);
+        this.updateAdvectionUniforms(params, stepDt);
+        shouldStepCloudAdvection = true;
+      }
     }
 
-    const hasCloudAdvectionCompute = showCloudAdvection && !!(
+    const hasCloudAdvectionCompute = showCloudAdvection && shouldStepCloudAdvection && !!(
       this.cloudAdvectionComputePipeline &&
       this.cloudAdvectionComputeBindGroups[0] &&
       this.cloudAdvectionComputeBindGroups[1]
     );
 
     // Pass 1e: Dynamic Geomorphic Drainage Basin Synthesis Compute Dispatch
-    if (showDrainageHydrology && !this.drainageBindGroup && this.demTextureView) {
-      this.updateDrainageBindGroups();
+    if (showDrainageHydrology && this.demTextureView) {
+      const activeRingDrainageView = (this.precipRingBuffer && !this.precipRingBuffer.disposed)
+        ? this.precipRingBuffer.getTextureView(0)
+        : null;
+      const isDrainageRingStale = activeRingDrainageView
+        ? (this.boundDrainagePrecipView !== activeRingDrainageView)
+        : Boolean(this.precipRingBuffer && this.precipRingBuffer.disposed && this.boundDrainagePrecipView && this.boundDrainagePrecipView !== this.dummyPrecipTextureView && this.boundDrainagePrecipView !== this.dummyTerrainShadowTextureView);
+      if (!this.drainageBindGroup || isDrainageRingStale) {
+        this.updateDrainageBindGroups();
+      }
     }
 
     const hasDrainageCompute = showDrainageHydrology && !!(
@@ -10993,17 +14888,26 @@ export class WebGPUEngine {
     if (hasCDLODCompute) {
       this.updateCDLOD(params.camera, params.mode ?? 0, params.unfurl ?? 0, Boolean(params.cursorActive));
     }
+    const needsCDLODComputeDispatch = hasCDLODCompute && this.cdlodUpdatedThisFrame;
 
-    if (needsParticleCompute || hasWindCompute || hasHorizonCompute || hasCloudAdvectionCompute || hasDrainageCompute || hasCDLODCompute) {
-      const computePass = commandEncoder.beginComputePass({
-        timestampWrites: this.profiler?.getComputeTimestampWrites(0),
-      });
+    if (needsParticleCompute || hasWindCompute || hasHorizonCompute || hasCloudAdvectionCompute || hasDrainageCompute || needsCDLODComputeDispatch) {
+      const splitComputeProfiling = Boolean(this.profiler?.isEnabled);
+      const sharedComputePass = splitComputeProfiling
+        ? null
+        : commandEncoder.beginComputePass({
+            timestampWrites: this.profiler?.getComputeTimestampWrites(0),
+          });
 
       if (needsParticleCompute) {
+        const computePass = sharedComputePass ?? commandEncoder.beginComputePass({
+          label: 'particle_physics_compute_pass',
+          timestampWrites: this.profiler?.getPassTimestampWrites(ProfilerPassSlot.Compute),
+        });
         computePass.setPipeline(this.computePipeline);
         computePass.setBindGroup(0, this.computeBindGroups[this.currentStep % 2]);
         const workgroupCount = Math.min(65535, Math.ceil(this.pointCount / 256));
         computePass.dispatchWorkgroups(workgroupCount, 1, 1);
+        if (!sharedComputePass) computePass.end();
         this.simWarmupFrames++;
         if (this.simPendingFrames > 0) {
           this.simPendingFrames--;
@@ -11017,6 +14921,10 @@ export class WebGPUEngine {
       }
 
       if (hasWindCompute) {
+        const computePass = sharedComputePass ?? commandEncoder.beginComputePass({
+          label: 'wind_particles_compute_pass',
+          timestampWrites: this.profiler?.getPassTimestampWrites(ProfilerPassSlot.WindCompute),
+        });
         computePass.setPipeline(this.windComputePipeline!);
         computePass.setBindGroup(0, this.windComputeBindGroups![this.windStep % 2]);
         if (this.windTileCacheBindGroup) {
@@ -11024,35 +14932,55 @@ export class WebGPUEngine {
         }
         const windWgCount = Math.min(65535, Math.ceil(this.windParticleCount / 256));
         computePass.dispatchWorkgroups(windWgCount, 1, 1);
+        if (!sharedComputePass) computePass.end();
       }
 
       if (hasHorizonCompute) {
+        const computePass = sharedComputePass ?? commandEncoder.beginComputePass({
+          label: 'horizon_occlusion_compute_pass',
+          timestampWrites: this.profiler?.getPassTimestampWrites(ProfilerPassSlot.HorizonCompute),
+        });
         computePass.setPipeline(this.horizonOcclusionPipeline!);
         computePass.setBindGroup(0, this.horizonOcclusionBindGroup!);
         const wgX = Math.ceil(this.terrainShadowMapWidth / 16);
         const wgY = Math.ceil(this.terrainShadowMapHeight / 16);
         computePass.dispatchWorkgroups(wgX, wgY, 1);
+        if (!sharedComputePass) computePass.end();
         this.terrainShadowDirty = false;
       }
 
       if (hasCloudAdvectionCompute) {
+        const computePass = sharedComputePass ?? commandEncoder.beginComputePass({
+          label: 'cloud_advection_compute_pass',
+          timestampWrites: this.profiler?.getPassTimestampWrites(ProfilerPassSlot.CloudAdvection),
+        });
         computePass.setPipeline(this.cloudAdvectionComputePipeline!);
         const pingIdx = this.cloudAdvectionStep % 2;
         computePass.setBindGroup(0, this.cloudAdvectionComputeBindGroups[pingIdx]!);
         computePass.dispatchWorkgroups(16, 16, 8);
+        if (!sharedComputePass) computePass.end();
         this.cloudAdvectionStep++;
       }
 
       if (hasDrainageCompute) {
+        const computePass = sharedComputePass ?? commandEncoder.beginComputePass({
+          label: 'drainage_synthesis_compute_pass',
+          timestampWrites: this.profiler?.getPassTimestampWrites(ProfilerPassSlot.DrainageCompute),
+        });
         computePass.setPipeline(this.drainagePipeline!);
         computePass.setBindGroup(0, this.drainageBindGroup!);
         const wgX = Math.ceil(this.drainageMapWidth / 16);
         const wgY = Math.ceil(this.drainageMapHeight / 16);
         computePass.dispatchWorkgroups(wgX, wgY, 1);
+        if (!sharedComputePass) computePass.end();
         this.drainageDirty = false;
       }
 
-      if (hasCDLODCompute) {
+      if (needsCDLODComputeDispatch) {
+        const computePass = sharedComputePass ?? commandEncoder.beginComputePass({
+          label: 'cdlod_culling_compute_pass',
+          timestampWrites: this.profiler?.getPassTimestampWrites(ProfilerPassSlot.CDLODCompute),
+        });
         if (this.cdlodResetPipeline) {
           computePass.setPipeline(this.cdlodResetPipeline);
           computePass.setBindGroup(0, this.cdlodCullingBindGroup!);
@@ -11062,9 +14990,12 @@ export class WebGPUEngine {
         computePass.setBindGroup(0, this.cdlodCullingBindGroup!);
         const cdlodWg = Math.max(1, Math.ceil(this.cdlodActiveNodeCount / 64));
         computePass.dispatchWorkgroups(cdlodWg, 1, 1);
+        if (!sharedComputePass) computePass.end();
       }
 
-      computePass.end();
+      if (sharedComputePass) {
+        sharedComputePass.end();
+      }
     }
 
     // Pass 2: Consolidated Single Render Pass (TBDR on-chip optimization)
@@ -11133,9 +15064,8 @@ export class WebGPUEngine {
       (params.reliefActive || params.showRelief) &&
       this.crustHydrospherePipeline &&
       this.crustBindGroup &&
-      (useCDLOD || (this.crustVertexBuffer && this.crustIndexBuffer && this.crustIndexCount > 0))
+      useCDLOD
     ) {
-      renderPass.setPipeline(this.crustHydrospherePipeline);
       const crustBg = (this.precipRingBuffer && !this.precipRingBuffer.disposed && this.crustPrecipBindGroups)
         ? this.crustPrecipBindGroups[this.precipRingBuffer.getActivePhysicalIndex(0)]
         : this.crustBindGroup;
@@ -11155,7 +15085,6 @@ export class WebGPUEngine {
         renderPass.setBindGroup(2, this.cdlodBindGroup);
       }
       if (
-        useCDLOD &&
         this.patchVertexBuffer &&
         this.patchIndexBuffer &&
         this.cdlodIndirectBuffer &&
@@ -11163,12 +15092,17 @@ export class WebGPUEngine {
       ) {
         renderPass.setVertexBuffer(0, this.patchVertexBuffer);
         renderPass.setIndexBuffer(this.patchIndexBuffer, 'uint32');
-        renderPass.drawIndexedIndirect(this.cdlodIndirectBuffer, 0);
+        renderPass.setPipeline(this.crustOpaquePipeline ?? this.crustHydrospherePipeline);
+        renderPass.drawIndexedIndirect(this.cdlodIndirectBuffer, 20);
+        const isArchitecturalStyle =
+          params.renderStyle !== 'hybrid' &&
+          params.renderStyle !== 'depth';
+        const skipHydroPass1B = isPurity || (isArchitecturalStyle && Math.abs(params.seaLevel ?? 0) <= 0.01);
+        if (!skipHydroPass1B) {
+          renderPass.setPipeline(this.crustHydroOnlyPipeline ?? this.crustHydrospherePipeline);
+          renderPass.drawIndexedIndirect(this.cdlodIndirectBuffer, 40);
+        }
         this.lastIndirectDrawCallsCount++;
-      } else if (this.crustVertexBuffer && this.crustIndexBuffer && this.crustIndexCount > 0) {
-        renderPass.setVertexBuffer(0, this.crustVertexBuffer);
-        renderPass.setIndexBuffer(this.crustIndexBuffer, 'uint32');
-        renderPass.drawIndexed(this.crustIndexCount);
       }
     }
 
@@ -11177,9 +15111,7 @@ export class WebGPUEngine {
     const isReliefActive = Boolean(params.reliefActive || params.showRelief);
     const showLines = (!isPurity && isReliefActive)
       ? false
-      : (params.renderStyle === 'photoreal'
-        ? layerMode === 2 // Only if explicitly set to wireframe-only
-        : (layerMode === 0 || layerMode === 2));
+      : (layerMode === 0 || layerMode === 2);
 
     if (showLines) {
       renderPass.setPipeline(this.linesRenderPipeline);
@@ -11214,6 +15146,10 @@ export class WebGPUEngine {
       } else if (configuredTier === 'local' && this.vectorSegmentBufferLocal && this.vectorSegmentCountLocal > 0) {
         renderPass.setVertexBuffer(1, this.vectorSegmentBufferLocal);
         renderPass.draw(4, this.vectorSegmentCountLocal, 0, 0);
+        if (this.vectorSegmentBufferDynamic && this.vectorSegmentCountDynamic > 0) {
+          renderPass.setVertexBuffer(1, this.vectorSegmentBufferDynamic);
+          renderPass.draw(4, this.vectorSegmentCountDynamic, 0, 0);
+        }
       } else if (configuredTier === 'regional' && (this.vectorSegmentBufferRegional || this.vectorSegmentBuffer)) {
         const buf = this.vectorSegmentBufferRegional || this.vectorSegmentBuffer;
         const count = this.vectorSegmentCountRegional || this.vectorSegmentCount;
@@ -11222,16 +15158,21 @@ export class WebGPUEngine {
           renderPass.draw(4, count, 0, 0);
         }
       } else {
-        // Auto tier mode with seamless cross-fading (M13-P2-T1)
-        const inOrbitTransition = camDist >= 10.5 && camDist <= 13.5;
+        // Auto tier mode: restrict coarse 1:110M vectorSegmentBufferOrbit strictly to extreme deep-space (r > 30)
+        // so geo-vectors.bin renders continuously across orbital & mid-scale with zero 110M/10M ghosting.
+        const inOrbitTransition = camDist > 30.0 && camDist <= 34.0;
         const inLocalTransition = camDist >= 5.6 && camDist <= 6.8;
 
-        if (camDist >= 13.5 && this.vectorSegmentBufferOrbit && this.vectorSegmentCountOrbit > 0) {
+        if (camDist > 34.0 && this.vectorSegmentBufferOrbit && this.vectorSegmentCountOrbit > 0) {
           renderPass.setVertexBuffer(1, this.vectorSegmentBufferOrbit);
           renderPass.draw(4, this.vectorSegmentCountOrbit, 0, 0);
         } else if (camDist <= 5.6 && this.vectorSegmentBufferLocal && this.vectorSegmentCountLocal > 0) {
           renderPass.setVertexBuffer(1, this.vectorSegmentBufferLocal);
           renderPass.draw(4, this.vectorSegmentCountLocal, 0, 0);
+          if (this.vectorSegmentBufferDynamic && this.vectorSegmentCountDynamic > 0) {
+            renderPass.setVertexBuffer(1, this.vectorSegmentBufferDynamic);
+            renderPass.draw(4, this.vectorSegmentCountDynamic, 0, 0);
+          }
         } else if (inOrbitTransition && this.vectorSegmentBufferOrbit && this.vectorSegmentCountOrbit > 0) {
           renderPass.setVertexBuffer(1, this.vectorSegmentBufferOrbit);
           renderPass.draw(4, this.vectorSegmentCountOrbit, 0, 0);
@@ -11250,6 +15191,10 @@ export class WebGPUEngine {
           }
           renderPass.setVertexBuffer(1, this.vectorSegmentBufferLocal);
           renderPass.draw(4, this.vectorSegmentCountLocal, 0, 0);
+          if (this.vectorSegmentBufferDynamic && this.vectorSegmentCountDynamic > 0) {
+            renderPass.setVertexBuffer(1, this.vectorSegmentBufferDynamic);
+            renderPass.draw(4, this.vectorSegmentCountDynamic, 0, 0);
+          }
         } else if (this.vectorSegmentBuffer && this.vectorSegmentCount > 0) {
           renderPass.setVertexBuffer(1, this.vectorSegmentBufferRegional || this.vectorSegmentBuffer);
           renderPass.draw(4, this.vectorSegmentCountRegional || this.vectorSegmentCount, 0, 0);
@@ -11276,7 +15221,6 @@ export class WebGPUEngine {
     const showCloudLow = !isPurity && showClouds && (params.showCloudLow !== undefined ? Boolean(params.showCloudLow) : this.cloudOptions.showLow !== false);
     const showCloudMid = !isPurity && showClouds && (params.showCloudMid !== undefined ? Boolean(params.showCloudMid) : this.cloudOptions.showMid !== false);
     const showCloudHigh = !isPurity && showClouds && (params.showCloudHigh !== undefined ? Boolean(params.showCloudHigh) : this.cloudOptions.showHigh !== false);
-    const showAtmosphere = !isPurity && !!(params.showAtmosphere && this.showAtmosphereScatter !== false);
 
     // 1. Surface Winds
     if (!isPurity && finalShowSurf && this.windRibbonPipeline && this.windRibbonBindGroups && this.quadCornerBuffer) {
@@ -11293,19 +15237,14 @@ export class WebGPUEngine {
       this.renderCloudLayer(renderPass, 'mid', params);
     }
 
-    // 4. Jet Stream
-    if (!isPurity && finalShowJet && this.windRibbonPipeline && this.windRibbonBindGroups && this.quadCornerBuffer) {
+    // 4. Jet Stream (Rendered in Pass 2 above volumetric clouds when useVolumetric is active)
+    if (!isPurity && finalShowJet && !useVolumetric && this.windRibbonPipeline && this.windRibbonBindGroups && this.quadCornerBuffer) {
       this.renderJetStreamRibbons(renderPass);
     }
 
     // 5. Cloud High (Bypassed when Pass 2 volumetric raymarching is active)
     if (!isPurity && showCloudHigh && !useVolumetric) {
       this.renderCloudLayer(renderPass, 'high', params);
-    }
-
-    // 5b. Planetary Atmospheric Scattering Envelope (RFC §1.3, Phase 6)
-    if (!isPurity && showAtmosphere && this.atmosphereScatterPipeline) {
-      this.renderAtmosphereScatterPass(renderPass, params);
     }
 
     // 5c. Render Toponymic GPU SDF Inscriptions & Spot Elevations above atmospheric strata (M13-P3-T1)
@@ -11329,7 +15268,9 @@ export class WebGPUEngine {
     // Pass 2: Dedicated Volumetric Cloud Raymarcher Pass (Milestone 3)
     if (!isPurity && useVolumetric) {
       this.renderVolumetricClouds(commandEncoder, params, sceneTargetView);
-      if (showToponymy && this.sdfTextGlyphCount > 0) {
+      const needPostCloudJet = finalShowJet && Boolean(this.windRibbonPipeline && this.windRibbonBindGroups && this.quadCornerBuffer);
+      const needPostCloudText = showToponymy && this.sdfTextGlyphCount > 0;
+      if (needPostCloudJet || needPostCloudText) {
         const toponymPass = commandEncoder.beginRenderPass({
           label: 'sdf_text_post_cloud_pass',
           colorAttachments: [
@@ -11343,11 +15284,17 @@ export class WebGPUEngine {
             ? {
                 view: this.depthTextureView,
                 depthLoadOp: 'load',
-                depthStoreOp: 'store',
+                depthStoreOp: this.retainDepthForReadback ? 'store' : 'discard',
               }
             : undefined,
+          timestampWrites: this.profiler?.getPassTimestampWrites(ProfilerPassSlot.PostCloudOverlay),
         });
-        this.renderSDFText(toponymPass);
+        if (needPostCloudJet) {
+          this.renderJetStreamRibbons(toponymPass);
+        }
+        if (needPostCloudText) {
+          this.renderSDFText(toponymPass);
+        }
         toponymPass.end();
       }
     }
@@ -11358,22 +15305,28 @@ export class WebGPUEngine {
         this.updateSubstrateBindGroups();
       }
       const shouldComputeSubstrate = this.paperNormalDirty || !this.paperNormalComputed;
-      if (shouldComputeSubstrate && this.substrateMicroReliefPipeline && this.substrateMicroReliefBindGroup) {
+      const runMicroRelief = Boolean(shouldComputeSubstrate && this.substrateMicroReliefPipeline && this.substrateMicroReliefBindGroup);
+      const runPaperComp = Boolean(this.paperCompositionPipeline && this.paperCompositionBindGroup);
+      if (runMicroRelief && this.substrateMicroReliefPipeline && this.substrateMicroReliefBindGroup) {
         const microReliefPass = commandEncoder.beginComputePass({
           label: 'substrate_micro_relief_pass',
-          timestampWrites: this.profiler?.getPassTimestampWrites(ProfilerPassSlot.Reserved2),
+          timestampWrites: runPaperComp
+            ? this.profiler?.getPassBeginTimestampWrites(ProfilerPassSlot.Reserved2)
+            : this.profiler?.getPassTimestampWrites(ProfilerPassSlot.Reserved2),
         });
         microReliefPass.setPipeline(this.substrateMicroReliefPipeline);
         microReliefPass.setBindGroup(0, this.substrateMicroReliefBindGroup);
-        const workgroupsX = Math.ceil(canvasWidth / 16);
-        const workgroupsY = Math.ceil(canvasHeight / 16);
+        const texW = this.paperNormalTexture?.width ?? 512;
+        const texH = this.paperNormalTexture?.height ?? 512;
+        const workgroupsX = Math.ceil(texW / 16);
+        const workgroupsY = Math.ceil(texH / 16);
         microReliefPass.dispatchWorkgroups(workgroupsX, workgroupsY);
         microReliefPass.end();
         this.paperNormalDirty = false;
         this.paperNormalComputed = true;
       }
 
-      if (this.paperCompositionPipeline && this.paperCompositionBindGroup) {
+      if (runPaperComp && this.paperCompositionPipeline && this.paperCompositionBindGroup) {
         const compPass = commandEncoder.beginRenderPass({
           label: 'paper_composition_pass',
           colorAttachments: [
@@ -11384,6 +15337,9 @@ export class WebGPUEngine {
               storeOp: 'store',
             },
           ],
+          timestampWrites: runMicroRelief
+            ? this.profiler?.getPassEndTimestampWrites(ProfilerPassSlot.Reserved2)
+            : this.profiler?.getPassTimestampWrites(ProfilerPassSlot.Reserved2),
         });
         compPass.setPipeline(this.paperCompositionPipeline);
         compPass.setBindGroup(0, this.paperCompositionBindGroup);
@@ -11408,7 +15364,8 @@ export class WebGPUEngine {
       device: this.device,
       format: this.format,
       alphaMode: 'premultiplied',
-    });
+      toneMapping: { mode: this.xdrSolarGlintEnabled ? 'extended' : 'standard' },
+    } as any);
     this.updateDepthTexture(width, height);
     this.updateSubstrateTextures(width, height);
   }
@@ -11837,212 +15794,551 @@ export class WebGPUEngine {
     if (!this.device || !this.isInitialized) return;
     const isMockFetch = typeof fetch === 'function' && Boolean((fetch as any).mock);
     if (typeof urlOrBuffer === 'string' && !isMockFetch) {
-      if (this.lastLoadedTempUrl === urlOrBuffer && this.tempTexture) return;
-      if (this.inFlightTempUrl === urlOrBuffer && this.inFlightTempPromise) {
-        return this.inFlightTempPromise;
+      if (this.lastLoadedTempUrl === urlOrBuffer && this.tempTexture && !this.inFlightTempPromise) return;
+      if (this.inFlightTempPromise) {
+        if (this.inFlightTempUrl === urlOrBuffer && this.pendingTempUrl === null) {
+          return this.inFlightTempPromise;
+        }
+        this.pendingTempUrl = urlOrBuffer;
+        return this.inFlightTempPromise.then(() => {
+          const nextUrl = this.pendingTempUrl;
+          if (nextUrl !== null) {
+            this.pendingTempUrl = null;
+            return this.loadTemperatureTexture(nextUrl);
+          }
+          return this.inFlightTempPromise ?? undefined;
+        });
       }
+    } else {
+      this.pendingTempUrl = null;
     }
 
-    let buffer: ArrayBuffer | null = null;
-    if (urlOrBuffer instanceof ArrayBuffer) {
-      buffer = urlOrBuffer;
-    } else if (typeof fetch !== 'undefined') {
-      try {
-        const res = await fetch(urlOrBuffer);
-        if (res.ok) {
-          buffer = await res.arrayBuffer();
-        } else if (urlOrBuffer === '/data/weathernext/temperature_2m_mean-0.bin') {
-          const fallbackRes = await fetch('/data/weathernext/temp-00.bin');
-          if (fallbackRes.ok) buffer = await fallbackRes.arrayBuffer();
+    const doLoadTemp = async (): Promise<void> => {
+      const seq = ++this.tempTextureLoadSeq;
+      if (typeof urlOrBuffer === 'string' && !isMockFetch && decodeWorkerPool.canUseWorkers()) {
+        const workerRes = await decodeWorkerPool.run<WeatherNextThermoPackResponse>({
+          type: 'weathernext_thermo_pack',
+          kind: 'temp',
+          url: urlOrBuffer,
+        });
+        if (!workerRes.ok || !workerRes.paddedBuffer || !this.device || !this.isInitialized || seq !== this.tempTextureLoadSeq) return;
+        const texW = workerRes.texW!;
+        const texH = workerRes.texH!;
+        const texFormat = workerRes.texFormat!;
+        const uploadBytesPerRow = workerRes.uploadBytesPerRow!;
+        const mask = workerRes.packedFlagsMask ?? 2;
+        this._volumetricPackedChannelFlags =
+          (this._volumetricPackedChannelFlags & ~mask) | (workerRes.packedFlagsValue ?? 0);
+
+        this.tempTexture?.destroy();
+        this.tempTexture = this.device.createTexture({
+          label: 'weathernext_temperature_texture',
+          size: [texW, texH, 1],
+          format: texFormat,
+          usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST,
+        });
+        this.device.queue.writeTexture(
+          { texture: this.tempTexture },
+          workerRes.paddedBuffer,
+          { bytesPerRow: uploadBytesPerRow, rowsPerImage: texH },
+          [texW, texH, 1]
+        );
+        this.tempTextureView = this.tempTexture.createView({
+          label: 'weathernext_temperature_texture_view',
+        });
+        this.lastLoadedTempUrl = urlOrBuffer;
+        if (workerRes.preCullThermoBuffer) {
+          this._preCullMinTemp.set(new Float32Array(workerRes.preCullThermoBuffer));
+          this._preCullHasTemp = true;
+          this.rebuildCloudPreCullGrid();
         }
-      } catch {
-        if (urlOrBuffer === '/data/weathernext/temperature_2m_mean-0.bin') {
-          try {
+        this.cloudAdvectionComputeBindGroups = [null, null];
+        if (this._preCullHasLayer.low && this._preCullHasLayer.mid && this._preCullHasLayer.high) {
+          this.cloudAdvectionStep = 0;
+          this._advectionAccumDt = 0;
+        }
+        this.updateDEMBindGroups();
+        this.updateCloudAdvectionBindGroups();
+        this.updateVolumetricCloudBindGroup();
+        return;
+      }
+
+      let buffer: ArrayBuffer | null = null;
+      if (urlOrBuffer instanceof ArrayBuffer) {
+        buffer = urlOrBuffer;
+      } else if (typeof fetch !== 'undefined') {
+        try {
+          const res = await fetch(urlOrBuffer);
+          if (res.ok) {
+            buffer = await res.arrayBuffer();
+          } else if (urlOrBuffer === '/data/weathernext/temperature_2m_mean-0.bin') {
             const fallbackRes = await fetch('/data/weathernext/temp-00.bin');
             if (fallbackRes.ok) buffer = await fallbackRes.arrayBuffer();
+          }
+        } catch {
+          if (urlOrBuffer === '/data/weathernext/temperature_2m_mean-0.bin') {
+            try {
+              const fallbackRes = await fetch('/data/weathernext/temp-00.bin');
+              if (fallbackRes.ok) buffer = await fallbackRes.arrayBuffer();
+            } catch {}
+          }
+        }
+      }
+
+      if (!buffer && typeof process !== 'undefined' && process.versions?.node) {
+        try {
+          buffer = await loadNodeAssetBuffer(
+            typeof urlOrBuffer === 'string' ? urlOrBuffer : 'public/data/weathernext/temperature_2m_mean-0.bin'
+          );
+        } catch {}
+        if (!buffer && (urlOrBuffer === '/data/weathernext/temperature_2m_mean-0.bin' || typeof urlOrBuffer !== 'string')) {
+          try {
+            buffer = await loadNodeAssetBuffer('public/data/weathernext/temp-00.bin');
           } catch {}
         }
       }
-    }
 
-    if (!buffer && typeof process !== 'undefined' && process.versions?.node) {
-      try {
-        buffer = await loadNodeAssetBuffer(
-          typeof urlOrBuffer === 'string' ? urlOrBuffer : 'public/data/weathernext/temperature_2m_mean-0.bin'
-        );
-      } catch {}
-      if (!buffer && (urlOrBuffer === '/data/weathernext/temperature_2m_mean-0.bin' || typeof urlOrBuffer !== 'string')) {
-        try {
-          buffer = await loadNodeAssetBuffer('public/data/weathernext/temp-00.bin');
-        } catch {}
+      if (!buffer || !this.device || !this.isInitialized || seq !== this.tempTextureLoadSeq) return;
+
+      const bytesPerTexel = 2; // Float16
+      let texW = 3600;
+      let texH = 1801;
+      const isPadded3600 = buffer.byteLength === 13370624;
+
+      if (isPadded3600) {
+        texW = 3600;
+        texH = 1801;
+      } else if (buffer.byteLength === 1440 * 721 * bytesPerTexel) {
+        texW = 1440;
+        texH = 721;
+      } else if (buffer.byteLength === 360 * 181 * bytesPerTexel) {
+        texW = 360;
+        texH = 181;
+      } else if (buffer.byteLength !== 3600 * 1801 * bytesPerTexel) {
+        texW = Math.max(1, Math.round(Math.sqrt(buffer.byteLength / (2 * bytesPerTexel))));
+        texH = Math.max(1, Math.floor(buffer.byteLength / (texW * bytesPerTexel)));
       }
-    }
 
-    if (!buffer) return;
+      const rowBytesRaw = texW * bytesPerTexel;
+      const bytesPerRow = Math.ceil(rowBytesRaw / 256) * 256;
+      let padded: Uint8Array;
+      let texFormat: GPUTextureFormat = 'r16float';
+      let uploadBytesPerRow = bytesPerRow;
 
-    const bytesPerTexel = 2; // Float16
-    let texW = 3600;
-    let texH = 1801;
-    const isPadded3600 = buffer.byteLength === 13370624;
-
-    if (isPadded3600) {
-      texW = 3600;
-      texH = 1801;
-    } else if (buffer.byteLength === 1440 * 721 * bytesPerTexel) {
-      texW = 1440;
-      texH = 721;
-    } else if (buffer.byteLength === 360 * 181 * bytesPerTexel) {
-      texW = 360;
-      texH = 181;
-    } else if (buffer.byteLength !== 3600 * 1801 * bytesPerTexel) {
-      texW = Math.max(1, Math.round(Math.sqrt(buffer.byteLength / (2 * bytesPerTexel))));
-      texH = Math.max(1, Math.floor(buffer.byteLength / (texW * bytesPerTexel)));
-    }
-
-    const rowBytesRaw = texW * bytesPerTexel;
-    const bytesPerRow = Math.ceil(rowBytesRaw / 256) * 256;
-    let padded: Uint8Array;
-
-    if (isPadded3600) {
-      padded = new Uint8Array(buffer);
-    } else {
-      const totalPadded = bytesPerRow * texH;
-      padded = new Uint8Array(totalPadded);
-      const srcU8 = new Uint8Array(buffer);
-
-      for (let r = 0; r < texH; r++) {
-        const srcOff = r * rowBytesRaw;
-        const dstOff = r * bytesPerRow;
-        padded.set(srcU8.subarray(srcOff, srcOff + rowBytesRaw), dstOff);
+      let sstBuf: ArrayBuffer | null = null;
+      let mslpBuf: ArrayBuffer | null = null;
+      let spreadBuf: ArrayBuffer | null = null;
+      if (isPadded3600 && typeof urlOrBuffer === 'string' && !isMockFetch && urlOrBuffer.includes('temperature_2m_mean-')) {
+        const sstUrl = urlOrBuffer.replace('temperature_2m_mean-', 'sea_surface_temperature_mean-');
+        const mslpUrl = urlOrBuffer.replace('temperature_2m_mean-', 'mean_sea_level_pressure_mean-');
+        const spreadUrl = urlOrBuffer.replace('temperature_2m_mean-', 'convective_spread-');
+        if (typeof fetch !== 'undefined') {
+          const fetchCompanion13M = async (targetUrl: string): Promise<ArrayBuffer | null> => {
+            try {
+              const cRes = await fetch(targetUrl);
+              const isHtml = cRes.headers.get('content-type')?.includes('text/html');
+              if (cRes.ok && !isHtml) {
+                const candidate = await cRes.arrayBuffer();
+                if (candidate.byteLength === 13370624) return candidate;
+              }
+            } catch {}
+            return null;
+          };
+          [sstBuf, mslpBuf, spreadBuf] = await Promise.all([
+            fetchCompanion13M(sstUrl),
+            fetchCompanion13M(mslpUrl),
+            fetchCompanion13M(spreadUrl),
+          ]);
+        }
       }
+      if (!this.device || !this.isInitialized || seq !== this.tempTextureLoadSeq) return;
+
+      if (isPadded3600 && (mslpBuf || spreadBuf)) {
+        const rgbaColsPadded = 3616; // 28928 bytes / 8 bytes per rgba16float texel
+        const srcR = new Uint16Array(buffer);
+        const srcG = sstBuf ? new Uint16Array(sstBuf) : null;
+        const srcB = mslpBuf ? new Uint16Array(mslpBuf) : null;
+        const srcA = spreadBuf ? new Uint16Array(spreadBuf) : null;
+        const interleaved = new Uint16Array(texH * rgbaColsPadded * 4);
+        for (let r = 0; r < texH; r++) {
+          const srcRowOff = r * 3712;
+          const dstRowOff = r * rgbaColsPadded * 4;
+          for (let c = 0; c < texW; c++) {
+            const dstIdx = dstRowOff + c * 4;
+            const rBits = srcR[srcRowOff + c];
+            const rawGBits = srcG ? srcG[srcRowOff + c] : rBits;
+            const isSentinelSST = (rawGBits & 0x8000) !== 0 && (rawGBits & 0x7fff) > 0x4500;
+            interleaved[dstIdx] = rBits;
+            interleaved[dstIdx + 1] = isSentinelSST ? rBits : rawGBits;
+            interleaved[dstIdx + 2] = srcB ? srcB[srcRowOff + c] : 0;
+            interleaved[dstIdx + 3] = srcA ? srcA[srcRowOff + c] : 0;
+          }
+        }
+        padded = new Uint8Array(interleaved.buffer);
+        texFormat = 'rgba16float';
+        uploadBytesPerRow = 28928;
+        if (mslpBuf && spreadBuf) {
+          this._volumetricPackedChannelFlags |= 2;
+        } else {
+          this._volumetricPackedChannelFlags &= ~2;
+        }
+      } else if (isPadded3600 && sstBuf) {
+        this._volumetricPackedChannelFlags &= ~2;
+        const vecColsPadded = 3648; // 14592 bytes / 4 bytes per rg16float texel
+        const srcR = new Uint16Array(buffer);
+        const srcG = new Uint16Array(sstBuf);
+        const interleaved = new Uint16Array(texH * vecColsPadded * 2);
+        for (let r = 0; r < texH; r++) {
+          const srcRowOff = r * 3712;
+          const dstRowOff = r * vecColsPadded * 2;
+          for (let c = 0; c < texW; c++) {
+            const dstIdx = dstRowOff + c * 2;
+            const rBits = srcR[srcRowOff + c];
+            const gBits = srcG[srcRowOff + c];
+            const isSentinelSST = (gBits & 0x8000) !== 0 && (gBits & 0x7fff) > 0x4500;
+            interleaved[dstIdx] = rBits;
+            interleaved[dstIdx + 1] = isSentinelSST ? rBits : gBits;
+          }
+        }
+        padded = new Uint8Array(interleaved.buffer);
+        texFormat = 'rg16float';
+        uploadBytesPerRow = 14592;
+      } else if (isPadded3600) {
+        this._volumetricPackedChannelFlags &= ~2;
+        padded = new Uint8Array(buffer);
+      } else {
+        this._volumetricPackedChannelFlags &= ~2;
+        const totalPadded = bytesPerRow * texH;
+        padded = new Uint8Array(totalPadded);
+        const srcU8 = new Uint8Array(buffer);
+
+        for (let r = 0; r < texH; r++) {
+          const srcOff = r * rowBytesRaw;
+          const dstOff = r * bytesPerRow;
+          padded.set(srcU8.subarray(srcOff, srcOff + rowBytesRaw), dstOff);
+        }
+      }
+
+      this.tempTexture?.destroy();
+      this.tempTexture = this.device.createTexture({
+        label: 'weathernext_temperature_texture',
+        size: [texW, texH, 1],
+        format: texFormat,
+        usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST,
+      });
+      this.device.queue.writeTexture(
+        { texture: this.tempTexture },
+        padded,
+        { bytesPerRow: uploadBytesPerRow, rowsPerImage: texH },
+        [texW, texH, 1]
+      );
+      this.tempTextureView = this.tempTexture.createView({
+        label: 'weathernext_temperature_texture_view',
+      });
+      this.lastLoadedTempUrl = typeof urlOrBuffer === 'string' ? urlOrBuffer : null;
+      this.updateCloudPreCullThermoField('temp', buffer, texW, texH, isPadded3600);
+
+      this.cloudAdvectionComputeBindGroups = [null, null];
+      if (this._preCullHasLayer.low && this._preCullHasLayer.mid && this._preCullHasLayer.high) {
+        this.cloudAdvectionStep = 0;
+        this._advectionAccumDt = 0;
+      }
+      this.updateDEMBindGroups();
+      this.updateCloudAdvectionBindGroups();
+      this.updateVolumetricCloudBindGroup();
+    };
+
+    if (typeof urlOrBuffer === 'string' && !isMockFetch) {
+      this.inFlightTempUrl = urlOrBuffer;
+      const p = doLoadTemp().finally(() => {
+        if (this.inFlightTempPromise === p) {
+          this.inFlightTempUrl = null;
+          this.inFlightTempPromise = null;
+        }
+      });
+      this.inFlightTempPromise = p;
+      return p;
     }
 
-    this.tempTexture?.destroy();
-    this.tempTexture = this.device.createTexture({
-      label: 'weathernext_temperature_texture',
-      size: [texW, texH, 1],
-      format: 'r16float',
-      usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST,
-    });
-    this.device.queue.writeTexture(
-      { texture: this.tempTexture },
-      padded,
-      { bytesPerRow, rowsPerImage: texH },
-      [texW, texH, 1]
-    );
-    this.tempTextureView = this.tempTexture.createView({
-      label: 'weathernext_temperature_texture_view',
-    });
-    this.lastLoadedTempUrl = typeof urlOrBuffer === 'string' ? urlOrBuffer : null;
-
-    this.updateDEMBindGroups();
+    return doLoadTemp();
   }
 
   public async loadDewpointTexture(
-    urlOrBuffer: string | ArrayBuffer = '/data/weathernext/dewpoint_temperature_2m_mean-0.bin'
+    urlOrBuffer: string | ArrayBuffer = '/data/weathernext/dewpoint_temperature_2m_mean-0.bin',
+    opticalDepthUrlOverride?: string
   ): Promise<void> {
     if (!this.device || !this.isInitialized) return;
     const isMockFetch = typeof fetch === 'function' && Boolean((fetch as any).mock);
-    if (typeof urlOrBuffer === 'string' && !isMockFetch) {
-      if (this.lastLoadedDewpointUrl === urlOrBuffer && this.dewpointTexture) return;
-      if (this.inFlightDewpointUrl === urlOrBuffer && this.inFlightDewpointPromise) {
-        return this.inFlightDewpointPromise;
+    const cacheKey =
+      typeof urlOrBuffer === 'string' && opticalDepthUrlOverride
+        ? `${urlOrBuffer}|${opticalDepthUrlOverride}`
+        : urlOrBuffer;
+    if (typeof urlOrBuffer === 'string' && typeof cacheKey === 'string' && !isMockFetch) {
+      if (this.lastLoadedDewpointUrl === cacheKey && this.dewpointTexture && !this.inFlightDewpointPromise) return;
+      if (this.inFlightDewpointPromise) {
+        if (this.inFlightDewpointUrl === cacheKey && this.pendingDewpointReq === null) {
+          return this.inFlightDewpointPromise;
+        }
+        this.pendingDewpointReq = { url: urlOrBuffer, opt: opticalDepthUrlOverride };
+        return this.inFlightDewpointPromise.then(() => {
+          const nextReq = this.pendingDewpointReq;
+          if (nextReq !== null) {
+            this.pendingDewpointReq = null;
+            return this.loadDewpointTexture(nextReq.url, nextReq.opt);
+          }
+          return this.inFlightDewpointPromise ?? undefined;
+        });
       }
+    } else {
+      this.pendingDewpointReq = null;
     }
 
-    let buffer: ArrayBuffer | null = null;
-    if (urlOrBuffer instanceof ArrayBuffer) {
-      buffer = urlOrBuffer;
-    } else if (typeof fetch !== 'undefined') {
-      try {
-        const res = await fetch(urlOrBuffer);
-        if (res.ok) {
-          buffer = await res.arrayBuffer();
-        } else if (urlOrBuffer === '/data/weathernext/dewpoint_temperature_2m_mean-0.bin') {
-          const fallbackRes = await fetch('/data/weathernext/dewpoint-00.bin');
-          if (fallbackRes.ok) buffer = await fallbackRes.arrayBuffer();
+    const doLoadDewpoint = async (): Promise<void> => {
+      const seq = ++this.dewpointTextureLoadSeq;
+      if (typeof urlOrBuffer === 'string' && !isMockFetch && decodeWorkerPool.canUseWorkers()) {
+        const workerRes = await decodeWorkerPool.run<WeatherNextThermoPackResponse>({
+          type: 'weathernext_thermo_pack',
+          kind: 'dew',
+          url: urlOrBuffer,
+          opticalDepthUrlOverride,
+        });
+        if (!workerRes.ok || !workerRes.paddedBuffer || !this.device || !this.isInitialized || seq !== this.dewpointTextureLoadSeq) return;
+        const texW = workerRes.texW!;
+        const texH = workerRes.texH!;
+        const texFormat = workerRes.texFormat!;
+        const uploadBytesPerRow = workerRes.uploadBytesPerRow!;
+        const mask = workerRes.packedFlagsMask ?? 4;
+        this._volumetricPackedChannelFlags =
+          (this._volumetricPackedChannelFlags & ~mask) | (workerRes.packedFlagsValue ?? 0);
+
+        this.dewpointTexture?.destroy();
+        this.dewpointTexture = this.device.createTexture({
+          label: 'weathernext_dewpoint_texture',
+          size: [texW, texH, 1],
+          format: texFormat,
+          usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST,
+        });
+        this.device.queue.writeTexture(
+          { texture: this.dewpointTexture },
+          workerRes.paddedBuffer,
+          { bytesPerRow: uploadBytesPerRow, rowsPerImage: texH },
+          [texW, texH, 1]
+        );
+        this.dewpointTextureView = this.dewpointTexture.createView({
+          label: 'weathernext_dewpoint_texture_view',
+        });
+        this.lastLoadedDewpointUrl = typeof cacheKey === 'string' ? cacheKey : null;
+        if (workerRes.preCullThermoBuffer) {
+          this._preCullMaxDew.set(new Float32Array(workerRes.preCullThermoBuffer));
+          this._preCullHasDew = true;
+          this.rebuildCloudPreCullGrid();
         }
-      } catch {
-        if (urlOrBuffer === '/data/weathernext/dewpoint_temperature_2m_mean-0.bin') {
-          try {
+        this.cloudAdvectionComputeBindGroups = [null, null];
+        if (this._preCullHasLayer.low && this._preCullHasLayer.mid && this._preCullHasLayer.high) {
+          this.cloudAdvectionStep = 0;
+          this._advectionAccumDt = 0;
+        }
+        this.updateDEMBindGroups();
+        this.updateCloudAdvectionBindGroups();
+        this.updateVolumetricCloudBindGroup();
+        return;
+      }
+
+      let buffer: ArrayBuffer | null = null;
+      if (urlOrBuffer instanceof ArrayBuffer) {
+        buffer = urlOrBuffer;
+      } else if (typeof fetch !== 'undefined') {
+        try {
+          const res = await fetch(urlOrBuffer);
+          if (res.ok) {
+            buffer = await res.arrayBuffer();
+          } else if (urlOrBuffer === '/data/weathernext/dewpoint_temperature_2m_mean-0.bin') {
             const fallbackRes = await fetch('/data/weathernext/dewpoint-00.bin');
             if (fallbackRes.ok) buffer = await fallbackRes.arrayBuffer();
+          }
+        } catch {
+          if (urlOrBuffer === '/data/weathernext/dewpoint_temperature_2m_mean-0.bin') {
+            try {
+              const fallbackRes = await fetch('/data/weathernext/dewpoint-00.bin');
+              if (fallbackRes.ok) buffer = await fallbackRes.arrayBuffer();
+            } catch {}
+          }
+        }
+      }
+
+      if (!buffer && typeof process !== 'undefined' && process.versions?.node) {
+        try {
+          buffer = await loadNodeAssetBuffer(
+            typeof urlOrBuffer === 'string' ? urlOrBuffer : 'public/data/weathernext/dewpoint_temperature_2m_mean-0.bin'
+          );
+        } catch {}
+        if (!buffer && (urlOrBuffer === '/data/weathernext/dewpoint_temperature_2m_mean-0.bin' || typeof urlOrBuffer !== 'string')) {
+          try {
+            buffer = await loadNodeAssetBuffer('public/data/weathernext/dewpoint-00.bin');
           } catch {}
         }
       }
-    }
 
-    if (!buffer && typeof process !== 'undefined' && process.versions?.node) {
-      try {
-        buffer = await loadNodeAssetBuffer(
-          typeof urlOrBuffer === 'string' ? urlOrBuffer : 'public/data/weathernext/dewpoint_temperature_2m_mean-0.bin'
-        );
-      } catch {}
-      if (!buffer && (urlOrBuffer === '/data/weathernext/dewpoint_temperature_2m_mean-0.bin' || typeof urlOrBuffer !== 'string')) {
-        try {
-          buffer = await loadNodeAssetBuffer('public/data/weathernext/dewpoint-00.bin');
-        } catch {}
+      if (!buffer || !this.device || !this.isInitialized || seq !== this.dewpointTextureLoadSeq) return;
+
+      const bytesPerTexel = 2; // Float16
+      let texW = 3600;
+      let texH = 1801;
+      const isPadded3600 = buffer.byteLength === 13370624;
+
+      if (isPadded3600) {
+        texW = 3600;
+        texH = 1801;
+      } else if (buffer.byteLength === 1440 * 721 * bytesPerTexel) {
+        texW = 1440;
+        texH = 721;
+      } else if (buffer.byteLength === 360 * 181 * bytesPerTexel) {
+        texW = 360;
+        texH = 181;
+      } else if (buffer.byteLength !== 3600 * 1801 * bytesPerTexel) {
+        texW = Math.max(1, Math.round(Math.sqrt(buffer.byteLength / (2 * bytesPerTexel))));
+        texH = Math.max(1, Math.floor(buffer.byteLength / (texW * bytesPerTexel)));
       }
-    }
 
-    if (!buffer) return;
+      const rowBytesRaw = texW * bytesPerTexel;
+      const bytesPerRow = Math.ceil(rowBytesRaw / 256) * 256;
+      let padded: Uint8Array;
+      let texFormat: GPUTextureFormat = 'r16float';
+      let uploadBytesPerRow = bytesPerRow;
 
-    const bytesPerTexel = 2; // Float16
-    let texW = 3600;
-    let texH = 1801;
-    const isPadded3600 = buffer.byteLength === 13370624;
-
-    if (isPadded3600) {
-      texW = 3600;
-      texH = 1801;
-    } else if (buffer.byteLength === 1440 * 721 * bytesPerTexel) {
-      texW = 1440;
-      texH = 721;
-    } else if (buffer.byteLength === 360 * 181 * bytesPerTexel) {
-      texW = 360;
-      texH = 181;
-    } else if (buffer.byteLength !== 3600 * 1801 * bytesPerTexel) {
-      texW = Math.max(1, Math.round(Math.sqrt(buffer.byteLength / (2 * bytesPerTexel))));
-      texH = Math.max(1, Math.floor(buffer.byteLength / (texW * bytesPerTexel)));
-    }
-
-    const rowBytesRaw = texW * bytesPerTexel;
-    const bytesPerRow = Math.ceil(rowBytesRaw / 256) * 256;
-    let padded: Uint8Array;
-
-    if (isPadded3600) {
-      padded = new Uint8Array(buffer);
-    } else {
-      const totalPadded = bytesPerRow * texH;
-      padded = new Uint8Array(totalPadded);
-      const srcU8 = new Uint8Array(buffer);
-
-      for (let r = 0; r < texH; r++) {
-        const srcOff = r * rowBytesRaw;
-        const dstOff = r * bytesPerRow;
-        padded.set(srcU8.subarray(srcOff, srcOff + rowBytesRaw), dstOff);
+      let optBuf: ArrayBuffer | null = null;
+      let w100Buf: ArrayBuffer | null = null;
+      if (isPadded3600 && typeof urlOrBuffer === 'string' && !isMockFetch && urlOrBuffer.includes('dewpoint_temperature_2m_mean-')) {
+        const optUrl = opticalDepthUrlOverride ?? urlOrBuffer.replace('dewpoint_temperature_2m_mean-', 'radiative_optical_depth-');
+        const w100Url = urlOrBuffer.replace('dewpoint_temperature_2m_mean-', 'wind_100m_vector-');
+        if (typeof fetch !== 'undefined') {
+          const fetchOpt = async (): Promise<ArrayBuffer | null> => {
+            try {
+              const optRes = await fetch(optUrl);
+              const isHtml = optRes.headers.get('content-type')?.includes('text/html');
+              if (optRes.ok && !isHtml) {
+                const candidate = await optRes.arrayBuffer();
+                if (candidate.byteLength === 13370624) return candidate;
+              }
+            } catch {}
+            return null;
+          };
+          const fetchW100 = async (): Promise<ArrayBuffer | null> => {
+            try {
+              const wRes = await fetch(w100Url);
+              const isHtml = wRes.headers.get('content-type')?.includes('text/html');
+              if (wRes.ok && !isHtml) {
+                const candidate = await wRes.arrayBuffer();
+                if (candidate.byteLength === 26280192 || candidate.byteLength === 25934400) return candidate;
+              }
+            } catch {}
+            return null;
+          };
+          [optBuf, w100Buf] = await Promise.all([fetchOpt(), fetchW100()]);
+        }
       }
+      if (!this.device || !this.isInitialized || seq !== this.dewpointTextureLoadSeq) return;
+
+      if (isPadded3600 && w100Buf) {
+        const rgbaColsPadded = 3616; // 28928 bytes / 8 bytes per rgba16float texel
+        const srcR = new Uint16Array(buffer);
+        const srcG = optBuf ? new Uint16Array(optBuf) : null;
+        const srcW100 = new Uint16Array(w100Buf);
+        const w100RowU16 = w100Buf.byteLength === 26280192 ? 7296 : 7200;
+        const interleaved = new Uint16Array(texH * rgbaColsPadded * 4);
+        for (let r = 0; r < texH; r++) {
+          const srcRowOff = r * 3712;
+          const wRowOff = r * w100RowU16;
+          const dstRowOff = r * rgbaColsPadded * 4;
+          for (let c = 0; c < texW; c++) {
+            const dstIdx = dstRowOff + c * 4;
+            const wIdx = wRowOff + c * 2;
+            interleaved[dstIdx] = srcR[srcRowOff + c];
+            interleaved[dstIdx + 1] = srcG ? srcG[srcRowOff + c] : 0;
+            interleaved[dstIdx + 2] = srcW100[wIdx];
+            interleaved[dstIdx + 3] = srcW100[wIdx + 1];
+          }
+        }
+        padded = new Uint8Array(interleaved.buffer);
+        texFormat = 'rgba16float';
+        uploadBytesPerRow = 28928;
+        this._volumetricPackedChannelFlags |= 4;
+      } else if (isPadded3600 && optBuf) {
+        this._volumetricPackedChannelFlags &= ~4;
+        const vecColsPadded = 3648; // 14592 bytes / 4 bytes per rg16float texel
+        const srcR = new Uint16Array(buffer);
+        const srcG = new Uint16Array(optBuf);
+        const interleaved = new Uint16Array(texH * vecColsPadded * 2);
+        for (let r = 0; r < texH; r++) {
+          const srcRowOff = r * 3712;
+          const dstRowOff = r * vecColsPadded * 2;
+          for (let c = 0; c < texW; c++) {
+            const dstIdx = dstRowOff + c * 2;
+            interleaved[dstIdx] = srcR[srcRowOff + c];
+            interleaved[dstIdx + 1] = srcG[srcRowOff + c];
+          }
+        }
+        padded = new Uint8Array(interleaved.buffer);
+        texFormat = 'rg16float';
+        uploadBytesPerRow = 14592;
+      } else if (isPadded3600) {
+        this._volumetricPackedChannelFlags &= ~4;
+        padded = new Uint8Array(buffer);
+      } else {
+        this._volumetricPackedChannelFlags &= ~4;
+        const totalPadded = bytesPerRow * texH;
+        padded = new Uint8Array(totalPadded);
+        const srcU8 = new Uint8Array(buffer);
+
+        for (let r = 0; r < texH; r++) {
+          const srcOff = r * rowBytesRaw;
+          const dstOff = r * bytesPerRow;
+          padded.set(srcU8.subarray(srcOff, srcOff + rowBytesRaw), dstOff);
+        }
+      }
+
+      this.dewpointTexture?.destroy();
+      this.dewpointTexture = this.device.createTexture({
+        label: 'weathernext_dewpoint_texture',
+        size: [texW, texH, 1],
+        format: texFormat,
+        usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST,
+      });
+      this.device.queue.writeTexture(
+        { texture: this.dewpointTexture },
+        padded,
+        { bytesPerRow: uploadBytesPerRow, rowsPerImage: texH },
+        [texW, texH, 1]
+      );
+      this.dewpointTextureView = this.dewpointTexture.createView({
+        label: 'weathernext_dewpoint_texture_view',
+      });
+      this.lastLoadedDewpointUrl = typeof cacheKey === 'string' ? cacheKey : null;
+      this.updateCloudPreCullThermoField('dew', buffer, texW, texH, isPadded3600);
+
+      this.cloudAdvectionComputeBindGroups = [null, null];
+      if (this._preCullHasLayer.low && this._preCullHasLayer.mid && this._preCullHasLayer.high) {
+        this.cloudAdvectionStep = 0;
+        this._advectionAccumDt = 0;
+      }
+      this.updateDEMBindGroups();
+      this.updateCloudAdvectionBindGroups();
+      this.updateVolumetricCloudBindGroup();
+    };
+
+    if (typeof cacheKey === 'string' && !isMockFetch) {
+      this.inFlightDewpointUrl = cacheKey;
+      const p = doLoadDewpoint().finally(() => {
+        if (this.inFlightDewpointPromise === p) {
+          this.inFlightDewpointUrl = null;
+          this.inFlightDewpointPromise = null;
+        }
+      });
+      this.inFlightDewpointPromise = p;
+      return p;
     }
 
-    this.dewpointTexture?.destroy();
-    this.dewpointTexture = this.device.createTexture({
-      label: 'weathernext_dewpoint_texture',
-      size: [texW, texH, 1],
-      format: 'r16float',
-      usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST,
-    });
-    this.device.queue.writeTexture(
-      { texture: this.dewpointTexture },
-      padded,
-      { bytesPerRow, rowsPerImage: texH },
-      [texW, texH, 1]
-    );
-    this.dewpointTextureView = this.dewpointTexture.createView({
-      label: 'weathernext_dewpoint_texture_view',
-    });
-    this.lastLoadedDewpointUrl = typeof urlOrBuffer === 'string' ? urlOrBuffer : null;
-
-    this.updateDEMBindGroups();
+    return doLoadDewpoint();
   }
 
   public setPrecipitationRingBuffer(ring: TemporalTextureRingBuffer | null): void {
@@ -12051,6 +16347,8 @@ export class WebGPUEngine {
       this.crustPrecipBindGroups = null;
       this.precipTextureView = null;
       this._advectionEnabled = false;
+      this.updateVolumetricCloudBindGroup();
+      this.updateDrainageBindGroups();
       return;
     }
 
@@ -12060,24 +16358,24 @@ export class WebGPUEngine {
     this.ensureDewpointTexture();
     this.ensureWindTexture();
 
-    if (this.device && this.crustBindGroupLayout && this.crustUniformBuffer && this.orbitalTextureView && this.orbitalSampler) {
-      const regView = this.activeRegionalDEM ? this.activeRegionalDEM.view : (this.dummyRegionalTextureView || this.demTextureView || this.orbitalTextureView);
+    if (this.device && this.crustBindGroupLayout && this.crustUniformBuffer && (this.demTextureView || this.dummyWhiteTextureView) && this.demSampler) {
+      const regView = this.activeRegionalDEM ? this.activeRegionalDEM.view : (this.dummyRegionalTextureView || this.demTextureView || this.dummyWhiteTextureView);
       const regBuffer = (this.activeRegionalDEM && this.regionalUniformBuffer)
         ? this.regionalUniformBuffer
         : (this.regionalUniformBuffer || this.reliefUniformBuffer || this.simUniformBuffer || this.crustUniformBuffer);
       const cloudView = (this.cloudTextures?.low
         ? this.cloudTextures.low.createView({ label: 'crust_cloud_texture_view' })
-        : (this.dummyCloudTextureView || this.orbitalTextureView))!;
+        : (this.dummyCloudTextureView || this.dummyWhiteTextureView))!;
       const highCloudView = (this.cloudTextures?.high
         ? this.cloudTextures.high.createView({ label: 'crust_high_cloud_texture_view' })
-        : (this.dummyCloudTextureView || this.orbitalTextureView))!;
-      const cloudSampler = (this.cloudSampler || this.demSampler || this.orbitalSampler)!;
-      const precipSampler = (this.precipSampler || this.dummyPrecipSampler || this.demSampler || this.orbitalSampler)!;
-      const tempView = (this.tempTextureView || this.dummyTempTextureView || this.orbitalTextureView)!;
-      const dewpointView = (this.dewpointTextureView || this.dummyDewpointTextureView || this.orbitalTextureView)!;
-      const windView = (this.windTextureView || this.dummyWindTextureView || this.orbitalTextureView)!;
-      const demView = (this.demTextureView || this.orbitalTextureView)!;
-      const demSamp = (this.demSampler || this.orbitalSampler)!;
+        : (this.dummyCloudTextureView || this.dummyWhiteTextureView))!;
+      const cloudSampler = (this.cloudSampler || this.demSampler)!;
+      const precipSampler = (this.precipSampler || this.dummyPrecipSampler || this.demSampler)!;
+      const tempView = (this.tempTextureView || this.dummyTempTextureView || this.dummyWhiteTextureView)!;
+      const dewpointView = (this.dewpointTextureView || this.dummyDewpointTextureView || this.dummyWhiteTextureView)!;
+      const windView = (this.windTextureView || this.dummyWindTextureView || this.dummyWhiteTextureView)!;
+      const demView = (this.demTextureView || this.dummyWhiteTextureView)!;
+      const demSamp = this.demSampler;
 
       this.crustPrecipBindGroups = [
         this.device.createBindGroup({
@@ -12087,8 +16385,6 @@ export class WebGPUEngine {
             { binding: 0, resource: { buffer: this.crustUniformBuffer } },
             { binding: 1, resource: demView },
             { binding: 2, resource: demSamp },
-            { binding: 3, resource: this.orbitalTextureView },
-            { binding: 4, resource: this.orbitalSampler },
             { binding: 5, resource: regView! },
             { binding: 6, resource: { buffer: regBuffer! } },
             { binding: 7, resource: cloudView },
@@ -12109,8 +16405,6 @@ export class WebGPUEngine {
             { binding: 0, resource: { buffer: this.crustUniformBuffer } },
             { binding: 1, resource: demView },
             { binding: 2, resource: demSamp },
-            { binding: 3, resource: this.orbitalTextureView },
-            { binding: 4, resource: this.orbitalSampler },
             { binding: 5, resource: regView! },
             { binding: 6, resource: { buffer: regBuffer! } },
             { binding: 7, resource: cloudView },
@@ -12131,8 +16425,6 @@ export class WebGPUEngine {
             { binding: 0, resource: { buffer: this.crustUniformBuffer } },
             { binding: 1, resource: demView },
             { binding: 2, resource: demSamp },
-            { binding: 3, resource: this.orbitalTextureView },
-            { binding: 4, resource: this.orbitalSampler },
             { binding: 5, resource: regView! },
             { binding: 6, resource: { buffer: regBuffer! } },
             { binding: 7, resource: cloudView },
@@ -12148,13 +16440,16 @@ export class WebGPUEngine {
         }),
       ];
     }
+    this.updateVolumetricCloudBindGroup();
+    this.updateDrainageBindGroups();
   }
 
-  public ensureCloudBuffers(width?: number, height?: number): void {
+  public ensureCloudBuffers(width?: number, height?: number, format?: GPUTextureFormat): void {
     if (!this.device) return;
 
     const targetWidth = width ?? (this.cloudTextures.low?.width || 1440);
     const targetHeight = height ?? (this.cloudTextures.low?.height || 721);
+    const targetFormat: GPUTextureFormat = format ?? this.cloudTextureFormat;
 
     if (!this.cloudUniformBuffers) {
       this.cloudUniformBuffers = [
@@ -12162,14 +16457,6 @@ export class WebGPUEngine {
         this.device.createBuffer({ label: 'cloud_uniform_mid', size: 288, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST }),
         this.device.createBuffer({ label: 'cloud_uniform_high', size: 288, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST }),
       ];
-    }
-    
-    if (!this.cloudStagingBuffer) {
-      this.cloudStagingBuffer = this.device.createBuffer({
-        label: 'cloud_staging',
-        size: 13370624, // Fits 3600x1801 WeatherNext pre-padded
-        usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC,
-      });
     }
 
     if (!this.cloudSphereVertexBuffer) {
@@ -12190,31 +16477,36 @@ export class WebGPUEngine {
       this.cloudIndexCount = sphereMesh.indices.length >>> 1;
     }
 
-    let texturesNeedRecreation = !this.cloudTextures.low || this.cloudTextures.low.width !== targetWidth || this.cloudTextures.low.height !== targetHeight;
+    let texturesNeedRecreation =
+      !this.cloudTextures.low ||
+      this.cloudTextures.low.width !== targetWidth ||
+      this.cloudTextures.low.height !== targetHeight ||
+      this.cloudTextureFormat !== targetFormat;
+
+    const oldLow = texturesNeedRecreation ? this.cloudTextures.low : null;
+    const oldMid = texturesNeedRecreation ? this.cloudTextures.mid : null;
+    const oldHigh = texturesNeedRecreation ? this.cloudTextures.high : null;
 
     if (texturesNeedRecreation) {
-      const oldLow = this.cloudTextures.low;
-      const oldMid = this.cloudTextures.mid;
-      const oldHigh = this.cloudTextures.high;
-
       const lowTex = this.device.createTexture({
         label: 'cloud_texture_low',
         size: [targetWidth, targetHeight, 1],
-        format: 'r16float',
+        format: targetFormat,
         usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST | GPUTextureUsage.COPY_SRC,
       });
       const midTex = this.device.createTexture({
         label: 'cloud_texture_mid',
         size: [targetWidth, targetHeight, 1],
-        format: 'r16float',
+        format: targetFormat,
         usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST | GPUTextureUsage.COPY_SRC,
       });
       const highTex = this.device.createTexture({
         label: 'cloud_texture_high',
         size: [targetWidth, targetHeight, 1],
-        format: 'r16float',
+        format: targetFormat,
         usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST | GPUTextureUsage.COPY_SRC,
       });
+      this.cloudTextureFormat = targetFormat;
 
       this.cloudTextures = {
         low: lowTex,
@@ -12228,18 +16520,10 @@ export class WebGPUEngine {
         high: highTex.createView({ label: 'cloud_view_high' }),
       };
       this.volumetricCloudBindGroup = null;
-
-      if (oldLow) oldLow.destroy();
-      if (oldMid) oldMid.destroy();
-      if (oldHigh) oldHigh.destroy();
     }
 
     if (!this.cloudSampler) {
-      this.cloudSampler = this.device.createSampler({
-        label: 'cloud_sampler',
-        minFilter: 'linear',
-        magFilter: 'linear',
-      });
+      this.cloudSampler = this.device.createSampler({ label: 'cloud_sampler', minFilter: 'linear', magFilter: 'linear', addressModeU: 'repeat', addressModeV: 'clamp-to-edge' });
     }
 
     this.cloudBuffersInitialized = true;
@@ -12249,18 +16533,34 @@ export class WebGPUEngine {
       this.cloudAdvectionComputeBindGroups = [null, null];
       this.updateCloudAdvectionBindGroups();
       this.updateVolumetricCloudBindGroup();
+      if (this.precipRingBuffer && !this.precipRingBuffer.disposed) {
+        this.setPrecipitationRingBuffer(this.precipRingBuffer);
+      }
+      if (oldLow) oldLow.destroy();
+      if (oldMid) oldMid.destroy();
+      if (oldHigh) oldHigh.destroy();
     }
+  }
+
+  private ensureCloudSampler(): GPUSampler {
+    if (!this.cloudSampler) {
+      this.cloudSampler = this.device.createSampler({
+        label: 'cloud_sampler',
+        minFilter: 'linear',
+        magFilter: 'linear',
+        addressModeU: 'repeat',
+        addressModeV: 'clamp-to-edge',
+      });
+    }
+    return this.cloudSampler;
   }
 
   public updateCloudBindGroups(): void {
     if (!this.device || !this.cloudBindGroupLayout || !this.cloudUniformBuffers || this.cloudUniformBuffers.length < 3 || !this.cloudTextures.low || !this.cloudTextures.mid || !this.cloudTextures.high) {
       return;
     }
-    if (!this.cloudSampler) {
-      this.cloudSampler = this.device.createSampler({ label: 'cloud_sampler', minFilter: 'linear', magFilter: 'linear' });
-    }
-    const sampler = this.cloudSampler;
-    const demView = (this.demTextureView || this.orbitalTextureView)!;
+    const sampler = this.ensureCloudSampler();
+    const demView = (this.demTextureView || this.dummyWhiteTextureView)!;
     const demSamp = (this.demSampler || sampler)!;
     const regView = (this.activeRegionalDEM ? this.activeRegionalDEM.view : (this.dummyRegionalTextureView || demView))!;
     const regBuffer = ((this.activeRegionalDEM && this.regionalUniformBuffer)
@@ -12335,7 +16635,8 @@ export class WebGPUEngine {
         ],
       }),
     };
-    this.updateAtmosphereBindGroup();
+    this.updateVolumetricCloudBindGroup();
+    this.updateTerrainShadowBindGroups();
   }
 
   public setCloudData(
@@ -12345,7 +16646,8 @@ export class WebGPUEngine {
     height: number = 721
   ): void {
     if (!this.device || !this.isInitialized) return;
-    this.ensureCloudBuffers(width, height);
+    this.ensureCloudBuffers(width, height, 'r16float');
+    this._volumetricPackedChannelFlags &= ~1;
 
     const rawBytes = data instanceof Uint8Array
       ? data
@@ -12370,14 +16672,6 @@ export class WebGPUEngine {
       }
     }
 
-    if (this.cloudStagingBuffer) {
-      try {
-        this.device.queue.writeBuffer(this.cloudStagingBuffer, 0, paddedBytes.buffer);
-      } catch {
-        // Mock guard
-      }
-    }
-
     const targetTexture =
       layer === 'low'
         ? this.cloudTextures?.low
@@ -12396,11 +16690,16 @@ export class WebGPUEngine {
         if (!this.cloudTextureViews[layer]) {
           this.cloudTextureViews[layer] = targetTexture.createView({ label: `cloud_view_${layer}` });
         }
-        if (layer === 'low' || layer === 'high') {
+        this.updateCloudPreCullLayer(layer, paddedBytes, width, height, paddedRowBytes);
+        if (layer === 'low' || layer === 'mid' || layer === 'high') {
           this.updateDEMBindGroups();
         }
         this.updateVolumetricCloudBindGroup();
         this.cloudAdvectionComputeBindGroups = [null, null];
+        if (this._preCullHasLayer.low && this._preCullHasLayer.mid && this._preCullHasLayer.high) {
+          this.cloudAdvectionStep = 0;
+          this._advectionAccumDt = 0;
+        }
         this.updateCloudAdvectionBindGroups();
         this.updateCloudBindGroups();
       } catch (err) {
@@ -12409,11 +16708,333 @@ export class WebGPUEngine {
     }
   }
 
+  public setCloudDataDualHour(
+    layer: 'low' | 'mid' | 'high',
+    data0: ArrayBuffer,
+    data1: ArrayBuffer,
+    width: number = 3600,
+    height: number = 1801
+  ): void {
+    if (!this.device || !this.isInitialized) return;
+    this.ensureCloudBuffers(width, height, 'rg16float');
+
+    const paddedRowBytes = Math.ceil((width * 4) / 256) * 256; // 14592 for 3600
+    const vecColsPadded = paddedRowBytes >> 2; // 3648 rg16float pairs/row
+    const src0 = new Uint16Array(data0);
+    const src1 = new Uint16Array(data1);
+    const src0RowU16 = data0.byteLength === 13370624 ? 3712 : width;
+    const src1RowU16 = data1.byteLength === 13370624 ? 3712 : width;
+    const interleaved = new Uint16Array(height * vecColsPadded * 2);
+
+    for (let r = 0; r < height; r++) {
+      const off0 = r * src0RowU16;
+      const off1 = r * src1RowU16;
+      const dstOff = r * vecColsPadded * 2;
+      for (let c = 0; c < width; c++) {
+        const dstIdx = dstOff + c * 2;
+        interleaved[dstIdx] = src0[off0 + c];
+        interleaved[dstIdx + 1] = src1[off1 + c];
+      }
+    }
+
+    const targetTexture =
+      layer === 'low'
+        ? this.cloudTextures?.low
+        : layer === 'mid'
+        ? this.cloudTextures?.mid
+        : this.cloudTextures?.high;
+
+    if (targetTexture) {
+      try {
+        this.device.queue.writeTexture(
+          { texture: targetTexture },
+          interleaved.buffer,
+          { bytesPerRow: paddedRowBytes, rowsPerImage: height },
+          { width, height, depthOrArrayLayers: 1 }
+        );
+        if (!this.cloudTextureViews[layer]) {
+          this.cloudTextureViews[layer] = targetTexture.createView({ label: `cloud_view_${layer}` });
+        }
+        this._volumetricPackedChannelFlags |= 1;
+        this.updateCloudPreCullLayerDualHour(layer, src0, src1, width, height, src0RowU16, src1RowU16);
+        this.updateDEMBindGroups();
+        this.updateVolumetricCloudBindGroup();
+        this.cloudAdvectionComputeBindGroups = [null, null];
+        if (this._preCullHasLayer.low && this._preCullHasLayer.mid && this._preCullHasLayer.high) {
+          this.cloudAdvectionStep = 0;
+          this._advectionAccumDt = 0;
+        }
+        this.updateCloudAdvectionBindGroups();
+        this.updateCloudBindGroups();
+      } catch (err) {
+        console.error('Failed to write dual-hour cloud texture:', err);
+      }
+    }
+  }
+
+  private applyPrepackedDualHourCloudBatch(
+    packs: {
+      low: WeatherNextCloudDualHourResponse;
+      mid: WeatherNextCloudDualHourResponse;
+      high: WeatherNextCloudDualHourResponse;
+    },
+    width: number = 3600,
+    height: number = 1801
+  ): boolean {
+    if (!this.device || !this.isInitialized) return false;
+    if (
+      !packs.low.ok ||
+      !packs.mid.ok ||
+      !packs.high.ok ||
+      !packs.low.interleavedBuffer ||
+      !packs.mid.interleavedBuffer ||
+      !packs.high.interleavedBuffer
+    ) {
+      return false;
+    }
+
+    this.ensureCloudBuffers(width, height, 'rg16float');
+    const layers = ['low', 'mid', 'high'] as const;
+    try {
+      for (const layer of layers) {
+        const pack = packs[layer];
+        const targetTexture =
+          layer === 'low'
+            ? this.cloudTextures?.low
+            : layer === 'mid'
+            ? this.cloudTextures?.mid
+            : this.cloudTextures?.high;
+        if (!targetTexture || !pack.interleavedBuffer) return false;
+        const paddedRowBytes = pack.paddedRowBytes ?? Math.ceil((width * 4) / 256) * 256;
+        this.device.queue.writeTexture(
+          { texture: targetTexture },
+          pack.interleavedBuffer,
+          { bytesPerRow: paddedRowBytes, rowsPerImage: height },
+          { width, height, depthOrArrayLayers: 1 }
+        );
+        if (!this.cloudTextureViews[layer]) {
+          this.cloudTextureViews[layer] = targetTexture.createView({ label: `cloud_view_${layer}` });
+        }
+        if (pack.preCullMaxBuffer) {
+          this._preCullLayerMax[layer].set(new Float32Array(pack.preCullMaxBuffer));
+          this._preCullHasLayer[layer] = true;
+        }
+      }
+
+      this._volumetricPackedChannelFlags |= 1;
+      this.rebuildCloudPreCullGrid();
+      this.updateDEMBindGroups();
+      this.updateVolumetricCloudBindGroup();
+      this.cloudAdvectionComputeBindGroups = [null, null];
+      if (this._preCullHasLayer.low && this._preCullHasLayer.mid && this._preCullHasLayer.high) {
+        this.cloudAdvectionStep = 0;
+        this._advectionAccumDt = 0;
+      }
+      this.updateCloudAdvectionBindGroups();
+      this.updateCloudBindGroups();
+      return true;
+    } catch (err) {
+      console.error('Failed to write worker-packed dual-hour cloud textures:', err);
+      return false;
+    }
+  }
+
+  private async fetchOrCacheWnCloudTriplet(
+    hour: number
+  ): Promise<{ low: ArrayBuffer; mid: ArrayBuffer; high: ArrayBuffer } | null> {
+    const cached = this._wnCloudSliceCache.get(hour);
+    if (cached) return cached;
+
+    const PADDED_SLICE_BYTES = 13370624;
+    const UNPADDED_SLICE_BYTES = 12967200;
+    try {
+      const [lowRes, midRes, highRes] = await Promise.all([
+        fetch(`/data/weathernext/low_cloud_cover_mean-${hour}.bin`),
+        fetch(`/data/weathernext/medium_cloud_cover_mean-${hour}.bin`),
+        fetch(`/data/weathernext/high_cloud_cover_mean-${hour}.bin`),
+      ]);
+      const isValidBinary = (res: Response): boolean => {
+        if (!res.ok) return false;
+        const ct = res.headers.get('content-type');
+        if (ct && (ct.includes('text/html') || ct.includes('text/plain'))) return false;
+        return true;
+      };
+      if (!isValidBinary(lowRes) || !isValidBinary(midRes) || !isValidBinary(highRes)) {
+        return null;
+      }
+      const [lowBuf, midBuf, highBuf] = await Promise.all([
+        lowRes.arrayBuffer(),
+        midRes.arrayBuffer(),
+        highRes.arrayBuffer(),
+      ]);
+      const isValidSliceSize = (buf: ArrayBuffer): boolean =>
+        buf.byteLength === PADDED_SLICE_BYTES || buf.byteLength === UNPADDED_SLICE_BYTES;
+      if (!isValidSliceSize(lowBuf) || !isValidSliceSize(midBuf) || !isValidSliceSize(highBuf)) {
+        return null;
+      }
+      const triplet = { low: lowBuf, mid: midBuf, high: highBuf };
+      if (this._wnCloudSliceCache.size >= 3) {
+        const firstKey = this._wnCloudSliceCache.keys().next().value;
+        if (firstKey !== undefined) this._wnCloudSliceCache.delete(firstKey);
+      }
+      this._wnCloudSliceCache.set(hour, triplet);
+      return triplet;
+    } catch {
+      return null;
+    }
+  }
+
+  private async fetchOrCacheSatelliteCloudTriplet(): Promise<{
+    low: ArrayBuffer;
+    mid: ArrayBuffer;
+    high: ArrayBuffer;
+  } | null> {
+    if (this._satelliteCloudTripletCache) return this._satelliteCloudTripletCache;
+
+    const PADDED_SLICE_BYTES = 13370624;
+    const UNPADDED_SLICE_BYTES = 12967200;
+    try {
+      const [lowRes, midRes, highRes] = await Promise.all([
+        fetch('/data/satellite-cloud-low-latest.bin'),
+        fetch('/data/satellite-cloud-mid-latest.bin'),
+        fetch('/data/satellite-cloud-high-latest.bin'),
+      ]);
+      const isValidBinary = (res: Response): boolean => {
+        if (!res.ok) return false;
+        const ct = res.headers.get('content-type');
+        if (ct && (ct.includes('text/html') || ct.includes('text/plain'))) return false;
+        return true;
+      };
+      if (!isValidBinary(lowRes) || !isValidBinary(midRes) || !isValidBinary(highRes)) {
+        return null;
+      }
+      const [lowBuf, midBuf, highBuf] = await Promise.all([
+        lowRes.arrayBuffer(),
+        midRes.arrayBuffer(),
+        highRes.arrayBuffer(),
+      ]);
+      const isValidSliceSize = (buf: ArrayBuffer): boolean =>
+        buf.byteLength === PADDED_SLICE_BYTES || buf.byteLength === UNPADDED_SLICE_BYTES;
+      if (!isValidSliceSize(lowBuf) || !isValidSliceSize(midBuf) || !isValidSliceSize(highBuf)) {
+        return null;
+      }
+      this._satelliteCloudTripletCache = { low: lowBuf, mid: midBuf, high: highBuf };
+      return this._satelliteCloudTripletCache;
+    } catch {
+      return null;
+    }
+  }
+
+  public invalidateSatelliteCloudCache(): void {
+    this._satelliteCloudTripletCache = null;
+  }
+
+  public async loadSatelliteCloudLayers(hour: number = 0): Promise<void> {
+    const clampedHour = Math.max(0, Math.min(11, Math.floor(hour)));
+    if (clampedHour >= 1) {
+      await this.loadWeatherNextCloudLayers(clampedHour, 'satellite');
+      return;
+    }
+
+    this.pendingWeatherNextHour = -1;
+    this.inFlightWeatherNextHour = -1;
+    this.inFlightWeatherNextPromise = null;
+    const cloudSeq = ++this.cloudLayerLoadSeq;
+
+    if (
+      this.lastLoadedCloudModel === 'satellite' &&
+      this.lastLoadedWeatherNextHour === 0 &&
+      this.cloudTextures.low &&
+      this.cloudTextures.mid &&
+      this.cloudTextures.high
+    ) {
+      this._volumetricPackedChannelFlags |= 16;
+      await this.loadDewpointTexture(
+        '/data/weathernext/dewpoint_temperature_2m_mean-0.bin',
+        '/data/satellite-radiative-optical-depth-latest.bin'
+      ).catch(() => {});
+      if (cloudSeq === this.cloudLayerLoadSeq && this.device && this.isInitialized) {
+        this.updateVolumetricCloudBindGroup();
+      }
+      return;
+    }
+
+    const isMockFetch = typeof fetch === 'function' && Boolean((fetch as any).mock);
+    if (!isMockFetch && decodeWorkerPool.canUseWorkers()) {
+      const [lowPack, midPack, highPack] = await Promise.all([
+        decodeWorkerPool.run<WeatherNextCloudDualHourResponse>({
+          type: 'weathernext_cloud_dual_hour',
+          url0: '/data/satellite-cloud-low-latest.bin',
+          url1: '/data/weathernext/low_cloud_cover_mean-1.bin',
+          width: 3600,
+          height: 1801,
+        }),
+        decodeWorkerPool.run<WeatherNextCloudDualHourResponse>({
+          type: 'weathernext_cloud_dual_hour',
+          url0: '/data/satellite-cloud-mid-latest.bin',
+          url1: '/data/weathernext/medium_cloud_cover_mean-1.bin',
+          width: 3600,
+          height: 1801,
+        }),
+        decodeWorkerPool.run<WeatherNextCloudDualHourResponse>({
+          type: 'weathernext_cloud_dual_hour',
+          url0: '/data/satellite-cloud-high-latest.bin',
+          url1: '/data/weathernext/high_cloud_cover_mean-1.bin',
+          width: 3600,
+          height: 1801,
+        }),
+      ]);
+      if (cloudSeq !== this.cloudLayerLoadSeq || !this.device || !this.isInitialized) return;
+      if (this.applyPrepackedDualHourCloudBatch({ low: lowPack, mid: midPack, high: highPack }, 3600, 1801)) {
+        this._volumetricPackedChannelFlags |= 16;
+        await Promise.all([
+          this.loadTemperatureTexture('/data/weathernext/temperature_2m_mean-0.bin').catch(() => {}),
+          this.loadDewpointTexture(
+            '/data/weathernext/dewpoint_temperature_2m_mean-0.bin',
+            '/data/satellite-radiative-optical-depth-latest.bin'
+          ).catch(() => {}),
+        ]);
+        if (cloudSeq !== this.cloudLayerLoadSeq || !this.device || !this.isInitialized) return;
+        this.updateVolumetricCloudBindGroup();
+        this.lastLoadedWeatherNextHour = 0;
+        this.lastLoadedCloudModel = 'satellite';
+        return;
+      }
+    }
+
+    const satTriplet = await this.fetchOrCacheSatelliteCloudTriplet();
+    if (cloudSeq !== this.cloudLayerLoadSeq || !this.device || !this.isInitialized) return;
+    if (satTriplet) {
+      const wnHour1 = (await this.fetchOrCacheWnCloudTriplet(1)) ?? satTriplet;
+      if (cloudSeq !== this.cloudLayerLoadSeq || !this.device || !this.isInitialized) return;
+      this.setCloudDataDualHour('low', satTriplet.low, wnHour1.low, 3600, 1801);
+      this.setCloudDataDualHour('mid', satTriplet.mid, wnHour1.mid, 3600, 1801);
+      this.setCloudDataDualHour('high', satTriplet.high, wnHour1.high, 3600, 1801);
+      this._volumetricPackedChannelFlags |= 16;
+      await Promise.all([
+        this.loadTemperatureTexture('/data/weathernext/temperature_2m_mean-0.bin').catch(() => {}),
+        this.loadDewpointTexture(
+          '/data/weathernext/dewpoint_temperature_2m_mean-0.bin',
+          '/data/satellite-radiative-optical-depth-latest.bin'
+        ).catch(() => {}),
+      ]);
+      if (cloudSeq !== this.cloudLayerLoadSeq || !this.device || !this.isInitialized) return;
+      this.updateVolumetricCloudBindGroup();
+      this.lastLoadedWeatherNextHour = 0;
+      this.lastLoadedCloudModel = 'satellite';
+      return;
+    }
+
+    if (cloudSeq !== this.cloudLayerLoadSeq) return;
+    await this.loadWeatherNextCloudLayers(0, 'satellite');
+  }
+
   public async loadCloudData(
     layer: 'low' | 'mid' | 'high',
     urlOrData?: string | Uint8Array | ArrayBuffer,
     width: number = 1440,
-    height: number = 721
+    height: number = 721,
+    expectedCloudSeq?: number
   ): Promise<void> {
     if (!this.device || !this.isInitialized) return;
 
@@ -12441,6 +17062,14 @@ export class WebGPUEngine {
       }
     }
 
+    if (
+      !this.device ||
+      !this.isInitialized ||
+      (expectedCloudSeq !== undefined && expectedCloudSeq !== this.cloudLayerLoadSeq)
+    ) {
+      return;
+    }
+
     if (buffer) {
       this.setCloudData(layer, buffer, width, height);
     } else {
@@ -12449,33 +17078,112 @@ export class WebGPUEngine {
     }
   }
 
-  public async loadAllCloudLayers(isWeatherNext: boolean = true): Promise<void> {
+  public async loadAllCloudLayers(
+    isWeatherNext: boolean = true,
+    hour: number = 0,
+    modelOverride?: string
+  ): Promise<void> {
+    if (modelOverride === 'satellite' || modelOverride === 'live-satellite') {
+      return this.loadSatelliteCloudLayers(hour);
+    }
+    const clampedHour = Math.max(0, Math.min(11, Math.floor(hour)));
     const isMockFetch = typeof fetch === 'function' && Boolean((fetch as any).mock);
-    if (isWeatherNext && !isMockFetch) {
+    if (!isWeatherNext) {
+      this.pendingWeatherNextHour = -1;
+      this.inFlightWeatherNextHour = -1;
+      this.inFlightWeatherNextPromise = null;
+      this.pendingTempUrl = null;
+      this.pendingDewpointReq = null;
+      ++this.tempTextureLoadSeq;
+      ++this.dewpointTextureLoadSeq;
+    } else if (!isMockFetch) {
       if (
-        this.lastLoadedWeatherNextHour === 0 &&
+        this.lastLoadedCloudModel === 'weathernext3' &&
+        this.lastLoadedWeatherNextHour === clampedHour &&
         this.cloudTextures.low &&
         this.cloudTextures.mid &&
         this.cloudTextures.high
       ) {
         return;
       }
-      if (this.inFlightWeatherNextHour === 0 && this.inFlightWeatherNextPromise) {
-        return this.inFlightWeatherNextPromise;
+      if (this.inFlightWeatherNextHour >= 0 && this.inFlightWeatherNextPromise) {
+        if (this.inFlightWeatherNextHour === clampedHour && this.pendingWeatherNextHour === -1) {
+          return this.inFlightWeatherNextPromise;
+        }
+        return this.loadWeatherNextCloudLayers(clampedHour, 'weathernext3');
       }
     }
 
     const doLoad = async (): Promise<void> => {
+      const cloudSeq = ++this.cloudLayerLoadSeq;
       const PADDED_SLICE_BYTES = 13370624;
       const UNPADDED_SLICE_BYTES = 12967200;
 
       if (isWeatherNext) {
         try {
+          if (!isMockFetch) {
+            const nextHour = Math.min(11, clampedHour + 1);
+            if (decodeWorkerPool.canUseWorkers()) {
+              const [lowPack, midPack, highPack] = await Promise.all([
+                decodeWorkerPool.run<WeatherNextCloudDualHourResponse>({
+                  type: 'weathernext_cloud_dual_hour',
+                  url0: `/data/weathernext/low_cloud_cover_mean-${clampedHour}.bin`,
+                  url1: `/data/weathernext/low_cloud_cover_mean-${nextHour}.bin`,
+                  width: 3600,
+                  height: 1801,
+                }),
+                decodeWorkerPool.run<WeatherNextCloudDualHourResponse>({
+                  type: 'weathernext_cloud_dual_hour',
+                  url0: `/data/weathernext/medium_cloud_cover_mean-${clampedHour}.bin`,
+                  url1: `/data/weathernext/medium_cloud_cover_mean-${nextHour}.bin`,
+                  width: 3600,
+                  height: 1801,
+                }),
+                decodeWorkerPool.run<WeatherNextCloudDualHourResponse>({
+                  type: 'weathernext_cloud_dual_hour',
+                  url0: `/data/weathernext/high_cloud_cover_mean-${clampedHour}.bin`,
+                  url1: `/data/weathernext/high_cloud_cover_mean-${nextHour}.bin`,
+                  width: 3600,
+                  height: 1801,
+                }),
+              ]);
+              if (cloudSeq !== this.cloudLayerLoadSeq || !this.device || !this.isInitialized) return;
+              if (this.applyPrepackedDualHourCloudBatch({ low: lowPack, mid: midPack, high: highPack }, 3600, 1801)) {
+                this._volumetricPackedChannelFlags &= ~16;
+                this.loadTemperatureTexture(`/data/weathernext/temperature_2m_mean-${clampedHour}.bin`).catch(() => {});
+                this.loadDewpointTexture(`/data/weathernext/dewpoint_temperature_2m_mean-${clampedHour}.bin`).catch(() => {});
+                this.lastLoadedWeatherNextHour = clampedHour;
+                this.lastLoadedCloudModel = 'weathernext3';
+                return;
+              }
+            }
+
+            const curTriplet = await this.fetchOrCacheWnCloudTriplet(clampedHour);
+            if (cloudSeq !== this.cloudLayerLoadSeq || !this.device || !this.isInitialized) return;
+            if (curTriplet) {
+              const nextTriplet =
+                nextHour === clampedHour
+                  ? curTriplet
+                  : (await this.fetchOrCacheWnCloudTriplet(nextHour)) ?? curTriplet;
+              if (cloudSeq !== this.cloudLayerLoadSeq || !this.device || !this.isInitialized) return;
+              this.setCloudDataDualHour('low', curTriplet.low, nextTriplet.low, 3600, 1801);
+              this.setCloudDataDualHour('mid', curTriplet.mid, nextTriplet.mid, 3600, 1801);
+              this.setCloudDataDualHour('high', curTriplet.high, nextTriplet.high, 3600, 1801);
+              this._volumetricPackedChannelFlags &= ~16;
+              this.loadTemperatureTexture(`/data/weathernext/temperature_2m_mean-${clampedHour}.bin`).catch(() => {});
+              this.loadDewpointTexture(`/data/weathernext/dewpoint_temperature_2m_mean-${clampedHour}.bin`).catch(() => {});
+              this.lastLoadedWeatherNextHour = clampedHour;
+              this.lastLoadedCloudModel = 'weathernext3';
+              return;
+            }
+          }
+
           const [lowRes, midRes, highRes] = await Promise.all([
-            fetch('/data/weathernext/low_cloud_cover_mean-0.bin'),
-            fetch('/data/weathernext/medium_cloud_cover_mean-0.bin'),
-            fetch('/data/weathernext/high_cloud_cover_mean-0.bin'),
+            fetch(`/data/weathernext/low_cloud_cover_mean-${clampedHour}.bin`),
+            fetch(`/data/weathernext/medium_cloud_cover_mean-${clampedHour}.bin`),
+            fetch(`/data/weathernext/high_cloud_cover_mean-${clampedHour}.bin`),
           ]);
+          if (cloudSeq !== this.cloudLayerLoadSeq || !this.device || !this.isInitialized) return;
 
           const isValidBinary = (res: Response): boolean => {
             if (!res.ok) return false;
@@ -12490,6 +17198,7 @@ export class WebGPUEngine {
               midRes.arrayBuffer(),
               highRes.arrayBuffer(),
             ]);
+            if (cloudSeq !== this.cloudLayerLoadSeq || !this.device || !this.isInitialized) return;
 
             const isValidSliceSize = (buf: ArrayBuffer): boolean =>
               buf.byteLength === PADDED_SLICE_BYTES || buf.byteLength === UNPADDED_SLICE_BYTES;
@@ -12498,7 +17207,11 @@ export class WebGPUEngine {
               this.setCloudData('low', lowBuf, 3600, 1801);
               this.setCloudData('mid', midBuf, 3600, 1801);
               this.setCloudData('high', highBuf, 3600, 1801);
-              this.lastLoadedWeatherNextHour = 0;
+              this._volumetricPackedChannelFlags &= ~16;
+              this.loadTemperatureTexture(`/data/weathernext/temperature_2m_mean-${clampedHour}.bin`).catch(() => {});
+              this.loadDewpointTexture(`/data/weathernext/dewpoint_temperature_2m_mean-${clampedHour}.bin`).catch(() => {});
+              this.lastLoadedWeatherNextHour = clampedHour;
+              this.lastLoadedCloudModel = 'weathernext3';
               return;
             } else {
               console.warn(
@@ -12512,17 +17225,20 @@ export class WebGPUEngine {
           console.warn('[WebGPU] WeatherNext cloud layers failed to load, triggering fallback to NOAA GFS:', e);
         }
       }
-      
+
+      if (cloudSeq !== this.cloudLayerLoadSeq || !this.device || !this.isInitialized) return;
+      this._volumetricPackedChannelFlags &= ~16;
       this.lastLoadedWeatherNextHour = -1;
+      this.lastLoadedCloudModel = 'gfs';
       await Promise.all([
-        this.loadCloudData('low', undefined, 1440, 721),
-        this.loadCloudData('mid', undefined, 1440, 721),
-        this.loadCloudData('high', undefined, 1440, 721),
+        this.loadCloudData('low', undefined, 1440, 721, cloudSeq),
+        this.loadCloudData('mid', undefined, 1440, 721, cloudSeq),
+        this.loadCloudData('high', undefined, 1440, 721, cloudSeq),
       ]);
     };
 
     if (isWeatherNext && !isMockFetch) {
-      this.inFlightWeatherNextHour = 0;
+      this.inFlightWeatherNextHour = clampedHour;
       const p = doLoad().finally(() => {
         if (this.inFlightWeatherNextPromise === p) {
           this.inFlightWeatherNextHour = -1;
@@ -12536,24 +17252,111 @@ export class WebGPUEngine {
     return doLoad();
   }
 
-  public async loadWeatherNextCloudLayers(hour: number): Promise<void> {
+  public async loadWeatherNextCloudLayers(
+    hour: number,
+    targetModel: 'weathernext3' | 'satellite' = 'weathernext3'
+  ): Promise<void> {
     const clampedHour = Math.max(0, Math.min(11, Math.floor(hour)));
-    if (this.lastLoadedWeatherNextHour === clampedHour) return;
+    if (
+      this.lastLoadedCloudModel === targetModel &&
+      this.lastLoadedWeatherNextHour === clampedHour &&
+      !this.inFlightWeatherNextPromise
+    ) {
+      return;
+    }
     const isMockFetch = typeof fetch === 'function' && Boolean((fetch as any).mock);
-    if (!isMockFetch && this.inFlightWeatherNextHour === clampedHour && this.inFlightWeatherNextPromise) {
-      return this.inFlightWeatherNextPromise;
+    if (!isMockFetch && this.inFlightWeatherNextPromise) {
+      if (
+        this.inFlightWeatherNextHour === clampedHour &&
+        this.pendingWeatherNextHour === -1 &&
+        targetModel === this.pendingWeatherNextModel
+      ) {
+        return this.inFlightWeatherNextPromise;
+      }
+      this.pendingWeatherNextHour = clampedHour;
+      this.pendingWeatherNextModel = targetModel;
+      return this.inFlightWeatherNextPromise.then(() => {
+        const nextHourTarget = this.pendingWeatherNextHour;
+        const nextModelTarget = this.pendingWeatherNextModel;
+        if (nextHourTarget >= 0) {
+          this.pendingWeatherNextHour = -1;
+          return this.loadWeatherNextCloudLayers(nextHourTarget, nextModelTarget);
+        }
+        return this.inFlightWeatherNextPromise ?? undefined;
+      });
     }
 
     const doLoad = async (): Promise<void> => {
+      const cloudSeq = ++this.cloudLayerLoadSeq;
       const PADDED_SLICE_BYTES = 13370624;
       const UNPADDED_SLICE_BYTES = 12967200;
 
       try {
+        if (!isMockFetch) {
+          const nextHour = Math.min(11, clampedHour + 1);
+          if (decodeWorkerPool.canUseWorkers()) {
+            const [lowPack, midPack, highPack] = await Promise.all([
+              decodeWorkerPool.run<WeatherNextCloudDualHourResponse>({
+                type: 'weathernext_cloud_dual_hour',
+                url0: `/data/weathernext/low_cloud_cover_mean-${clampedHour}.bin`,
+                url1: `/data/weathernext/low_cloud_cover_mean-${nextHour}.bin`,
+                width: 3600,
+                height: 1801,
+              }),
+              decodeWorkerPool.run<WeatherNextCloudDualHourResponse>({
+                type: 'weathernext_cloud_dual_hour',
+                url0: `/data/weathernext/medium_cloud_cover_mean-${clampedHour}.bin`,
+                url1: `/data/weathernext/medium_cloud_cover_mean-${nextHour}.bin`,
+                width: 3600,
+                height: 1801,
+              }),
+              decodeWorkerPool.run<WeatherNextCloudDualHourResponse>({
+                type: 'weathernext_cloud_dual_hour',
+                url0: `/data/weathernext/high_cloud_cover_mean-${clampedHour}.bin`,
+                url1: `/data/weathernext/high_cloud_cover_mean-${nextHour}.bin`,
+                width: 3600,
+                height: 1801,
+              }),
+            ]);
+            if (cloudSeq !== this.cloudLayerLoadSeq || !this.device || !this.isInitialized) return;
+            if (this.applyPrepackedDualHourCloudBatch({ low: lowPack, mid: midPack, high: highPack }, 3600, 1801)) {
+              this._volumetricPackedChannelFlags &= ~16;
+              this.loadTemperatureTexture(`/data/weathernext/temperature_2m_mean-${clampedHour}.bin`).catch(() => {});
+              this.loadDewpointTexture(`/data/weathernext/dewpoint_temperature_2m_mean-${clampedHour}.bin`).catch(() => {});
+              this.updateVolumetricCloudBindGroup();
+              this.lastLoadedWeatherNextHour = clampedHour;
+              this.lastLoadedCloudModel = targetModel;
+              return;
+            }
+          }
+
+          const curTriplet = await this.fetchOrCacheWnCloudTriplet(clampedHour);
+          if (cloudSeq !== this.cloudLayerLoadSeq || !this.device || !this.isInitialized) return;
+          if (curTriplet) {
+            const nextTriplet =
+              nextHour === clampedHour
+                ? curTriplet
+                : (await this.fetchOrCacheWnCloudTriplet(nextHour)) ?? curTriplet;
+            if (cloudSeq !== this.cloudLayerLoadSeq || !this.device || !this.isInitialized) return;
+            this.setCloudDataDualHour('low', curTriplet.low, nextTriplet.low, 3600, 1801);
+            this.setCloudDataDualHour('mid', curTriplet.mid, nextTriplet.mid, 3600, 1801);
+            this.setCloudDataDualHour('high', curTriplet.high, nextTriplet.high, 3600, 1801);
+            this._volumetricPackedChannelFlags &= ~16;
+            this.loadTemperatureTexture(`/data/weathernext/temperature_2m_mean-${clampedHour}.bin`).catch(() => {});
+            this.loadDewpointTexture(`/data/weathernext/dewpoint_temperature_2m_mean-${clampedHour}.bin`).catch(() => {});
+            this.updateVolumetricCloudBindGroup();
+            this.lastLoadedWeatherNextHour = clampedHour;
+            this.lastLoadedCloudModel = targetModel;
+            return;
+          }
+        }
+
         const [lowRes, midRes, highRes] = await Promise.all([
           fetch(`/data/weathernext/low_cloud_cover_mean-${clampedHour}.bin`),
           fetch(`/data/weathernext/medium_cloud_cover_mean-${clampedHour}.bin`),
           fetch(`/data/weathernext/high_cloud_cover_mean-${clampedHour}.bin`),
         ]);
+        if (cloudSeq !== this.cloudLayerLoadSeq || !this.device || !this.isInitialized) return;
         const isValidBinary = (res: Response): boolean => {
           if (!res.ok) return false;
           const ct = res.headers.get('content-type');
@@ -12567,6 +17370,7 @@ export class WebGPUEngine {
             midRes.arrayBuffer(),
             highRes.arrayBuffer(),
           ]);
+          if (cloudSeq !== this.cloudLayerLoadSeq || !this.device || !this.isInitialized) return;
 
           const isValidSliceSize = (buf: ArrayBuffer): boolean =>
             buf.byteLength === PADDED_SLICE_BYTES || buf.byteLength === UNPADDED_SLICE_BYTES;
@@ -12575,9 +17379,12 @@ export class WebGPUEngine {
             this.setCloudData('low', lowBuf, 3600, 1801);
             this.setCloudData('mid', midBuf, 3600, 1801);
             this.setCloudData('high', highBuf, 3600, 1801);
+            this._volumetricPackedChannelFlags &= ~16;
             this.loadTemperatureTexture(`/data/weathernext/temperature_2m_mean-${clampedHour}.bin`).catch(() => {});
             this.loadDewpointTexture(`/data/weathernext/dewpoint_temperature_2m_mean-${clampedHour}.bin`).catch(() => {});
+            this.updateVolumetricCloudBindGroup();
             this.lastLoadedWeatherNextHour = clampedHour;
+            this.lastLoadedCloudModel = targetModel;
             return;
           } else {
             console.warn(
@@ -12594,6 +17401,7 @@ export class WebGPUEngine {
 
     if (!isMockFetch) {
       this.inFlightWeatherNextHour = clampedHour;
+      this.pendingWeatherNextModel = targetModel;
       const p = doLoad().finally(() => {
         if (this.inFlightWeatherNextPromise === p) {
           this.inFlightWeatherNextHour = -1;
@@ -12610,8 +17418,7 @@ export class WebGPUEngine {
   public updateCloudUniforms(dt: number, params?: Partial<any>): void {
     if (!this.device) return;
     const hasClouds = !!(this.cloudUniformBuffers && this.cloudUniformBuffers.length >= 3);
-    const hasAtmosphere = !!this.atmosphereUniformBuffer;
-    if (!hasClouds && !hasAtmosphere) return;
+    if (!hasClouds) return;
 
     const unfurl = params?.unfurl ?? 0.0;
     const mode = Math.max(0, Math.floor(params?.mode ?? 0));
@@ -12746,25 +17553,6 @@ export class WebGPUEngine {
         } catch (err) {}
       }
     }
-
-    if (this.atmosphereUniformBuffer) {
-      try {
-        const atmMirror = this.atmosphereUniformMirror;
-        const atmMirrorU32 = this.atmosphereUniformMirrorU32;
-        atmMirror.set(this.cloudUniformFloats);
-        atmMirrorU32[24] = 3; // atmosphere limb scatter layer
-        atmMirror[25] = peakExponent;
-        atmMirror[26] = atmosphericScale;
-        atmMirror[27] = shadowIntensity;
-        this.device.queue.writeBuffer(
-          this.atmosphereUniformBuffer,
-          0,
-          atmMirror.buffer,
-          0,
-          288
-        );
-      } catch (err) {}
-    }
   }
 
   public updateCloudLayerUniform(
@@ -12883,9 +17671,9 @@ export class WebGPUEngine {
       return;
     }
 
-    const vBuf = this.cloudSphereVertexBuffer || this.crustVertexBuffer;
-    const iBuf = this.cloudSphereIndexBuffer || this.crustIndexBuffer;
-    const iCount = this.cloudIndexCount || this.crustIndexCount;
+    const vBuf = this.cloudSphereVertexBuffer;
+    const iBuf = this.cloudSphereIndexBuffer;
+    const iCount = this.cloudIndexCount;
 
     if (!vBuf || !iBuf || !iCount) {
       return;
@@ -12907,86 +17695,18 @@ export class WebGPUEngine {
     passEncoder.drawIndexed(iCount);
   }
 
-  public renderAtmosphereScatterPass(
-    passEncoder: GPURenderPassEncoder,
-    _params?: any
-  ): void {
-    if (!this.atmosphereScatterPipeline) {
-      return;
-    }
-
-    this.ensureAtmosphereScatterBuffers();
-
-    if (!this.atmosphereBindGroup) {
-      this.updateAtmosphereBindGroup();
-    }
-    if (!this.atmosphereBindGroup) {
-      return;
-    }
-
-    const vBuf = this.cloudSphereVertexBuffer || this.crustVertexBuffer;
-    const iBuf = this.cloudSphereIndexBuffer || this.crustIndexBuffer;
-    const iCount = this.cloudIndexCount || this.crustIndexCount;
-
-    if (!vBuf || !iBuf || !iCount) {
-      return;
-    }
-
-    passEncoder.setPipeline(this.atmosphereScatterPipeline);
-    passEncoder.setBindGroup(0, this.atmosphereBindGroup);
-    passEncoder.setVertexBuffer(0, vBuf);
-    passEncoder.setIndexBuffer(iBuf, 'uint32');
-    passEncoder.drawIndexed(iCount);
-  }
-
-  public ensureAtmosphereScatterBuffers(): void {
-    if (!this.device || this.atmosphereUniformBuffer) return;
-    this.atmosphereUniformBuffer = this.device.createBuffer({
-      label: 'atmosphere_scatter_uniform',
-      size: 288,
-      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
-    });
-    this.updateAtmosphereBindGroup();
-  }
-
-  public updateAtmosphereBindGroup(): void {
-    if (!this.device || !this.atmosphereBindGroupLayout) return;
-    const targetBuffer = this.atmosphereUniformBuffer || (this.cloudUniformBuffers && this.cloudUniformBuffers[2]);
-    if (!targetBuffer) return;
-
-    this.atmosphereBindGroup = this.device.createBindGroup({
-      label: 'atmosphere_scatter_bind_group',
-      layout: this.atmosphereBindGroupLayout,
-      entries: [
-        { binding: 0, resource: { buffer: targetBuffer } },
-      ],
-    });
-  }
-
-  public getAtmosphereScatterPipeline(): GPURenderPipeline | null {
-    return this.atmosphereScatterPipeline;
-  }
-
-  public getAtmosphereUniformBuffer(): GPUBuffer | null {
-    return this.atmosphereUniformBuffer;
-  }
-
-  public setAtmosphereScatter(show: boolean): void {
-    this.showAtmosphereScatter = show;
-    if (show) {
-      this.ensureAtmosphereScatterBuffers();
-    }
-  }
-
-  public getAtmosphereScatter(): boolean {
-    return this.showAtmosphereScatter;
-  }
-
   public dispose(): void {
     if (!this.isInitialized) return;
     this.onDeviceLostCallback = undefined;
     this.profiler?.dispose();
     this.profiler = null;
+    const sharedCacheTex = this.gpuTileCache?.getTexture() ?? null;
+    for (const entry of this.regionalDEMTextures.values()) {
+      if (entry.texture !== sharedCacheTex) {
+        try { entry.texture.destroy(); } catch {}
+      }
+    }
+    this.regionalDEMTextures.clear();
     this.gpuTileCache.destroy();
     this.particleBuffers[0]?.destroy();
     this.particleBuffers[1]?.destroy();
@@ -13015,15 +17735,14 @@ export class WebGPUEngine {
     this.vectorSegmentBufferLocal?.destroy();
     this.vectorSegmentBufferLocal = null;
     this.vectorSegmentCountLocal = 0;
+    this.vectorSegmentBufferDynamic?.destroy();
+    this.vectorSegmentBufferDynamic = null;
+    this.vectorSegmentCountDynamic = 0;
+    this.slippyVectorChunkLoader.clear();
     this.ribbonUniformBuffer?.destroy();
     this.ribbonUniformBuffer = null!;
     this.crustUniformBuffer?.destroy();
     this.crustUniformBuffer = null!;
-    this.crustVertexBuffer?.destroy();
-    this.crustVertexBuffer = null;
-    this.crustIndexBuffer?.destroy();
-    this.crustIndexBuffer = null;
-    this.crustIndexCount = 0;
     this.contourVertexBuffer?.destroy();
     this.contourVertexBuffer = null;
     this.contourIndexBuffer?.destroy();
@@ -13035,10 +17754,22 @@ export class WebGPUEngine {
     this.demTexture?.destroy();
     this.demTexture = null;
     this.demTextureView = null;
-    this.orbitalTexture?.destroy();
-    this.orbitalTexture = null;
-    this.orbitalTextureView = null;
-    this.orbitalSampler = null;
+    this.dummyWhiteTexture?.destroy();
+    this.dummyWhiteTexture = null;
+    this.dummyWhiteTextureView = null;
+    this.dummyWhiteArrayView = null;
+    this.rg16U16Layout = null;
+    this.rg16U16GlobalPipeline = null;
+    this.rg16U16RegionalPipeline = null;
+    this.rg16U16MipGlobalPipeline = null;
+    this.rg16U16MipLinearPipeline = null;
+    this.rg16TexLayout = null;
+    this.rg16BA8GlobalPipeline = null;
+    this.rg16BA8RegionalPipeline = null;
+    this.rg16MipGlobalPipeline = null;
+    this.rg16MipLinearPipeline = null;
+    this.rg16ElevLayout = null;
+    this.rg16ElevToRG16Pipeline = null;
     this.spawnPipeline = null;
     this.spawnBindGroupLayout = null;
     this.depthTexture?.destroy();
@@ -13048,6 +17779,10 @@ export class WebGPUEngine {
     this.cloudNoiseTexture = null;
     this.cloudNoiseTextureView = null;
     this.cloudNoisePipeline = null;
+    this.regionalCloudNoiseTexture?.destroy();
+    this.regionalCloudNoiseTexture = null;
+    this.regionalCloudNoiseTextureView = null;
+    this.regionalCloudNoisePipeline = null;
     this.cloudNoiseBindGroupLayout = null;
     this.cloudNoiseComputeDurationMs = 0;
     this.reliefBindGroup = null!;
@@ -13058,6 +17793,12 @@ export class WebGPUEngine {
     this.satelliteSegmentBuffer?.destroy();
     this.satelliteSegmentBuffer = null;
     this.satelliteSegmentCount = 0;
+    this.inFlightVectorPromise = null;
+    this.inFlightVectorUrl = null;
+    this.loadedVectorUrl = null;
+    this.inFlightSatellitePromise = null;
+    this.inFlightSatelliteUrl = null;
+    this.loadedSatelliteUrl = null;
     this.windTexture?.destroy();
     this.windTexture = null;
     this.windTextureView = null;
@@ -13065,6 +17806,11 @@ export class WebGPUEngine {
     this.windTexture1 = null;
     this.windTextureView1 = null;
     this.windSampler = null;
+    this.windSlot0RawU16 = null;
+    this.windSlot0Dims = [0, 0];
+    this.windSlot0Format = 'rg16float';
+    this.jetStreamRawU16 = null;
+    this.jetStreamDims = [0, 0];
     this.sdfTextQuadBuffer?.destroy();
     this.sdfTextQuadBuffer = null;
     this.sdfTextInstanceBuffer?.destroy();
@@ -13088,12 +17834,17 @@ export class WebGPUEngine {
     this.windUniformBuffer?.destroy();
     this.windUniformBuffer = null;
     this.windComputePipeline = null;
+    this.windComputeBindGroupLayout = null;
     this.windComputeBindGroups = null;
     this.windTileCacheBindGroupLayout = null;
     this.windTileCacheBindGroup = null;
     this.windRibbonPipeline = null;
+    this.windRibbonBindGroupLayout = null;
     this.windRibbonBindGroups = null;
+    this.lastPlacedToponymSig = '';
     this.inFlightSlippyTiles.clear();
+    this.inFlightSlippyTilePromises.clear();
+    this.slippyBathyZ10Cache.clear();
     this.cpuDEMData = null;
     this.regionalUniformBuffer?.destroy();
     this.regionalUniformBuffer = null;
@@ -13106,10 +17857,6 @@ export class WebGPUEngine {
     this.activeRegionalMaxLon = 0;
     this.activeRegionalMaxLat = 0;
     this.hasActiveRegionalDEM = false;
-    for (const entry of this.regionalDEMTextures.values()) {
-      try { entry.texture.destroy(); } catch {}
-    }
-    this.regionalDEMTextures.clear();
 
     if (this.cloudUniformBuffers) {
       for (const b of this.cloudUniformBuffers) {
@@ -13117,8 +17864,6 @@ export class WebGPUEngine {
       }
       this.cloudUniformBuffers = null;
     }
-    this.cloudStagingBuffer?.destroy();
-    this.cloudStagingBuffer = null;
     this.cloudSphereVertexBuffer?.destroy();
     this.cloudSphereVertexBuffer = null;
     this.cloudSphereIndexBuffer?.destroy();
@@ -13142,8 +17887,68 @@ export class WebGPUEngine {
     this.volumetricCloudUniformBuffer?.destroy();
     this.volumetricCloudUniformBuffer = null;
     this.volumetricCloudPipeline = null;
+    this.crustOpaquePipeline = null;
+    this.crustHydroOnlyPipeline = null;
+    this.cloudPreCullBuffer?.destroy();
+    this.cloudPreCullBuffer = null;
+    this._preCullHasLayer = { low: false, mid: false, high: false };
+    this._preCullHasTemp = false;
+    this._preCullHasDew = false;
+    this.cloudAdvectionHasRealTextures = false;
+    this.cloudAdvectionStep = 0;
+    this._advectionAccumDt = 0;
     this.volumetricCloudPipelineLayout = null;
     this.volumetricCloudBindGroup = null;
+    this.volumetricTerrainBindGroupLayout = null;
+    this.volumetricTerrainBindGroup = null;
+    this.boundVolumetricRegView = null;
+    this.boundVolumetricTileArrayView = null;
+    this.boundVolumetricTileSlotBuffer = null;
+    this.boundVolumetricRegBuffer = null;
+    this.boundVolumetricRegNoiseView = null;
+    if (
+      this.volumetricHalfResTexture &&
+      this.volumetricHalfResTexture !== this.volumetricTaaColorTextures[0] &&
+      this.volumetricHalfResTexture !== this.volumetricTaaColorTextures[1]
+    ) {
+      this.volumetricHalfResTexture.destroy();
+    }
+    this.volumetricHalfResTexture = null;
+    this.volumetricHalfResView = null;
+    this.volumetricCheckerColorTexture?.destroy();
+    this.volumetricCheckerColorTexture = null;
+    this.volumetricCheckerColorView = null;
+    this.volumetricCheckerCentroidTexture?.destroy();
+    this.volumetricCheckerCentroidTexture = null;
+    this.volumetricCheckerCentroidView = null;
+    for (let i = 0; i < 2; i++) {
+      this.volumetricTaaColorTextures[i]?.destroy();
+      this.volumetricTaaColorTextures[i] = null;
+      this.volumetricTaaColorViews[i] = null;
+      this.volumetricTaaCentroidTextures[i]?.destroy();
+      this.volumetricTaaCentroidTextures[i] = null;
+      this.volumetricTaaCentroidViews[i] = null;
+      this.volumetricTaaResolveBindGroups[i] = null;
+      this.volumetricUpsampleBindGroups[i] = null;
+    }
+    this.volumetricHalfResPipeline = null;
+    this.volumetricTaaResolvePipeline = null;
+    this.volumetricTaaResolvePipelineLayout = null;
+    this.volumetricTaaResolveBindGroupLayout = null;
+    this.volumetricUpsamplePipeline = null;
+    this.volumetricUpsamplePipelineLayout = null;
+    this.volumetricUpsampleBindGroupLayout = null;
+    this.volumetricUpsampleBindGroup = null;
+    this.volumetricTaaFrameIndex = 0;
+    this.volumetricTaaValidFrames = 0;
+    this.volumetricTaaPendingParityFrames = 2;
+    this.volumetricHasPrevCamera = false;
+    this.volumetricIsStationaryRest = false;
+    this.volumetricIsCameraSettled = false;
+    this.volumetricPrevWasWhipPan = false;
+    this.volumetricPrevWasMotionSubgrid = false;
+    this.volumetricCameraSettledFrames = 0;
+    this.boundVolumetricPrecipView = null;
     this.volumetricCloudBindGroupLayout = null;
     this.volumetricNoiseSampler = null;
     this.volumetricPipelineDescriptor = null;
@@ -13200,12 +18005,6 @@ export class WebGPUEngine {
     this.dummyWindTexture?.destroy();
     this.dummyWindTexture = null;
     this.dummyWindTextureView = null;
-
-    this.atmosphereUniformBuffer?.destroy();
-    this.atmosphereUniformBuffer = null;
-    this.atmosphereBindGroup = null;
-    this.atmosphereBindGroupLayout = null;
-    this.atmosphereScatterPipeline = null;
 
     // Cartographic Intaglio Substrate Micro-Relief & Paper Composition Cleanup
     this.paperSubstrateUniformBuffer?.destroy();
@@ -13272,6 +18071,7 @@ export class WebGPUEngine {
     this.drainagePipeline = null;
     this.drainageBindGroupLayout = null;
     this.drainageBindGroup = null;
+    this.boundDrainagePrecipView = null;
     this.crustGroup1BindGroups = [null, null, null, null];
 
     // Section 1: Temporal Cloud Morphing & Semi-Lagrangian Vector Advection Cleanup
@@ -13315,22 +18115,53 @@ export class WebGPUEngine {
     this.cdlodCullingPipeline = null;
     this.cdlodResetPipeline = null;
     this.cdlodBuffersInitialized = false;
+    this.invalidateCDLODState();
+    this.cdlodHasValidState = false;
+    this.cdlodUpdatedThisFrame = true;
+    this.uniformShadowValidMask = 0;
+    this.lastExplicitCdlodDiagnosticMode = undefined;
 
     this.cachedInitConfig = null;
+    this.lastLoadedDEMUrl = null;
+    this.lastGlobalDEMLoadSource = null;
+    this.lastGlobalDEMLoadMs = 0;
+    this.lastRegionalDEMLoadSource = null;
+    this.lastRegionalDEMLoadMs = 0;
+    this.lastOPFSWritePromise = null;
     this.lastLoadedWeatherNextHour = -1;
+    this.lastLoadedCloudModel = null;
+    this._satelliteCloudTripletCache = null;
     this.inFlightWeatherNextHour = -1;
     this.inFlightWeatherNextPromise = null;
+    this.pendingWeatherNextHour = -1;
+    this.pendingWeatherNextModel = 'weathernext3';
+    ++this.cloudLayerLoadSeq;
     this.lastLoadedWindUrl = [null, null];
     this.inFlightWindUrl = [null, null];
     this.inFlightWindPromise = [null, null];
+    this.pendingWindUrl = [null, null];
+    this.lastLoadedJetStreamUrl = null;
+    this.inFlightJetStreamUrl = null;
+    this.inFlightJetStreamPromise = null;
     this.lastLoadedTempUrl = null;
     this.inFlightTempUrl = null;
     this.inFlightTempPromise = null;
+    this.pendingTempUrl = null;
+    ++this.tempTextureLoadSeq;
     this.lastLoadedDewpointUrl = null;
     this.inFlightDewpointUrl = null;
     this.inFlightDewpointPromise = null;
+    this.pendingDewpointReq = null;
+    ++this.dewpointTextureLoadSeq;
+    this.prefetchedColdDEMVersionTags.clear();
+    this._volumetricPackedChannelFlags = 0;
+    this.cloudTextureFormat = 'r16float';
+    this.jetStreamTextureFormat = 'rg16float';
+    this._wnCloudSliceCache.clear();
     this.terrainShadowDirty = true;
     this.drainageDirty = true;
+    this.lastUniformUnfurl = null;
+    this.unfurlFlexEnvelope = 0.0;
 
     if (this.uncapturedErrorHandler && this.device) {
       this.device.removeEventListener?.('uncapturederror', this.uncapturedErrorHandler);

@@ -282,6 +282,35 @@ export class RasterTileDataSource implements IDataSource<RasterTileMetadata> {
     return this.loadTilePyramidTexture(url, 2);
   }
 
+  public async decodeTerrariumTileOffThread(
+    z: number,
+    tx: number,
+    ty: number,
+    bounds: { minLon: number; minLat: number; maxLon: number; maxLat: number },
+    rgbaBuffer?: ArrayBuffer
+  ): Promise<Float32Array | null> {
+    const { decodeWorkerPool } = await import('../workers/DecodeWorkerPool');
+    const transfer = rgbaBuffer ? [rgbaBuffer] : [];
+    const res = await decodeWorkerPool.run(
+      {
+        type: 'terrarium_decode_tile',
+        z,
+        tx,
+        ty,
+        minLon: bounds.minLon,
+        minLat: bounds.minLat,
+        maxLon: bounds.maxLon,
+        maxLat: bounds.maxLat,
+        rgbaBuffer,
+      },
+      transfer
+    );
+    if (res.type === 'terrarium_decode_tile' && res.ok && res.elevBuffer) {
+      return new Float32Array(res.elevBuffer);
+    }
+    return null;
+  }
+
   public toGPUBinding(deviceOrGl?: GPUDevice | WebGL2RenderingContext): GPUBuffer | WebGLBuffer | null {
     return null;
   }

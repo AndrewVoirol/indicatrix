@@ -83,11 +83,18 @@ async function run() {
   }
 
   // Step 1: Fetch 1:10m Coastlines
-  console.log('\n[2/5] Fetching Natural Earth 1:10m Coastlines TopoJSON...');
-  const topoUrl = 'https://cdn.jsdelivr.net/npm/world-atlas@2/land-10m.json';
-  const topoRes = await fetch(topoUrl);
-  if (!topoRes.ok) throw new Error(`Failed to fetch TopoJSON: ${topoRes.statusText}`);
-  const topoData = await topoRes.json();
+  console.log('\n[2/5] Loading Natural Earth 1:10m Coastlines TopoJSON...');
+  const localLand10mPath = path.resolve(process.cwd(), 'data/land-10m.json');
+  let topoData: any;
+  if (fs.existsSync(localLand10mPath)) {
+    topoData = JSON.parse(fs.readFileSync(localLand10mPath, 'utf-8'));
+    console.log(`  ✓ Loaded local cache: ${localLand10mPath}`);
+  } else {
+    const topoUrl = 'https://cdn.jsdelivr.net/npm/world-atlas@2/land-10m.json';
+    const topoRes = await fetch(topoUrl);
+    if (!topoRes.ok) throw new Error(`Failed to fetch TopoJSON: ${topoRes.statusText}`);
+    topoData = await topoRes.json();
+  }
   const coastMesh = topojson.mesh(topoData, topoData.objects.land);
   console.log(`  ✓ Loaded ${coastMesh.coordinates.length} coastline paths`);
 

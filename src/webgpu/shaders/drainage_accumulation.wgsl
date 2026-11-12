@@ -32,6 +32,13 @@ const TWO_PI: f32 = 6.28318530717958647692;
 const EARTH_RADIUS_M: f32 = 6371000.0;
 const A_MAX_KM2: f32 = 7000000.0; // Amazon Basin benchmark ~7,000,000 km²
 
+fn unpackDemRG(s: vec4<f32>) -> vec4<f32> {
+    let bNorm = s.r;
+    let aNorm = s.g;
+    let elevM = aNorm * 19772.0 - 10924.0;
+    return vec4<f32>(clamp(elevM / 8848.0, 0.0, 1.0), clamp(-elevM / 10924.0, 0.0, 1.0), bNorm, aNorm);
+}
+
 fn decodeElevation(demSample: vec4<f32>) -> f32 {
     return demSample.a * 19772.0 - 10924.0;
 }
@@ -49,7 +56,7 @@ fn cs_main(@builtin(global_invocation_id) globalId: vec3<u32>) {
     let ts = vec2<f32>(1.0 / fDims.x, 1.0 / fDims.y);
 
     // Center elevation & land gate
-    let centerSample = textureSampleLevel(u_demTexture, u_demSampler, uv, 0.0);
+    let centerSample = unpackDemRG(textureSampleLevel(u_demTexture, u_demSampler, uv, 0.0));
     let h0 = decodeElevation(centerSample);
     let isLand = centerSample.b > 0.45;
 
@@ -71,10 +78,10 @@ fn cs_main(@builtin(global_invocation_id) globalId: vec3<u32>) {
     let uvU = vec2<f32>(uv.x, clamp(uv.y + ts.y, 0.001, 0.999));
     let uvD = vec2<f32>(uv.x, clamp(uv.y - ts.y, 0.001, 0.999));
 
-    let hR = decodeElevation(textureSampleLevel(u_demTexture, u_demSampler, uvR, 0.0));
-    let hL = decodeElevation(textureSampleLevel(u_demTexture, u_demSampler, uvL, 0.0));
-    let hU = decodeElevation(textureSampleLevel(u_demTexture, u_demSampler, uvU, 0.0));
-    let hD = decodeElevation(textureSampleLevel(u_demTexture, u_demSampler, uvD, 0.0));
+    let hR = decodeElevation(unpackDemRG(textureSampleLevel(u_demTexture, u_demSampler, uvR, 0.0)));
+    let hL = decodeElevation(unpackDemRG(textureSampleLevel(u_demTexture, u_demSampler, uvL, 0.0)));
+    let hU = decodeElevation(unpackDemRG(textureSampleLevel(u_demTexture, u_demSampler, uvU, 0.0)));
+    let hD = decodeElevation(unpackDemRG(textureSampleLevel(u_demTexture, u_demSampler, uvD, 0.0)));
 
     // Discrete topographic gradient: grad(h) = (dh/dx, dh/dy)
     let gx = (hR - hL) / (2.0 * dxMeters);
@@ -92,7 +99,7 @@ fn cs_main(@builtin(global_invocation_id) globalId: vec3<u32>) {
     let laplacian = d2x + d2y;
     let valleyCurvature = max(0.0, laplacian * 1e6); // Scale curvature for geomorphic convergence
 
-    // Sample live precipitation from WeatherNext 3 / RainViewer texture
+    // Sample live precipitation from WeatherNext 3 10 km prognostic field
     let precipRate = textureSampleLevel(u_precipTexture, u_precipSampler, uv, 0.0).r;
 
     // Upstream Catchment Basin Trajectory Accumulation:
@@ -113,10 +120,10 @@ fn cs_main(@builtin(global_invocation_id) globalId: vec3<u32>) {
         let sUvU = vec2<f32>(traceUV.x, clamp(traceUV.y + ts.y, 0.001, 0.999));
         let sUvD = vec2<f32>(traceUV.x, clamp(traceUV.y - ts.y, 0.001, 0.999));
 
-        let sHR = decodeElevation(textureSampleLevel(u_demTexture, u_demSampler, sUvR, 0.0));
-        let sHL = decodeElevation(textureSampleLevel(u_demTexture, u_demSampler, sUvL, 0.0));
-        let sHU = decodeElevation(textureSampleLevel(u_demTexture, u_demSampler, sUvU, 0.0));
-        let sHD = decodeElevation(textureSampleLevel(u_demTexture, u_demSampler, sUvD, 0.0));
+        let sHR = decodeElevation(unpackDemRG(textureSampleLevel(u_demTexture, u_demSampler, sUvR, 0.0)));
+        let sHL = decodeElevation(unpackDemRG(textureSampleLevel(u_demTexture, u_demSampler, sUvL, 0.0)));
+        let sHU = decodeElevation(unpackDemRG(textureSampleLevel(u_demTexture, u_demSampler, sUvU, 0.0)));
+        let sHD = decodeElevation(unpackDemRG(textureSampleLevel(u_demTexture, u_demSampler, sUvD, 0.0)));
 
         let sgx = (sHR - sHL) / (2.0 * sampleDxM);
         let sgy = (sHU - sHD) / (2.0 * sampleDyM);

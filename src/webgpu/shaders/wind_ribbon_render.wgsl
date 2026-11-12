@@ -84,8 +84,9 @@ fn vs_main(in: VertexInput) -> VertexOutput {
 
     // Degenerate checks: if segment alpha too low, endpoints identical, or crossing flat map seam
     let segLenSq = dot(ptA.xyz - ptB.xyz, ptA.xyz - ptB.xyz);
+    let maxSegLenSq = select(0.64, 2.5, sim.u_unfurl > 0.05);
     let isCrossAntimeridian = select(false, abs(ptA.x - ptB.x) > PI * RADIUS * 0.75, sim.u_unfurl > 0.05);
-    if (ptA.w <= 0.01 || ptB.w <= 0.01 || segLenSq < 0.000001 || segLenSq > 2.5 || isCrossAntimeridian) {
+    if (ptA.w <= 0.01 || ptB.w <= 0.01 || segLenSq < 0.000001 || segLenSq > maxSegLenSq || isCrossAntimeridian) {
         out.clipPos = vec4<f32>(0.0, 0.0, -1.0, 0.0);
         return out;
     }
@@ -136,13 +137,15 @@ fn vs_main(in: VertexInput) -> VertexOutput {
 
     // Longitudinal head-to-tail aerodynamic taper (segIdx 0..2, u 0..1)
     let ribbonT = (f32(segIdx) + in.corner.x) / 3.0;
-    let taperWidth = mix(1.0, 0.22, ribbonT);
+    let headTip = smoothstep(0.0, 0.08, ribbonT);
+    let tailTaper = pow(1.0 - ribbonT, 0.85);
+    let taperWidth = mix(0.22, 1.08, tailTaper) * mix(0.58, 1.0, headTip);
 
-    // Surface winds: refined ~0.95px half-width (total ~1.9px stroke) for crisp filament visibility
-    // Jet stream: wider ~2.40px half-width (total ~4.8px stroke) for continuous atmospheric river
-    let baseHalfWidth = select(0.95, 2.40, isJet > 0.5) * sim.u_dpr;
+    // Surface winds: refined ~1.35px half-width (total ~2.7px stroke) for crisp filament visibility
+    // Jet stream: drafted ~1.85px half-width (total ~3.7px stroke) for upper-air circulation traces
+    let baseHalfWidth = select(1.35, 1.85, isJet > 0.5) * sim.u_dpr;
     let widthAtten = select(
-        clamp(p.vel.w / 16.0, 0.70, 1.25),
+        clamp(p.vel.w / 14.0, 0.80, 1.35),
         clamp(p.vel.w / 40.0, 0.75, 1.60),
         isJet > 0.5
     );
@@ -160,7 +163,7 @@ fn vs_main(in: VertexInput) -> VertexOutput {
     let finalW = mix(clipA.w, clipB.w, u);
 
     out.clipPos = vec4<f32>(finalNdc * finalW, mix(clipA.z, clipB.z, u), finalW);
-    out.uv = in.corner;
+    out.uv = vec2<f32>(ribbonT, in.corner.y);
     // Longitudinal power-law alpha decay for clean directional quill tapering
     let trailDecay = pow(1.0 - ribbonT, 1.30);
     out.alpha = mix(ptA.w, ptB.w, u) * mix(0.15, 1.0, trailDecay);
@@ -169,11 +172,19 @@ fn vs_main(in: VertexInput) -> VertexOutput {
 
     // Normal facing calculation across both spherical and flat manifold states
     let midWorld = mix(ptA.xyz, ptB.xyz, u);
-    let sphereNorm = normalize(midWorld);
+    let sphereNorm = midWorld / max(length(midWorld), 1e-5);
     let flatNorm = vec3<f32>(0.0, 0.0, 1.0);
     let surfNorm = normalize(mix(sphereNorm, flatNorm, clamp(sim.u_unfurl * 2.0, 0.0, 1.0)));
-    let viewDir = normalize(sim.u_cameraPos.xyz - midWorld);
-    out.facing = dot(surfNorm, viewDir);
+    let viewVecMid = sim.u_cameraPos.xyz - midWorld;
+    let viewDir = viewVecMid / max(length(viewVecMid), 1e-5);
+    let facingMid = dot(surfNorm, viewDir);
+    let normA = ptA.xyz / max(length(ptA.xyz), 1e-5);
+    let normB = ptB.xyz / max(length(ptB.xyz), 1e-5);
+    let viewVecA = sim.u_cameraPos.xyz - ptA.xyz;
+    let viewVecB = sim.u_cameraPos.xyz - ptB.xyz;
+    let facingA = dot(normA, viewVecA / max(length(viewVecA), 1e-5));
+    let facingB = dot(normB, viewVecB / max(length(viewVecB), 1e-5));
+    out.facing = select(facingMid, min(facingMid, min(facingA, facingB)), sim.u_unfurl < 0.20);
     out.vertVel = p.vel.z;
 
     return out;
@@ -232,13 +243,13 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
             color = mix(color, coreJet, coreSpine * smoothstep(0.40, 0.85, normSpeed) * 0.35);
             alphaBase = mix(0.20, 0.78, jetSpeedAtten);
         } else if (sim.u_theme == 1u) {
-            // Theme 1: Cream Rag (Swiss Relief): Charcoal to Deep Indigo-Navy
-            let calmJet = vec3<f32>(0.42, 0.46, 0.54);
-            let fastJet = vec3<f32>(0.12, 0.20, 0.38);
-            let coreJet = vec3<f32>(0.04, 0.08, 0.18);
+            // Theme 1: Cream Rag (Swiss Relief): Warm Pewter-Bistre to Archival Iron-Gall Sepia (#332E29)
+            let calmJet = vec3<f32>(0.46, 0.42, 0.38);
+            let fastJet = vec3<f32>(0.29, 0.25, 0.22);
+            let coreJet = vec3<f32>(0.20, 0.18, 0.16);
             color = mix(calmJet, fastJet, smoothstep(0.2, 0.7, normSpeed));
             color = mix(color, coreJet, smoothstep(0.7, 1.0, normSpeed));
-            alphaBase = mix(0.20, 0.78, jetSpeedAtten);
+            alphaBase = mix(0.14, 0.54, jetSpeedAtten);
         } else if (sim.u_theme == 2u) {
             // Theme 2: Prussian Cyanotype (Blueprint architectural drafting traces)
             // Chalk cerulean (#7AA2C8) to crisp chalk ruling pen white (#E8EDF2)
@@ -251,12 +262,12 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
             alphaBase = mix(0.15, 0.55, jetSpeedAtten);
         } else {
             // Fallback: Theme 1
-            let calmJet = vec3<f32>(0.42, 0.46, 0.54);
-            let fastJet = vec3<f32>(0.12, 0.20, 0.38);
-            let coreJet = vec3<f32>(0.04, 0.08, 0.18);
+            let calmJet = vec3<f32>(0.46, 0.42, 0.38);
+            let fastJet = vec3<f32>(0.29, 0.25, 0.22);
+            let coreJet = vec3<f32>(0.20, 0.18, 0.16);
             color = mix(calmJet, fastJet, smoothstep(0.2, 0.7, normSpeed));
             color = mix(color, coreJet, smoothstep(0.7, 1.0, normSpeed));
-            alphaBase = mix(0.20, 0.78, jetSpeedAtten);
+            alphaBase = mix(0.14, 0.54, jetSpeedAtten);
         }
     } else {
         // Surface Boundary Layer (10m, speeds up to 32 m/s):
@@ -269,30 +280,34 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
             let calmSurf  = vec3<f32>(0.56, 0.66, 0.76); // Muted slate-pearl
             let briskSurf = vec3<f32>(0.88, 0.94, 1.00); // Luminous silver filament
             color = mix(calmSurf, briskSurf, normSpeed);
-            alphaBase = mix(0.06, 0.72, smoothstep(0.06, 0.60, normSpeed));
+            alphaBase = max(0.38 * smoothstep(0.02, 0.18, normSpeed), mix(0.06, 0.72, smoothstep(0.06, 0.60, normSpeed)) * 1.25);
         } else if (sim.u_theme == 1u) {
-            // Theme 1: Cream Rag: Warm sienna-copper drafting filaments
-            // Contrasts cleanly against both warm ivory paper (#F3ECE0) and dark sepia relief (#38302A)
+            // Theme 1: Cream Rag: Deep sepia-verdigris intaglio core with warm vellum edge halo
+            // Contrasts cleanly against both warm ochre landmass and dark marine bathymetry
             let calmSurf  = vec3<f32>(0.74, 0.38, 0.20); // Warm burnt sienna archival ink
             let briskSurf = vec3<f32>(0.94, 0.58, 0.26); // Luminous polished copper filament
             color = mix(calmSurf, briskSurf, normSpeed);
             // Capillary ink bleed into cellulose fibers at stroke margins
             let inkBleed = smoothstep(0.45, 0.95, lateralDist) * 0.18;
             color = mix(color, vec3<f32>(0.64, 0.44, 0.30), inkBleed);
-            alphaBase = mix(0.08, 0.78, smoothstep(0.06, 0.60, normSpeed));
+            let intaglioCore = mix(vec3<f32>(0.21, 0.18, 0.16), vec3<f32>(0.11, 0.29, 0.36), normSpeed);
+            let vellumHalo = vec3<f32>(0.98, 0.96, 0.91);
+            let spineMask = 1.0 - smoothstep(0.24, 0.64, lateralDist);
+            color = mix(vellumHalo, mix(intaglioCore, color, 0.22), spineMask);
+            alphaBase = max(0.46 * smoothstep(0.02, 0.18, normSpeed), mix(0.08, 0.78, smoothstep(0.06, 0.60, normSpeed)) * mix(0.95, 1.38, spineMask));
         } else if (sim.u_theme == 2u) {
-            // Theme 2: Prussian Cyanotype: Actinic chalk white & photochemical cerulean
+            // Theme 2: Prussian Cyanotype: Photochemical cerulean (calm) -> Actinic chalk white (brisk)
             // Contrasts sharply against ferroprussiate indigo oceans and cerulean terrain - zero amber contamination
-            let calmSurf  = vec3<f32>(0.92, 0.96, 1.00); // Pure actinic white ruling pen line
-            let briskSurf = vec3<f32>(0.42, 0.82, 0.98); // Cold photochemical cerulean filament
+            let calmSurf  = vec3<f32>(0.42, 0.82, 0.98); // Cold photochemical cerulean filament
+            let briskSurf = vec3<f32>(0.92, 0.96, 1.00); // Pure actinic white ruling pen line
             color = mix(calmSurf, briskSurf, normSpeed);
-            alphaBase = mix(0.10, 0.88, smoothstep(0.06, 0.60, normSpeed));
+            alphaBase = max(0.48 * smoothstep(0.02, 0.18, normSpeed), mix(0.10, 0.88, smoothstep(0.06, 0.60, normSpeed)) * 1.20);
         } else {
             // Fallback: Theme 1
             let calmSurf  = vec3<f32>(0.74, 0.38, 0.20);
             let briskSurf = vec3<f32>(0.94, 0.58, 0.26);
             color = mix(calmSurf, briskSurf, normSpeed);
-            alphaBase = mix(0.08, 0.78, smoothstep(0.06, 0.60, normSpeed));
+            alphaBase = max(0.46 * smoothstep(0.02, 0.18, normSpeed), mix(0.08, 0.78, smoothstep(0.06, 0.60, normSpeed)));
         }
     }
 
@@ -318,8 +333,14 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         alphaBase = alphaBase + condensation * 0.18;
     }
 
+    // Tail-to-head traveling ink-density wave: in.uv.x runs 1.0 (tail) -> 0.0 (head)
+    let waveRate = select(2.2, 3.4, in.isJetStream > 0.5);
+    let flowWavePhase = in.uv.x * 2.0 + sim.u_time * waveRate;
+    let flowPulse = 0.72 + 0.28 * (0.5 + 0.5 * cos(flowWavePhase * 6.2831853));
+    let headCrest = 1.0 + 0.24 * (1.0 - smoothstep(0.0, 0.30, in.uv.x));
+
     let sphereFactor = 1.0 - smoothstep(0.0, 0.35, sim.u_unfurl);
-    let limbFalloff = mix(1.0, smoothstep(0.02, 0.20, in.facing), sphereFactor);
-    let finalAlpha = in.alpha * capillaryFeather * alphaBase * limbFalloff + dVertVel * 0.000001;
+    let limbFalloff = mix(1.0, smoothstep(0.08, 0.26, in.facing), sphereFactor);
+    let finalAlpha = clamp(in.alpha * capillaryFeather * alphaBase * flowPulse * headCrest * limbFalloff, 0.0, 1.0) + dVertVel * 0.000001;
     return vec4<f32>(color, finalAlpha);
 }

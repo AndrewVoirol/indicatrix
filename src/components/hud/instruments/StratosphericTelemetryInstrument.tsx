@@ -7,13 +7,15 @@
 // (Single-Border, 10px Clearance, Ivory Vellum Card Tone)
 // ============================================================================
 
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useEffect } from 'react';
 import type { ResolutionTier } from '../../../types';
 
 export interface StratosphericTelemetryInstrumentProps {
   theme?: 0 | 1 | 2; // 0: Marie Tharp, 1: Cream Rag, 2: Prussian Cyanotype
   isLight?: boolean;
   cloudFalseColor?: boolean;
+  cloudThickness?: number;
+  isActive?: boolean;
   resolution?: ResolutionTier;
   onPitchChange?: (pitchDeg: number) => void;
   className?: string;
@@ -42,18 +44,20 @@ export const StratosphericTelemetryInstrument: React.FC<StratosphericTelemetryIn
   theme: propTheme,
   isLight = false,
   cloudFalseColor = false,
+  cloudThickness = 0.19,
+  isActive = true,
   resolution: propResolution,
-  onPitchChange,
   className = '',
 }) => {
   const activeTheme: 0 | 1 | 2 = propTheme !== undefined ? propTheme : isLight ? 1 : 0;
+  void activeTheme;
 
   const [camDist, setCamDist] = useState<number>(15.0);
   const [pitch, setPitch] = useState<number>(0.0);
   const [coords, setCoords] = useState<{ lat?: number; lon?: number } | null>(null);
   const [cloudSteps, setCloudSteps] = useState<number>(32);
 
-  // Poll camera and coordinate telemetry at ~10 Hz without React tree thrash
+  // Poll camera and coordinate telemetry at ~10 Hz while active without React tree thrash
   useEffect(() => {
     let active = true;
 
@@ -111,33 +115,19 @@ export const StratosphericTelemetryInstrument: React.FC<StratosphericTelemetryIn
     };
 
     poll();
+    if (!isActive) {
+      return () => {
+        active = false;
+      };
+    }
+
     const interval = setInterval(poll, 100);
 
     return () => {
       active = false;
       clearInterval(interval);
     };
-  }, []);
-
-  const handlePitchSliderChange = useCallback(
-    (newPitch: number) => {
-      const clamped = Math.max(0, Math.min(85, newPitch));
-      setPitch(clamped);
-      if (typeof window !== 'undefined') {
-        const cam = (window as any).__INDICATRIX_CAMERA__;
-        if (cam && typeof cam.setPitch === 'function') {
-          cam.setPitch(clamped);
-        } else {
-          (window as any).__INDICATRIX_LIVE_UNIFORMS__ = {
-            ...((window as any).__INDICATRIX_LIVE_UNIFORMS__ || {}),
-            cameraPitchDeg: clamped,
-          };
-        }
-      }
-      onPitchChange?.(clamped);
-    },
-    [onPitchChange]
-  );
+  }, [isActive]);
 
   const km = unitDistToKm(camDist);
   const kmStr =
@@ -147,8 +137,9 @@ export const StratosphericTelemetryInstrument: React.FC<StratosphericTelemetryIn
 
   const stratum = getStratumName(km);
 
-  // Tropospheric Regime calculation
-  const rOuter = GLOBE_RADIUS_UNITS + 0.035;
+  // Tropospheric Regime calculation coupled to live cloudThickness (default 0.19 units)
+  const shellThickness = Math.max(0.01, Number.isFinite(cloudThickness) ? cloudThickness : 0.19);
+  const rOuter = GLOBE_RADIUS_UNITS + shellThickness;
   let regimeText = 'REGIME 1: ORBITAL SPACE';
   let regimeColor = 'text-[var(--theme-text-accent)]';
   if (camDist <= rOuter && camDist >= GLOBE_RADIUS_UNITS) {
@@ -162,7 +153,7 @@ export const StratosphericTelemetryInstrument: React.FC<StratosphericTelemetryIn
   // Raymarch interval through tropospheric bounding shell
   let rayRangeKm = 0;
   if (camDist > rOuter) {
-    rayRangeKm = 0.035 * KM_PER_UNIT;
+    rayRangeKm = shellThickness * KM_PER_UNIT;
   } else if (camDist >= GLOBE_RADIUS_UNITS) {
     rayRangeKm = (camDist - GLOBE_RADIUS_UNITS) * KM_PER_UNIT;
   } else {

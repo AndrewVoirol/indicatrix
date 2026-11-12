@@ -25,9 +25,15 @@ import {
 } from '../../webgpu/TemporalTextureRingBuffer';
 import {
   loadNodeAssetBuffer,
-  loadNodeAssetText,
 } from '../../utils/nodeAssetLoader';
 import { encodeFloat16, decodeFloat16 } from '../math/float16';
+import { fetchWeatherNextMeta } from './weatherNextMetaLoader';
+import { opfsAssetStore, probeAssetVersionTag } from './OPFSAssetStore';
+import { decodeWorkerPool } from '../workers/DecodeWorkerPool';
+import type {
+  WeatherNextScalarSpeedResponse,
+  WeatherNextSlicePadResponse,
+} from '../workers/decodeTasks';
 
 const DECODE_FLOAT16_LUT = new Float32Array(65536);
 for (let i = 0; i < 65536; i++) {
@@ -45,6 +51,14 @@ export const WEATHERNEXT_CORE_VARIABLES = [
   'medium_cloud_cover_mean',
   'high_cloud_cover_mean',
   'wind_10m_vector',
+] as const;
+
+export const WEATHERNEXT_AUXILIARY_VARIABLES = [
+  'sea_surface_temperature_mean',
+  'radiative_optical_depth',
+  'mean_sea_level_pressure_mean',
+  'convective_spread',
+  'wind_100m_vector',
 ] as const;
 
 export type WeatherNextCoreVariable = (typeof WEATHERNEXT_CORE_VARIABLES)[number];
@@ -273,7 +287,10 @@ export class WeatherNextDataSource implements IDataSource<WeatherNextMeta> {
    * Helper to check if a variable is recognized.
    */
   public isValidVariable(variable: string): boolean {
-    if (WEATHERNEXT_CORE_VARIABLES.includes(variable as any)) {
+    if (
+      WEATHERNEXT_CORE_VARIABLES.includes(variable as any) ||
+      WEATHERNEXT_AUXILIARY_VARIABLES.includes(variable as any)
+    ) {
       return true;
     }
     if (
@@ -301,40 +318,9 @@ export class WeatherNextDataSource implements IDataSource<WeatherNextMeta> {
       return this.metadata;
     }
 
-    const isMock = typeof globalThis.fetch === 'function' && Boolean((globalThis.fetch as any).mock);
-
-    if (typeof fetch !== 'undefined') {
-      try {
-        const res = await fetch(targetUrl);
-        if (!res.ok) {
-          throw new Error(
-            `Failed to fetch metadata from ${targetUrl}: HTTP ${res.status} ${res.statusText || ''}`.trim()
-          );
-        }
-        const parsed = (await res.json()) as WeatherNextMeta;
-        this.metadata = parsed;
-        return this.metadata;
-      } catch (err) {
-        if (isMock) {
-          throw err;
-        }
-      }
-    }
-
-    // Node filesystem loader fallback
-    const nodeText = await loadNodeAssetText(targetUrl);
-    if (nodeText !== null) {
-      try {
-        this.metadata = JSON.parse(nodeText) as WeatherNextMeta;
-        return this.metadata;
-      } catch (e) {
-        throw new Error(
-          `Failed to parse metadata JSON from ${targetUrl}: ${(e as Error).message}`
-        );
-      }
-    }
-
-    throw new Error(`Failed to fetch metadata from ${targetUrl}`);
+    const parsed = await fetchWeatherNextMeta(targetUrl);
+    this.metadata = parsed;
+    return this.metadata;
   }
 
   /**
@@ -386,11 +372,37 @@ export class WeatherNextDataSource implements IDataSource<WeatherNextMeta> {
       return pending;
     }
 
-    // 3. Initiate fetch
+    // 3. Initiate fetch (with OPFS warm Float16 chunk cache in browser runtime)
     const requestPromise = (async () => {
       try {
         const filePath = `${this.basePath}/${variable}-${hour}.bin`;
+        const isMock = typeof globalThis.fetch === 'function' && Boolean((globalThis.fetch as any).mock);
+        const canUseOpfs = !isMock && opfsAssetStore.isEnabled();
+        const versionTag = canUseOpfs
+          ? (this.metadata?.forecastInitTimestamp || this.metadata?.ingestedAtUTC || (await probeAssetVersionTag(filePath)))
+          : 'v1';
+
+        if (canUseOpfs) {
+          const opfsHit = await opfsAssetStore.getWeatherNextChunk(filePath, versionTag);
+          if (opfsHit && opfsHit.data.byteLength >= 12967200) {
+            const hitBuf =
+              opfsHit.data.byteOffset === 0 && opfsHit.data.byteLength === opfsHit.data.buffer.byteLength
+                ? (opfsHit.data.buffer as ArrayBuffer)
+                : (opfsHit.data.buffer.slice(
+                    opfsHit.data.byteOffset,
+                    opfsHit.data.byteOffset + opfsHit.data.byteLength
+                  ) as ArrayBuffer);
+            if (this.sliceCache.size >= this.maxCachedSlices) {
+              const oldestKey = this.sliceCache.keys().next().value;
+              if (oldestKey !== undefined) this.sliceCache.delete(oldestKey);
+            }
+            this.sliceCache.set(cacheKey, hitBuf);
+            return hitBuf;
+          }
+        }
+
         let buffer: ArrayBuffer;
+        let fetchedLive = false;
         try {
           buffer = await this.fetchBuffer(filePath);
           // Hardware invariant check: slice must be at least raw 3600x1801 Float16 (12,967,200 bytes)
@@ -399,13 +411,30 @@ export class WeatherNextDataSource implements IDataSource<WeatherNextMeta> {
               `Insufficient data length for slice '${variable}-${hour}': expected at least 12967200 bytes, got ${buffer.byteLength}`
             );
           }
+          fetchedLive = true;
         } catch (fetchErr) {
-          const isMock = typeof globalThis.fetch === 'function' && Boolean((globalThis.fetch as any).mock);
           if (isMock) {
             throw fetchErr;
           }
           console.warn(`[WeatherNextDataSource] Falling back to synthesized slice for '${variable}-${hour}':`, fetchErr);
           buffer = this.synthesizeDeterministicSlice(variable, hour);
+        }
+
+        if (canUseOpfs && fetchedLive) {
+          const channels = buffer.byteLength >= 25934400 ? 2 : 1;
+          const persistTimer = setTimeout(() => {
+            if (this.disposed) return;
+            void opfsAssetStore.putWeatherNextChunk(filePath, {
+              versionTag,
+              variable,
+              hourOffset: hour,
+              channels,
+              data: new Uint16Array(buffer),
+            });
+          }, 600);
+          if (typeof (persistTimer as unknown as { unref?: () => void }).unref === 'function') {
+            (persistTimer as unknown as { unref: () => void }).unref();
+          }
         }
 
         // Enforce cache capacity limit (evict oldest inserted)
@@ -432,6 +461,23 @@ export class WeatherNextDataSource implements IDataSource<WeatherNextMeta> {
    */
   private async fetchBuffer(url: string): Promise<ArrayBuffer> {
     const isMock = typeof globalThis.fetch === 'function' && Boolean((globalThis.fetch as any).mock);
+
+    if (!isMock && decodeWorkerPool.canUseWorkers() && !url.includes('wind_10m_vector')) {
+      try {
+        const paddedRes = await decodeWorkerPool.run<WeatherNextSlicePadResponse>({
+          type: 'weathernext_slice_pad',
+          url,
+          rawRowBytes: WEATHERNEXT_GRID_SPEC.rawRowBytes,
+          paddedRowBytes: WEATHERNEXT_GRID_SPEC.paddedRowBytes,
+          height: WEATHERNEXT_GRID_SPEC.height,
+        });
+        if (paddedRes.ok && paddedRes.buffer) {
+          return paddedRes.buffer;
+        }
+      } catch {
+        // Fall back to main-thread fetch below
+      }
+    }
 
     if (typeof fetch !== 'undefined') {
       try {
@@ -578,16 +624,66 @@ export class WeatherNextDataSource implements IDataSource<WeatherNextMeta> {
       return;
     }
 
+    const [p0, p1, p2] = await Promise.all([
+      this.prepareSliceForRingAsync(b0, targetVar),
+      this.prepareSliceForRingAsync(b1, targetVar),
+      this.prepareSliceForRingAsync(b2, targetVar),
+    ]);
+
+    if (seekId !== this.seekSequenceId || this.isDisposed) {
+      return;
+    }
+
     if (this.ringBuffer && !this.ringBuffer.disposed) {
-      this.ringBuffer.uploadSlice(0, this.prepareSliceForRing(b0, targetVar));
-      this.ringBuffer.uploadSlice(1, this.prepareSliceForRing(b1, targetVar));
-      this.ringBuffer.uploadSlice(2, this.prepareSliceForRing(b2, targetVar));
+      this.ringBuffer.uploadSlice(0, p0);
+      if (decodeWorkerPool.canUseWorkers()) {
+        await new Promise<void>((resolve) => setTimeout(resolve, 0));
+        if (seekId !== this.seekSequenceId || this.isDisposed || !this.ringBuffer || this.ringBuffer.disposed) {
+          return;
+        }
+      }
+      this.ringBuffer.uploadSlice(1, p1);
+      if (decodeWorkerPool.canUseWorkers()) {
+        await new Promise<void>((resolve) => setTimeout(resolve, 0));
+        if (seekId !== this.seekSequenceId || this.isDisposed || !this.ringBuffer || this.ringBuffer.disposed) {
+          return;
+        }
+      }
+      this.ringBuffer.uploadSlice(2, p2);
     }
 
     this.currentHour = clampedHour;
     this.lastScrubHour = clampedHour;
     this.activeVariable = targetVar;
     this.residentHours = [h0, h1, h2];
+  }
+
+  private readonly scalarSliceMemo = new WeakMap<ArrayBuffer, Promise<ArrayBuffer>>();
+
+  private async prepareSliceForRingAsync(sliceBuffer: ArrayBuffer, variable: string): Promise<ArrayBuffer> {
+    if (
+      variable === 'wind_10m_vector' &&
+      this.ringBuffer &&
+      this.ringBuffer.format === 'r16float' &&
+      sliceBuffer.byteLength >= 25934400
+    ) {
+      if (!decodeWorkerPool.canUseWorkers()) {
+        return this.extractScalarSpeedSlice(sliceBuffer);
+      }
+      let memo = this.scalarSliceMemo.get(sliceBuffer);
+      if (!memo) {
+        const cloned = sliceBuffer.slice(0);
+        memo = decodeWorkerPool
+          .run<WeatherNextScalarSpeedResponse>(
+            { type: 'weathernext_scalar_speed', vectorBuffer: cloned },
+            [cloned]
+          )
+          .then((res) => res.scalarBuffer);
+        this.scalarSliceMemo.set(sliceBuffer, memo);
+      }
+      return memo;
+    }
+    return sliceBuffer;
   }
 
   /**
@@ -692,6 +788,7 @@ export class WeatherNextDataSource implements IDataSource<WeatherNextMeta> {
       this.residentHours = [expectedSlot1, expectedSlot2, -1];
       const prefetchHour = Math.min(maxHour, targetHour + 2);
       const prefetchBuffer = await this.getSlice(targetVar, prefetchHour);
+      const preparedPrefetch = await this.prepareSliceForRingAsync(prefetchBuffer, targetVar);
 
       if (
         dispatchSeekId !== this.seekSequenceId ||
@@ -703,7 +800,7 @@ export class WeatherNextDataSource implements IDataSource<WeatherNextMeta> {
         return;
       }
 
-      this.ringBuffer.uploadSlice(2, this.prepareSliceForRing(prefetchBuffer, targetVar));
+      this.ringBuffer.uploadSlice(2, preparedPrefetch);
       this.residentHours[2] = prefetchHour;
     };
 

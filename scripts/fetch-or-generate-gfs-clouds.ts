@@ -49,7 +49,7 @@ export function computeWebGPURowPitch(width = GFS_CLOUD_WIDTH, height = GFS_CLOU
  *   3. High Layer (HCDC, ~10-12 km): Polar/subtropical jet stream cirrus filaments and
  *      Indo-Pacific Warm Pool convective outflow anvils.
  */
-export function generateProceduralCloudGrids(): {
+export function generateProceduralCloudGrids(rollAntimeridian = false): {
   lowBuf: ArrayBuffer;
   midBuf: ArrayBuffer;
   highBuf: ArrayBuffer;
@@ -107,7 +107,9 @@ export function generateProceduralCloudGrids(): {
 
     for (let i = 0; i < ni; i++) {
       const idx = j * ni + i;
-      const lonDeg = i * 0.25; // 0° to 359.75°
+      // When rollAntimeridian is true (for disk .bin files), Column 0 corresponds to
+      // 180°E / -180°W (Antimeridian), matching scripts/fetch-real-gfs.py and WebGPU UVs.
+      const lonDeg = rollAntimeridian ? ((i * 0.25 + 180.0) % 360.0) : i * 0.25;
       const lonRad = (lonDeg * Math.PI) / 180.0;
 
       // ----------------------------------------------------------------------
@@ -257,6 +259,16 @@ export async function fetchOrGenerateGFSClouds(): Promise<void> {
   const midPath = path.join(outputDir, 'gfs-cloud-mid-latest.bin');
   const highPath = path.join(outputDir, 'gfs-cloud-high-latest.bin');
 
+  if (
+    process.env.VITEST &&
+    fs.existsSync(lowPath) && fs.statSync(lowPath).size === GFS_CLOUD_FILE_SIZE &&
+    fs.existsSync(midPath) && fs.statSync(midPath).size === GFS_CLOUD_FILE_SIZE &&
+    fs.existsSync(highPath) && fs.statSync(highPath).size === GFS_CLOUD_FILE_SIZE
+  ) {
+    console.log('Retaining previously cached NOAA GFS cloud fraction grids (test mode).');
+    return;
+  }
+
   // 1. Attempt live ingestion from NOAA NOMADS via fetch-real-gfs.py --clouds
   const pythonScript = path.join(projectRoot, 'scripts/fetch-real-gfs.py');
   if (fs.existsSync(pythonScript)) {
@@ -281,10 +293,10 @@ export async function fetchOrGenerateGFSClouds(): Promise<void> {
     }
   }
 
-  // 2. Analytical atmospheric multi-layer cloud fallback
+  // 2. Analytical atmospheric multi-layer cloud fallback (rolled so Column 0 = -180° Antimeridian)
   console.log('Generating procedural NOAA GFS 0.25° multi-layer cloud fraction grids...');
   const t0 = Date.now();
-  const { lowBuf, midBuf, highBuf } = generateProceduralCloudGrids();
+  const { lowBuf, midBuf, highBuf } = generateProceduralCloudGrids(true);
   const durationMs = Date.now() - t0;
 
   fs.writeFileSync(lowPath, Buffer.from(lowBuf));

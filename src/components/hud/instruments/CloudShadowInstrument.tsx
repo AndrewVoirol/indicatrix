@@ -15,6 +15,7 @@ export interface CloudShadowInstrumentProps {
   isGfsActive?: boolean;
   onChange?: (intensity: number) => void;
   onShadowIntensityChange?: (intensity: number) => void;
+  isActive?: boolean;
   className?: string;
 }
 
@@ -25,6 +26,7 @@ export const CloudShadowInstrument: React.FC<CloudShadowInstrumentProps> = ({
   isGfsActive = true,
   onChange,
   onShadowIntensityChange,
+  isActive = true,
   className = '',
 }) => {
   const [internalIntensity, setInternalIntensity] = useState<number>(0.45);
@@ -180,6 +182,7 @@ export const CloudShadowInstrument: React.FC<CloudShadowInstrumentProps> = ({
         title="Drag ground umbra caliper horizontally to adjust shadow intensity (0–60%) • Double-click to reset (45%)"
         className={`relative w-full h-20 rounded-[2px] overflow-hidden cursor-crosshair select-none touch-none shadow-inner transition-all duration-200 hover:shadow-[0_0_12px_var(--theme-focus-ring)] hover:border-[var(--theme-card-border-hover)] focus-visible:ring-2 focus-visible:ring-[var(--theme-focus-ring)] focus-visible:outline-none bg-[var(--theme-instrument-viewport-bg)]`}
       >
+        {isActive && (
         <svg
           className="w-full h-full pointer-events-none"
           viewBox="0 0 240 60"
@@ -565,6 +568,7 @@ export const CloudShadowInstrument: React.FC<CloudShadowInstrumentProps> = ({
             </text>
           </g>
         </svg>
+        )}
       </div>
 
       {/* Hidden input preserving DOM ID for test compatibility */}

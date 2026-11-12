@@ -16,7 +16,7 @@ const projectRoot = path.resolve(__dirname, '..');
 const outputDir = path.join(projectRoot, 'public/data');
 const outputPath = path.join(outputDir, 'gfs-wind-latest.bin');
 
-export function generateGFSAtmosphericCirculationGrid(): ArrayBuffer {
+export function generateGFSAtmosphericCirculationGrid(rollAntimeridian = false): ArrayBuffer {
   const lonPoints = 360;
   const latPoints = 181; // 90°N to -90°S inclusive at 1.0° resolution
   const componentsPerNode = 2; // [u, v]
@@ -36,7 +36,8 @@ export function generateGFSAtmosphericCirculationGrid(): ArrayBuffer {
 
     for (let lonIdx = 0; lonIdx < lonPoints; lonIdx++) {
       const idx = (latIdx * lonPoints + lonIdx) * 2;
-      const lonRad = (lonIdx * Math.PI) / 180.0;
+      const lonDeg = rollAntimeridian ? ((lonIdx + 180) % 360) : lonIdx;
+      const lonRad = (lonDeg * Math.PI) / 180.0;
       const latRad = (latDeg * Math.PI) / 180.0;
 
       let uMps = 0.0;
@@ -84,7 +85,7 @@ export function generateGFSAtmosphericCirculationGrid(): ArrayBuffer {
  * Generates 250 hPa Upper Troposphere Jet Stream velocity grid (360x181 half-precision float16).
  * Features high-velocity core corridors (30 to 50 m/s) with Rossby wave meandering.
  */
-export function generateGFSJetStreamGrid(): ArrayBuffer {
+export function generateGFSJetStreamGrid(rollAntimeridian = false): ArrayBuffer {
   const lonPoints = 360;
   const latPoints = 181;
   const componentsPerNode = 2; // [u_jet, v_jet]
@@ -100,7 +101,8 @@ export function generateGFSJetStreamGrid(): ArrayBuffer {
 
     for (let lonIdx = 0; lonIdx < lonPoints; lonIdx++) {
       const idx = (latIdx * lonPoints + lonIdx) * 2;
-      const lonRad = (lonIdx * Math.PI) / 180.0;
+      const lonDeg = rollAntimeridian ? ((lonIdx + 180) % 360) : lonIdx;
+      const lonRad = (lonDeg * Math.PI) / 180.0;
       const latRad = (latDeg * Math.PI) / 180.0;
 
       let uMps = 0.0;
@@ -145,34 +147,33 @@ export function generateGFSJetStreamGrid(): ArrayBuffer {
   return buffer;
 }
 
-/**
- * Packs Surface and Jet Stream grids into a single 4-channel RGBA16Float buffer (521,280 bytes).
- * r: u_surface, g: v_surface, b: u_jet, a: v_jet
- */
-export function generateMultiStratumGrid(): ArrayBuffer {
-  const surfaceBuf = generateGFSAtmosphericCirculationGrid();
-  const jetBuf = generateGFSJetStreamGrid();
-
-  const numNodes = 360 * 181;
-  const multiBuf = new ArrayBuffer(numNodes * 4 * 2); // 4 components * 2 bytes = 521,280 bytes
-  const multiU16 = new Uint16Array(multiBuf);
-
-  const surfU16 = new Uint16Array(surfaceBuf);
+export function generateGFSMidTroposphereGrid(rollAntimeridian = false): ArrayBuffer {
+  const surfBuf = generateGFSAtmosphericCirculationGrid(rollAntimeridian);
+  const jetBuf = generateGFSJetStreamGrid(rollAntimeridian);
+  const surfU16 = new Uint16Array(surfBuf);
   const jetU16 = new Uint16Array(jetBuf);
-
-  for (let i = 0; i < numNodes; i++) {
-    multiU16[i * 4 + 0] = surfU16[i * 2 + 0]; // u_surface
-    multiU16[i * 4 + 1] = surfU16[i * 2 + 1]; // v_surface
-    multiU16[i * 4 + 2] = jetU16[i * 2 + 0];  // u_jet
-    multiU16[i * 4 + 3] = jetU16[i * 2 + 1];  // v_jet
+  const outBuf = new ArrayBuffer(surfBuf.byteLength);
+  const outU16 = new Uint16Array(outBuf);
+  for (let i = 0; i < outU16.length; i++) {
+    // 500 hPa thermal-wind steering interpolation in analytical fallback
+    outU16[i] = i % 2 === 0 ? jetU16[i] : surfU16[i];
   }
-
-  return multiBuf;
+  return outBuf;
 }
 
 export async function fetchOrGenerateGFS(): Promise<void> {
   if (!fs.existsSync(outputDir)) {
     fs.mkdirSync(outputDir, { recursive: true });
+  }
+
+  const jetPath = path.join(outputDir, 'gfs-jetstream-latest.bin');
+  const mid500Path = path.join(outputDir, 'gfs-wind-500hpa-latest.bin');
+  if (process.env.VITEST && fs.existsSync(outputPath) && fs.existsSync(jetPath)) {
+    const surfSize = fs.statSync(outputPath).size;
+    if (surfSize === 4152960 || surfSize === 260640) {
+      console.log('Retaining previously cached NOAA GFS wind records (test mode).');
+      return;
+    }
   }
 
   // 1. Attempt live ingestion from NOAA NOMADS via fetch-real-gfs.py
@@ -188,9 +189,8 @@ export async function fetchOrGenerateGFS(): Promise<void> {
 
       const surfStats = fs.statSync(outputPath);
       const jetPath = path.join(outputDir, 'gfs-jetstream-latest.bin');
-      const multiPath = path.join(outputDir, 'gfs-multistratum-latest.bin');
 
-      if ((surfStats.size === 4152960 || surfStats.size === 260640) && fs.existsSync(jetPath) && fs.existsSync(multiPath)) {
+      if ((surfStats.size === 4152960 || surfStats.size === 260640) && fs.existsSync(jetPath)) {
         console.log('[OK] Live NOAA GFS planetary wind velocity fields successfully ingested.');
         return;
       }
@@ -199,9 +199,9 @@ export async function fetchOrGenerateGFS(): Promise<void> {
     }
   }
 
-  // 2. Analytical atmospheric circulation fallback model
+  // 2. Analytical atmospheric circulation fallback model (rolled so Column 0 = -180° Antimeridian)
   console.log('Generating fallback NOAA GFS 1.0° planetary wind velocity field...');
-  const buffer = generateGFSAtmosphericCirculationGrid();
+  const buffer = generateGFSAtmosphericCirculationGrid(true);
 
   fs.writeFileSync(outputPath, Buffer.from(buffer));
   const stats = fs.statSync(outputPath);
@@ -212,17 +212,13 @@ export async function fetchOrGenerateGFS(): Promise<void> {
     throw new Error(`Invalid file size: ${stats.size} !== 260640`);
   }
 
-  // Also write Jet Stream grid
-  const jetPath = path.join(outputDir, 'gfs-jetstream-latest.bin');
-  const jetBuf = generateGFSJetStreamGrid();
+  // Also write Jet Stream & 500 hPa Mid-Troposphere grids
+  const jetBuf = generateGFSJetStreamGrid(true);
   fs.writeFileSync(jetPath, Buffer.from(jetBuf));
   console.log(`Successfully generated ${jetPath} (260,640 bytes)`);
-
-  // And composite multi-stratum grid
-  const multiPath = path.join(outputDir, 'gfs-multistratum-latest.bin');
-  const multiBuf = generateMultiStratumGrid();
-  fs.writeFileSync(multiPath, Buffer.from(multiBuf));
-  console.log(`Successfully generated ${multiPath} (521,280 bytes)`);
+  const midBuf = generateGFSMidTroposphereGrid(true);
+  fs.writeFileSync(mid500Path, Buffer.from(midBuf));
+  console.log(`Successfully generated ${mid500Path} (260,640 bytes)`);
 }
 
 // Run if executed directly

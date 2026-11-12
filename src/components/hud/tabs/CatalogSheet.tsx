@@ -11,6 +11,17 @@ export interface CatalogSheetProps {
   onShowCloudsChange?: (v: boolean) => void;
 }
 
+function getPresetFormatLabel(preset: (typeof DATA_LAYER_CATALOG)[number]): string {
+  if (preset.elevationEncoding) return `Format: ${preset.elevationEncoding.toUpperCase()}`;
+  if (preset.url.endsWith('-u16.bin')) return 'Format: Uint16 DEM';
+  if (preset.url.endsWith('-mesh.bin')) return 'Format: Binary Vectors';
+  if (preset.url.endsWith('.json') && preset.id === 'spacex-satellite-constellation') return 'Format: TLE JSON';
+  if (preset.id === 'google-weathernext3' || preset.id.includes('gfs')) {
+    return 'Format: Float16';
+  }
+  return 'Format: Binary';
+}
+
 export const CatalogSheet: React.FC<CatalogSheetProps> = ({
   isCatalogOpen,
   setIsCatalogOpen,
@@ -19,7 +30,7 @@ export const CatalogSheet: React.FC<CatalogSheetProps> = ({
   onAddDataLayer,
   onShowCloudsChange,
 }) => {
-  const [catalogFilter, setCatalogFilter] = useState<'all' | 'topo' | 'vectors' | 'satellite'>('all');
+  const [catalogFilter, setCatalogFilter] = useState<'all' | 'topo' | 'vectors' | 'weather' | 'satellite'>('all');
   const catalogSheetRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -66,20 +77,21 @@ export const CatalogSheet: React.FC<CatalogSheetProps> = ({
         </div>
 
         {/* Filter Chips */}
-        <div className="flex items-center gap-1.5 pt-2 pb-2 border-b border-[var(--theme-panel-border)]">
-          {(['all', 'topo', 'vectors', 'satellite'] as const).map((cat) => {
+        <div className="flex items-center gap-1 pt-2 pb-2 border-b border-[var(--theme-panel-border)] flex-wrap">
+          {(['all', 'topo', 'vectors', 'weather', 'satellite'] as const).map((cat) => {
             const isSelected = catalogFilter === cat;
             const labels = {
               all: 'ALL',
               topo: 'TOPO',
               vectors: 'VECTORS',
+              weather: 'WEATHER',
               satellite: 'SATELLITE',
             };
             return (
               <button
                 key={cat}
                 onClick={() => setCatalogFilter(cat)}
-                className={`domain-chip cursor-pointer px-2 py-0.5 rounded-[2px] text-nano font-mono font-bold tracking-wider uppercase border transition-all ${
+                className={`domain-chip cursor-pointer px-1.5 py-0.5 rounded-[2px] text-nano font-mono font-bold tracking-wider uppercase border transition-all ${
                   isSelected
                     ? 'bg-[var(--theme-control-active-bg)] text-[var(--theme-control-active-text)] border-[var(--theme-control-active-border)] shadow-sm ring-1 ring-[var(--theme-control-active-ring)]'
                     : 'border-[var(--theme-control-border)] bg-[var(--theme-control-bg)] text-[var(--theme-control-text)] hover:bg-[var(--theme-control-hover-bg)] hover:text-[var(--theme-control-hover-text)] hover:border-[var(--theme-card-border-hover)]'
@@ -99,10 +111,22 @@ export const CatalogSheet: React.FC<CatalogSheetProps> = ({
               return preset.category === 'topo' || preset.category === 'ocean' || preset.category === 'point';
             }
             if (catalogFilter === 'vectors') {
-              return preset.category === 'vectors' || preset.category === 'field' || preset.category === 'trajectory' || preset.category === 'point';
+              return (
+                preset.category === 'vectors' ||
+                preset.category === 'point' ||
+                preset.id === 'noaa-gfs-wind' ||
+                preset.id === 'noaa-gfs-jetstream'
+              );
+            }
+            if (catalogFilter === 'weather') {
+              return (
+                preset.category === 'atmospheric-clouds' ||
+                preset.category === 'planetary-clouds' ||
+                preset.category === 'field'
+              );
             }
             if (catalogFilter === 'satellite') {
-              return preset.category === 'satellite' || preset.category === 'night' || preset.category === 'trajectory' || preset.id === 'starlink-iss-orbits';
+              return preset.category === 'satellite' || preset.category === 'night' || preset.category === 'trajectory';
             }
             return true;
           }).map((preset) => {
@@ -162,12 +186,10 @@ export const CatalogSheet: React.FC<CatalogSheetProps> = ({
                         ? 'Google DeepMind WeatherNext 3 (0.1°)'
                         : preset.id.includes('gfs')
                         ? 'NOAA GFS (0.25°)'
-                        : preset.id === 'live-doppler-radar'
-                        ? 'RainViewer (Doppler Radar)'
                         : preset.attribution}
                     </span>
                     <span className="text-pico text-[var(--theme-text-muted)]">
-                      {preset.elevationEncoding ? `Format: ${preset.elevationEncoding.toUpperCase()}` : 'Format: Float32'}
+                      {getPresetFormatLabel(preset)}
                     </span>
                   </div>
 

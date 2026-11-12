@@ -5,26 +5,21 @@
 // ============================================================================
 
 import React, { useEffect, useRef, useState, useCallback } from 'react';
-import { Vector3, Vector4, Matrix4, PerspectiveCamera, Vec3Tuple, slerpVec3 } from '../core/math/cameraMath';
+import { Vector3, PerspectiveCamera, Vec3Tuple, slerpVec3 } from '../core/math/cameraMath';
 import { computeDynamicNearPlane, computeGroundClearanceFloor } from '../core/math/cameraMath';
 import { WebGPUEngine } from './WebGPUEngine';
+import { getWebGPUDevice } from './support';
+import { preloadSDFAtlas } from '../core/data/toponymy';
+import { opfsAssetStore } from '../core/data/OPFSAssetStore';
+import { telemetryStore } from '../core/TelemetryStore';
 import { CursorTracker } from '../utils/raycast';
 import { invertMacroChart } from '../core/math/volumetricMath';
 import { useCursorTracker } from '../core/CursorContext';
-import { DataLayerItem, PrognosticModelBackend, isWeatherNextModel } from '../components/hud/TelemetryHUD';
+import { DataLayerItem, PrognosticModelBackend, isWeatherNextModel, isSatelliteModel } from '../components/hud/TelemetryHUD';
 import { updateProvenanceTelemetry } from '../core/DevToolsAPI';
 
-import { GeodesicOverlayMode, ResolutionTier, SimulationMode } from '../types';
-import { WhimsicalEffectsManager } from '../core/effects/WhimsicalEffectsManager';
-import { ManifoldPinchController } from '../core/interactions/ManifoldPinchController';
-import {
-  GEODESIC_ARCS,
-  LANDMARK_ANCHORS,
-  sampleGreatCircleGeodesic,
-  generateTissotCircles,
-  evaluatePointMorph,
-  geoToSphere,
-} from '../core/GlobeOverlay';
+import { ResolutionTier, SimulationMode } from '../types';
+import { evaluatePointMorph } from '../core/GlobeOverlay';
 import { TrajectoryCameraController, Waypoint3D } from '../core/camera/TrajectoryCameraController';
 import {
   HAWAII_WAYPOINTS,
@@ -33,21 +28,8 @@ import {
   FUJI_WAYPOINTS,
 } from '../core/camera/litmusWaypoints';
 
-import {
-  type BathymetricSounding,
-  ARCHIVAL_SOUNDINGS,
-  type GeodeticBenchmark,
-  GEODETIC_BENCHMARKS,
-  GEODETIC_EDGES,
-  BENCHMARKS_MAP,
-} from '../core/data/archivalSoundings';
-
 const ORIGIN_VEC = new Vector3(0, 0, 0);
 const _scratchVecA = new Vector3();
-const _scratchProjVec = new Vector3();
-const _scratchNorm = new Vector3();
-const _scratchVDir = new Vector3();
-const _scratchProjResult: [number, number, boolean] = [0, 0, false];
 
 const TIER_CONFIG: Record<ResolutionTier, { lat: number; lon: number; bin: string }> = {
   '100k': { lat: 256, lon: 512, bin: '/geo-mesh-100k.bin' },
@@ -63,15 +45,10 @@ export interface WebGPUCanvasProps {
   mode: SimulationMode;
   layerMode?: 0 | 1 | 2;
   theme?: 0 | 1 | 2; // 0 = Marie Tharp, 1 = Cream Rag Paper, 2 = Prussian Cyanotype
-  showSoundings?: boolean;
-  showTriangulation?: boolean;
   showCartouche?: boolean;
   resolution: ResolutionTier;
   cameraTarget?: Vec3Tuple | Vector3;
   cameraPosition?: Vec3Tuple | Vector3;
-  activeOverlay?: GeodesicOverlayMode;
-  showLandmarks?: boolean;
-  showTissot?: boolean;
   showVectors?: boolean;
   dataLayers?: DataLayerItem[];
   onFpsUpdate?: (fps: number) => void;
@@ -83,7 +60,7 @@ export interface WebGPUCanvasProps {
     vramMb: number;
   }) => void;
   onError?: (err: Error) => void;
-  onCoordsChange?: (latDeg: number, lonDeg: number) => void;
+  onCoordsChange?: (latDeg: number, lonDeg: number, camDist?: number) => void;
   onResolutionChange?: (r: ResolutionTier) => void;
   cursorPhysicsEnabled?: boolean;
   cdlodEnabled?: boolean;
@@ -91,10 +68,7 @@ export interface WebGPUCanvasProps {
   isZenMode?: boolean;
   isSidebarOpen?: boolean;
   startTime?: number;
-  vortexStrength?: number;
-  fractureIntensity?: number;
   onGpuProfilerReport?: (report: any) => void;
-  isolatedStratum?: number | null;
   isDemoMode?: boolean;
   demoSequence?: 'hawaii' | 'cape-cod' | 'grand-canyon' | 'fuji';
   onDemoModeChange?: (active: boolean, sequence?: 'hawaii' | 'cape-cod' | 'grand-canyon' | 'fuji') => void;
@@ -118,13 +92,11 @@ export interface WebGPUCanvasProps {
   verticalScaleMode?: number;
   rainShadowFeedback?: number;
   pluvialGamma?: number;
-  weatherOpticalMode?: number;
   timelineMinutes?: number;
   scrubTau?: number;
   weatherTau?: number;
   thermodynamicGating?: boolean;
   onThermodynamicGatingChange?: (v: boolean) => void;
-  showAtmosphere?: boolean;
   volumetricClouds?: boolean;
   onShowCloudsChange?: (v: boolean) => void;
   onTogglePlanetaryLayer?: (id: string, force?: boolean) => void;
@@ -177,32 +149,15 @@ interface RegionalManifestEntry {
   cogUrl?: string;
 }
 
-const textMetricsCache = new Map<string, number>();
-function getCachedTextWidth(ctx: CanvasRenderingContext2D, text: string, font: string): number {
-  const key = `${font}__${text}`;
-  let w = textMetricsCache.get(key);
-  if (w === undefined) {
-    ctx.font = font;
-    w = ctx.measureText(text).width;
-    textMetricsCache.set(key, w);
-  }
-  return w;
-}
-
 export const WebGPUCanvas: React.FC<WebGPUCanvasProps> = React.memo(({
   unfurlProgress,
   mode,
   layerMode,
   theme = 0,
-  showSoundings = true,
-  showTriangulation = false,
   showCartouche = true,
   resolution,
   cameraTarget,
   cameraPosition,
-  activeOverlay = 'off',
-  showLandmarks = false,
-  showTissot = false,
   showVectors = true,
   dataLayers,
   onFpsUpdate,
@@ -216,10 +171,7 @@ export const WebGPUCanvas: React.FC<WebGPUCanvasProps> = React.memo(({
   isZenMode = false,
   isSidebarOpen = true,
   startTime,
-  vortexStrength = 1.0,
-  fractureIntensity = 1.0,
   onGpuProfilerReport,
-  isolatedStratum,
   isDemoMode = false,
   demoSequence = 'hawaii',
   onDemoModeChange,
@@ -243,12 +195,10 @@ export const WebGPUCanvas: React.FC<WebGPUCanvasProps> = React.memo(({
   verticalScaleMode = 1,
   rainShadowFeedback = 0.0,
   pluvialGamma = 0.0,
-  weatherOpticalMode = 0,
   timelineMinutes = 0,
   scrubTau = 0,
   weatherTau = 0,
   thermodynamicGating = true,
-  showAtmosphere = false,
   volumetricClouds = true,
   onShowCloudsChange,
   onTogglePlanetaryLayer,
@@ -286,7 +236,6 @@ export const WebGPUCanvas: React.FC<WebGPUCanvasProps> = React.memo(({
 }) => {
   const containerRef = useRef<HTMLDivElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
-  const overlayCanvasRef = useRef<HTMLCanvasElement>(null);
   const viewportSizeRef = useRef<{ width: number; height: number; dpr: number }>({ width: 0, height: 0, dpr: 1 });
   const engineRef = useRef<WebGPUEngine>(new WebGPUEngine());
   if (typeof window !== 'undefined') {
@@ -323,68 +272,7 @@ export const WebGPUCanvas: React.FC<WebGPUCanvasProps> = React.memo(({
     }
   }, [cdlodEnabled]);
 
-  // Whimsical Effects & Signature Manifold Pinch Controllers
-  const whimsicalManagerRef = useRef<WhimsicalEffectsManager>(new WhimsicalEffectsManager());
-  const pinchControllerRef = useRef<ManifoldPinchController>(new ManifoldPinchController());
-  const isPinchingRef = useRef<boolean>(false);
   const currentHitPosRef = useRef<Vector3>(new Vector3(0, 0, 5));
-
-  // Pre-sampled cartographic overlay data
-  const sampledArcSegmentsRef = useRef<Array<{ category: string; color: string; segments: { lon: number; lat: number }[] }>>([]);
-  const tissotCirclesRef = useRef<ReturnType<typeof generateTissotCircles>>([]);
-
-  useEffect(() => {
-    sampledArcSegmentsRef.current = GEODESIC_ARCS.map(arc => ({
-      category: arc.category,
-      color: arc.color,
-      segments: sampleGreatCircleGeodesic(arc.from, arc.to, 44),
-    }));
-    tissotCirclesRef.current = generateTissotCircles(30, 45, 4.8, 24);
-  }, []);
-
-  const overlayCacheRef = useRef<{
-    camX: number;
-    camY: number;
-    camZ: number;
-    unfurl: number;
-    mode: number;
-    w: number;
-    h: number;
-    theme: number;
-    frame: number;
-    landmarks: Array<{
-      lx: number;
-      ly: number;
-      px: number;
-      py: number;
-      pw: number;
-      ph: number;
-      label: string;
-    }>;
-    soundings: Array<{
-      sx: number;
-      sy: number;
-      text: string;
-    }>;
-    benchmarks: Array<{
-      bx: number;
-      by: number;
-      id: string;
-    }>;
-  }>({
-    camX: 0,
-    camY: 0,
-    camZ: 0,
-    unfurl: -1,
-    mode: -1,
-    w: 0,
-    h: 0,
-    theme: -1,
-    frame: 0,
-    landmarks: [],
-    soundings: [],
-    benchmarks: [],
-  });
 
   // Camera & Orbit State
   const cameraRef = useRef<PerspectiveCamera>(
@@ -434,9 +322,10 @@ export const WebGPUCanvas: React.FC<WebGPUCanvasProps> = React.memo(({
   const lastProfilerTimeRef = useRef(0);
 
   // Reusable objects to eliminate per-frame GC allocations in 120 FPS render loop
-  const reusableHitPosRef = useRef(new Vector3());
   const telemetryNormRef = useRef(new Vector3());
   const telemetryForwardRef = useRef(new Vector3());
+  const ownedWnRingRef = useRef<any>(null);
+  const ownedWnDataSourceRef = useRef<any>(null);
 
   const computeCachedLayers = (curDataLayers?: any[]) => {
     const primaryReliefLayer =
@@ -458,8 +347,7 @@ export const WebGPUCanvas: React.FC<WebGPUCanvasProps> = React.memo(({
       activeDataLayer.category === 'topography' ||
       activeDataLayer.type === 'raster' ||
       activeDataLayer.renderStyle === 'architectural' ||
-      activeDataLayer.renderStyle === 'hybrid' ||
-      activeDataLayer.renderStyle === 'photoreal'
+      activeDataLayer.renderStyle === 'hybrid'
     ) : false;
 
     const showContours = !!curDataLayers?.find(
@@ -471,16 +359,14 @@ export const WebGPUCanvas: React.FC<WebGPUCanvasProps> = React.memo(({
       !!curDataLayers?.find(
         (l) => (l.id === 'noaa-gfs-wind' || l.id === 'noaa-grib2-wind' || l.id === 'gfs-surface-winds' || l.id === 'gfs-wind-velocity-grid') && l.visible
       );
-    const hasJetStream = !!curDataLayers?.find(
-      (l) => (l.id === 'noaa-gfs-jetstream' || l.id === 'gfs-jetstream') && l.visible
+    const jetLayer = curDataLayers?.find(
+      (l) => l.id === 'noaa-gfs-jetstream' || l.id === 'gfs-jetstream'
     );
+    const hasJetStream = Boolean(jetLayer?.visible);
     const showSatellites = !!curDataLayers?.find(
       (l) => (l.id === 'starlink-iss-orbits' || l.id === 'spacex-satellite-constellation') && l.visible
     );
     const cloudLayer = curDataLayers?.find((l) => l.id === 'noaa-gfs-clouds' || l.id === 'google-weathernext3' || l.id === 'weathernext3') || null;
-    const atmLayer = curDataLayers?.find(
-      (l) => (l.id === 'atmosphere-scatter' || l.id === 'planetary-atmosphere')
-    ) || null;
 
     return {
       activeDataLayer,
@@ -491,7 +377,6 @@ export const WebGPUCanvas: React.FC<WebGPUCanvasProps> = React.memo(({
       hasJetStream,
       showSatellites,
       cloudLayer,
-      atmLayer,
     };
   };
 
@@ -525,17 +410,9 @@ export const WebGPUCanvas: React.FC<WebGPUCanvasProps> = React.memo(({
     mode,
     layerMode,
     theme,
-    showSoundings,
-    showTriangulation,
     showCartouche,
     showVectors,
-    activeOverlay,
-    showLandmarks,
-    showTissot,
     dataLayers,
-    vortexStrength,
-    fractureIntensity,
-    isolatedStratum,
     isDemoMode,
     demoSequence,
     showClouds,
@@ -556,12 +433,10 @@ export const WebGPUCanvas: React.FC<WebGPUCanvasProps> = React.memo(({
     verticalScaleMode,
     rainShadowFeedback,
     pluvialGamma,
-    weatherOpticalMode,
     timelineMinutes,
     scrubTau,
     weatherTau,
     thermodynamicGating,
-    showAtmosphere,
     volumetricClouds,
     resolution,
     purityMode,
@@ -599,17 +474,9 @@ export const WebGPUCanvas: React.FC<WebGPUCanvasProps> = React.memo(({
       mode,
       layerMode,
       theme,
-      showSoundings,
-      showTriangulation,
       showCartouche,
       showVectors,
-      activeOverlay,
-      showLandmarks,
-      showTissot,
       dataLayers,
-      vortexStrength,
-      fractureIntensity,
-      isolatedStratum,
       isDemoMode,
       demoSequence,
       showClouds,
@@ -630,12 +497,10 @@ export const WebGPUCanvas: React.FC<WebGPUCanvasProps> = React.memo(({
       verticalScaleMode,
       rainShadowFeedback,
       pluvialGamma,
-      weatherOpticalMode,
       timelineMinutes,
       scrubTau,
       weatherTau,
       thermodynamicGating,
-      showAtmosphere,
       volumetricClouds,
       resolution,
       purityMode,
@@ -648,7 +513,7 @@ export const WebGPUCanvas: React.FC<WebGPUCanvasProps> = React.memo(({
       grainAngleRadians,
       sheenIntensity,
       absorptionFeathering,
-      cameraPitchDeg,
+      cameraPitchDeg: cameraPitchDeg !== undefined ? cameraPitchDeg : (stateRef.current as any)?.cameraPitchDeg,
       cdlodDiagnosticMode,
       prognosticModel,
       prognosticVariable,
@@ -667,7 +532,7 @@ export const WebGPUCanvas: React.FC<WebGPUCanvasProps> = React.memo(({
       showToponymy,
     };
     cachedLayersRef.current = computeCachedLayers(dataLayers);
-  }, [unfurlProgress, mode, layerMode, theme, showSoundings, showTriangulation, showCartouche, showVectors, activeOverlay, showLandmarks, showTissot, dataLayers, vortexStrength, fractureIntensity, isolatedStratum, isDemoMode, demoSequence, showClouds, showCloudLow, showCloudMid, showCloudHigh, cloudFalseColor, cloudDriftSpeed, cloudOpacity, cloudThickness, cloudLowTop, cloudErosion, cloudFreqHoriz, cloudFreqVert, cloudExtinction, atmosphericScale, shadowIntensity, verticalScaleMode, rainShadowFeedback, pluvialGamma, weatherOpticalMode, timelineMinutes, scrubTau, weatherTau, thermodynamicGating, showAtmosphere, volumetricClouds, resolution, purityMode, substrateHaptics, paperSubstrate, fiberFrequency, fiberAnisotropy, plateMarkDepthMeters, inkRidgeHeightMeters, grainAngleRadians, sheenIntensity, absorptionFeathering, cameraPitchDeg, cdlodDiagnosticMode, prognosticModel, prognosticVariable, windSpeedMultiplier, windParticleLifetime, terrainShadows, showTerrainShadows, maxRayDistanceMeters, penumbraSoftness, sampleStepCount, geomorphicHydrology, showDrainageHydrology, pluvialDischargeCoupling, bedrockIncision, contourActive, showToponymy]);
+  }, [unfurlProgress, mode, layerMode, theme, showCartouche, showVectors, dataLayers, isDemoMode, demoSequence, showClouds, showCloudLow, showCloudMid, showCloudHigh, cloudFalseColor, cloudDriftSpeed, cloudOpacity, cloudThickness, cloudLowTop, cloudErosion, cloudFreqHoriz, cloudFreqVert, cloudExtinction, atmosphericScale, shadowIntensity, verticalScaleMode, rainShadowFeedback, pluvialGamma, timelineMinutes, scrubTau, weatherTau, thermodynamicGating, volumetricClouds, resolution, purityMode, substrateHaptics, paperSubstrate, fiberFrequency, fiberAnisotropy, plateMarkDepthMeters, inkRidgeHeightMeters, grainAngleRadians, sheenIntensity, absorptionFeathering, cameraPitchDeg, cdlodDiagnosticMode, prognosticModel, prognosticVariable, windSpeedMultiplier, windParticleLifetime, terrainShadows, showTerrainShadows, maxRayDistanceMeters, penumbraSoftness, sampleStepCount, geomorphicHydrology, showDrainageHydrology, pluvialDischargeCoupling, bedrockIncision, contourActive, showToponymy]);
 
   useEffect(() => {
     if (engineRef.current) {
@@ -697,10 +562,10 @@ export const WebGPUCanvas: React.FC<WebGPUCanvasProps> = React.memo(({
   }, [thermodynamicGating]);
 
   useEffect(() => {
-    if (engineRef.current) {
-      engineRef.current.setWeatherOpticalMode(weatherOpticalMode);
+    if (engineRef.current && typeof engineRef.current.setVolumetricCloudsEnabled === 'function') {
+      engineRef.current.setVolumetricCloudsEnabled(volumetricClouds ?? true);
     }
-  }, [weatherOpticalMode]);
+  }, [volumetricClouds]);
 
   useEffect(() => {
     if (engineRef.current) {
@@ -717,33 +582,41 @@ export const WebGPUCanvas: React.FC<WebGPUCanvasProps> = React.memo(({
       (window as any).__INDICATRIX_WEATHERNEXT_DATA_SOURCE__ ||
       (window as any).__INDICATRIX_WEATHERNEXT_SOURCE__;
     if (weatherNextDS && !weatherNextDS.disposed && typeof weatherNextDS.setTime === 'function') {
-      const clamped = Math.max(-110, Math.min(720, timelineMinutes ?? 0));
-      if (clamped >= 0) {
-        const wnRing = (window as any).__INDICATRIX_WEATHERNEXT_RING_BUFFER__;
-        if (wnRing && !wnRing.disposed && engineRef.current && engineRef.current.precipRingBuffer !== wnRing) {
-          engineRef.current.setPrecipitationRingBuffer(wnRing);
-        }
-        const totalHours = clamped / 60;
-        const bracketHour = totalHours >= 12 ? 11 : Math.min(11, Math.floor(totalHours));
-        const tau = totalHours >= 12 ? 1.0 : Math.max(0.0, Math.min(1.0, totalHours - bracketHour));
-        weatherNextDS.setTime(bracketHour, tau).catch(() => {});
+      const clamped = Math.max(0, Math.min(720, timelineMinutes ?? 0));
+      const wnRing = (window as any).__INDICATRIX_WEATHERNEXT_RING_BUFFER__;
+      if (wnRing && !wnRing.disposed && engineRef.current && engineRef.current.precipRingBuffer !== wnRing) {
+        engineRef.current.setPrecipitationRingBuffer(wnRing);
       }
+      const totalHours = clamped / 60;
+      const bracketHour = totalHours >= 12 ? 11 : Math.min(11, Math.floor(totalHours));
+      const tau = totalHours >= 12 ? 1.0 : Math.max(0.0, Math.min(1.0, totalHours - bracketHour));
+      weatherNextDS.setTime(bracketHour, tau).catch(() => {});
     }
     const isWn = isWeatherNextModel(prognosticModel);
-    if (isWn && engineRef.current && timelineMinutes !== undefined && timelineMinutes >= 0) {
+    const isSat = isSatelliteModel(prognosticModel);
+    if ((isWn || isSat) && engineRef.current && timelineMinutes !== undefined && timelineMinutes >= 0) {
       const targetHour = Math.min(11, Math.max(0, Math.floor(timelineMinutes / 60)));
-      engineRef.current.loadWeatherNextCloudLayers(targetHour).catch(() => {});
-    }
-    const radarDS = (window as any).__INDICATRIX_LIVE_RADAR_DATA_SOURCE__;
-    if (radarDS && !radarDS.disposed && timelineMinutes !== undefined && timelineMinutes < 0) {
-      radarDS.setAbsoluteMinutes(timelineMinutes);
-      const radarRing = (window as any).__INDICATRIX_RADAR_RING_BUFFER__;
-      if (radarRing && !radarRing.disposed && engineRef.current && engineRef.current.precipRingBuffer !== radarRing) {
-        engineRef.current.setPrecipitationRingBuffer(radarRing);
+      const nextHour = Math.min(11, targetHour + 1);
+      if (isSat && typeof engineRef.current.loadSatelliteCloudLayers === 'function') {
+        engineRef.current.loadSatelliteCloudLayers(targetHour).catch(() => {});
+      } else {
+        engineRef.current.loadWeatherNextCloudLayers(targetHour).catch(() => {});
       }
-      radarDS.uploadToRingBuffer();
+      engineRef.current.loadWindTexture(`/data/weathernext/wind_10m_vector-${targetHour}.bin`, 0).catch(() => {});
+      engineRef.current.loadWindTexture(`/data/weathernext/wind_10m_vector-${nextHour}.bin`, 1).catch(() => {});
+      engineRef.current.loadTemperatureTexture(`/data/weathernext/temperature_2m_mean-${targetHour}.bin`).catch(() => {});
+      if (isSat && targetHour === 0) {
+        engineRef.current
+          .loadDewpointTexture(
+            `/data/weathernext/dewpoint_temperature_2m_mean-${targetHour}.bin`,
+            '/data/satellite-radiative-optical-depth-latest.bin'
+          )
+          .catch(() => {});
+      } else {
+        engineRef.current.loadDewpointTexture(`/data/weathernext/dewpoint_temperature_2m_mean-${targetHour}.bin`).catch(() => {});
+      }
     }
-  }, [timelineMinutes, scrubTau, weatherTau, prognosticModel]);
+  }, [timelineMinutes, scrubTau, weatherTau, prognosticModel, dataLayers, prognosticVariable]);
 
   useEffect(() => {
     if (engineRef.current) {
@@ -794,10 +667,30 @@ export const WebGPUCanvas: React.FC<WebGPUCanvasProps> = React.memo(({
     if (hasSatellites) {
       engine.loadSatelliteTrajectories('/data/tle-starlink.json').catch(() => {});
     }
+    const hasContours =
+      Boolean(contourActive) ||
+      !!dataLayers?.find((l) => l.id === 'usgs-elevation-contours' && l.visible);
+    if (hasContours && engine.contourIndexCount === 0) {
+      engine.loadContourMesh('/geo-contour-mesh.bin').catch(() => {});
+    }
+    const explicitEtopoLayer = dataLayers?.find((l) => l.id === 'global-dem-crust' && l.visible);
+    if (explicitEtopoLayer && explicitEtopoLayer.url) {
+      engine.loadDEMTexture(explicitEtopoLayer.url).catch(() => {});
+    }
     const isWnModel = isWeatherNextModel(prognosticModel);
+    const isSatModel = isSatelliteModel(prognosticModel);
+    const wnTargetHour = Math.min(11, Math.max(0, Math.floor((timelineMinutes ?? 0) / 60)));
+    const wnNextHour = Math.min(11, wnTargetHour + 1);
+    const hasGfsClouds = !!dataLayers?.find(
+      (l) => (l.id === 'noaa-gfs-clouds' || l.id === 'atmospheric-clouds') && l.visible
+    );
 
-    if (showClouds) {
-      engine.loadAllCloudLayers(isWnModel).catch(() => {});
+    if (showClouds || hasGfsClouds) {
+      if (isSatModel) {
+        engine.loadAllCloudLayers(false, wnTargetHour, 'satellite').catch(() => {});
+      } else {
+        engine.loadAllCloudLayers(isWnModel && !hasGfsClouds, wnTargetHour).catch(() => {});
+      }
     }
 
     const hasWind =
@@ -806,78 +699,69 @@ export const WebGPUCanvas: React.FC<WebGPUCanvasProps> = React.memo(({
       !!dataLayers?.find(
         (l) => (l.id === 'noaa-gfs-wind' || l.id === 'noaa-grib2-wind' || l.id === 'gfs-surface-winds' || l.id === 'gfs-wind-velocity-grid') && l.visible
       );
-    const wnTargetHour = Math.min(11, Math.max(0, Math.floor((timelineMinutes ?? 0) / 60)));
     if (hasWind || showClouds) {
-      if (isWnModel) {
-        engine.loadWindTexture(`/data/weathernext/wind_10m_vector-${wnTargetHour}.bin`).catch(() => {
-          engine.loadWindTexture('/data/gfs-wind-latest.bin').catch(() => {});
+      if (isWnModel || isSatModel) {
+        engine.loadWindTexture(`/data/weathernext/wind_10m_vector-${wnTargetHour}.bin`, 0).catch(() => {
+          engine.loadWindTexture('/data/gfs-wind-latest.bin', 0).catch(() => {});
         });
+        engine.loadWindTexture(`/data/weathernext/wind_10m_vector-${wnNextHour}.bin`, 1).catch(() => {});
       } else {
-        engine.loadWindTexture('/data/gfs-wind-latest.bin').catch(() => {});
+        engine.loadWindTexture('/data/gfs-wind-latest.bin', 0).catch(() => {});
       }
     }
-    const hasJetStream = !!dataLayers?.find(
-      (l) => (l.id === 'noaa-gfs-jetstream' || l.id === 'gfs-jetstream') && l.visible
+    const jetLayer = dataLayers?.find(
+      (l) => l.id === 'noaa-gfs-jetstream' || l.id === 'gfs-jetstream'
     );
+    const hasJetStream = Boolean(jetLayer?.visible);
     if (hasJetStream || showClouds) {
       engine.loadJetStreamTexture('/data/gfs-jetstream-latest.bin').catch(() => {});
     }
-    const hasRadar = !!dataLayers?.find(
-      (l) => (l.id === 'live-doppler-radar' || l.type === 'Doppler Radar Mosaic') && l.visible
+    const hasExplicitWeatherNextLayer = !!dataLayers?.find(
+      (l) =>
+        (l.id === 'google-weathernext3' ||
+          l.id === 'weathernext' ||
+          l.type === '0.1° (10km) AI') &&
+        l.visible
     );
-    if (hasRadar) {
-      import('../core/data/LiveRadarDataSource').then(({ LiveRadarDataSource }) => {
-        let radarDS = (window as any).__INDICATRIX_LIVE_RADAR_DATA_SOURCE__;
-        if (!radarDS || radarDS.disposed) {
-          radarDS = new LiveRadarDataSource({ autoLoad: true });
-          (window as any).__INDICATRIX_LIVE_RADAR_DATA_SOURCE__ = radarDS;
-        }
-        const dev = engine.getDevice();
-        if (dev) {
-          let ring = (window as any).__INDICATRIX_RADAR_RING_BUFFER__;
-          if (!ring || ring.disposed) {
-            ring = radarDS.createRingBuffer(dev);
-            (window as any).__INDICATRIX_RADAR_RING_BUFFER__ = ring;
-          }
-          if (engine.precipRingBuffer !== ring) {
-            engine.setPrecipitationRingBuffer(ring);
-          }
-          radarDS.uploadToRingBuffer();
-        }
-      }).catch((err) => {
-        console.warn('[WebGPUCanvas] Failed to initialize live Doppler radar:', err);
-      });
-    } else {
-      const radarRing = (window as any).__INDICATRIX_RADAR_RING_BUFFER__;
-      if (radarRing && engine.precipRingBuffer === radarRing) {
-        engine.setPrecipitationRingBuffer(null);
-      }
-    }
-    const hasWeatherNext =
+    const hasPrecipVariable = Boolean(
+      prognosticVariable &&
+        prognosticVariable !== 'none' &&
+        prognosticVariable !== 'wind_10m_vector'
+    );
+    const hasWeatherNextScalars =
       isWnModel &&
-      (showClouds ||
-        Boolean(prognosticVariable && prognosticVariable !== 'none') ||
-        !!dataLayers?.find(
-          (l) =>
-            (l.id === 'google-weathernext3' ||
-              l.id === 'weathernext' ||
-              l.type === '0.1° (10km) AI') &&
-            l.visible
-        ));
-    if (hasWeatherNext) {
+      (showClouds || hasPrecipVariable || hasExplicitWeatherNextLayer || Boolean(geomorphicHydrology));
+    if (hasWeatherNextScalars) {
       const targetHour = wnTargetHour;
       if (!(hasWind || showClouds)) {
         engine.loadWindTexture(`/data/weathernext/wind_10m_vector-${targetHour}.bin`).catch(() => {});
       }
       engine.loadTemperatureTexture(`/data/weathernext/temperature_2m_mean-${targetHour}.bin`).catch(() => {});
       engine.loadDewpointTexture(`/data/weathernext/dewpoint_temperature_2m_mean-${targetHour}.bin`).catch(() => {});
+    }
+
+    const needsPrecipRing =
+      (isWnModel &&
+        (hasPrecipVariable ||
+          hasExplicitWeatherNextLayer ||
+          Boolean(geomorphicHydrology) ||
+          (timelineMinutes ?? 0) > 0)) ||
+      (isSatModel && (timelineMinutes ?? 0) > 0);
+
+    if (needsPrecipRing) {
+      const targetHour = wnTargetHour;
+      const clampedMins = Math.max(0, Math.min(720, timelineMinutes ?? 0));
+      const totalHours = clampedMins / 60;
+      const bracketHour = totalHours >= 12 ? 11 : Math.min(11, Math.floor(totalHours));
+      const tau = totalHours >= 12 ? 1.0 : Math.max(0.0, Math.min(1.0, totalHours - bracketHour));
       import('../core/data/WeatherNextDataSource').then(({ WeatherNextDataSource }) => {
         import('./TemporalTextureRingBuffer').then(({ TemporalTextureRingBuffer }) => {
           const dev = engine.getDevice();
-          if (dev) {
+          if (dev && engine.initialized) {
             let wnRing = (window as any).__INDICATRIX_WEATHERNEXT_RING_BUFFER__;
             if (!wnRing || wnRing.disposed || wnRing.width !== 3600) {
               wnRing = new TemporalTextureRingBuffer(dev, 3600, 1801, 'r16float');
+              ownedWnRingRef.current = wnRing;
               (window as any).__INDICATRIX_WEATHERNEXT_RING_BUFFER__ = wnRing;
             }
             if ((timelineMinutes ?? 0) >= 0 && engine.precipRingBuffer !== wnRing) {
@@ -888,10 +772,16 @@ export const WebGPUCanvas: React.FC<WebGPUCanvasProps> = React.memo(({
               (window as any).__INDICATRIX_WEATHERNEXT_SOURCE__;
             if (!weatherNextDS || weatherNextDS.disposed) {
               weatherNextDS = new WeatherNextDataSource({ ringBuffer: wnRing });
+              ownedWnDataSourceRef.current = weatherNextDS;
               (window as any).__INDICATRIX_WEATHERNEXT_DATA_SOURCE__ = weatherNextDS;
               weatherNextDS
                 .loadMetadata()
                 .then(() => weatherNextDS.seekHour(targetHour, 'total_precipitation_1hr_mean'))
+                .then(() => {
+                  if ((timelineMinutes ?? 0) > 0 && typeof weatherNextDS.setTime === 'function') {
+                    return weatherNextDS.setTime(bracketHour, tau);
+                  }
+                })
                 .catch(() => weatherNextDS.seekHour(targetHour, 'total_precipitation_1hr_mean'))
                 .catch((err: any) => {
                   console.warn('[WeatherNext] Initial seekHour error:', err);
@@ -903,21 +793,27 @@ export const WebGPUCanvas: React.FC<WebGPUCanvasProps> = React.memo(({
         console.warn('[WebGPUCanvas] Failed to initialize WeatherNext 3:', err);
       });
     } else {
-      const wnRing = (window as any).__INDICATRIX_WEATHERNEXT_RING_BUFFER__;
-      if (wnRing && engine.precipRingBuffer === wnRing && !hasRadar) {
+      if (engine.precipRingBuffer) {
         engine.setPrecipitationRingBuffer(null);
       }
+      if (ownedWnDataSourceRef.current) {
+        const dsToDispose = ownedWnDataSourceRef.current;
+        ownedWnDataSourceRef.current = null;
+        if ((window as any).__INDICATRIX_WEATHERNEXT_DATA_SOURCE__ === dsToDispose) {
+          delete (window as any).__INDICATRIX_WEATHERNEXT_DATA_SOURCE__;
+        }
+        try { dsToDispose.dispose?.(); } catch {}
+      }
+      if (ownedWnRingRef.current) {
+        const ringToDispose = ownedWnRingRef.current;
+        ownedWnRingRef.current = null;
+        if ((window as any).__INDICATRIX_WEATHERNEXT_RING_BUFFER__ === ringToDispose) {
+          delete (window as any).__INDICATRIX_WEATHERNEXT_RING_BUFFER__;
+        }
+        try { ringToDispose.dispose?.(); } catch {}
+      }
     }
-    if (!hasRadar && !hasWeatherNext && engine.precipRingBuffer) {
-      engine.setPrecipitationRingBuffer(null);
-    }
-    const hasPhotoreal = !!dataLayers?.find(
-      (l) => (l.renderStyle === 'photoreal' || l.id === 'photoreal-satellite-layer') && l.visible
-    );
-    if (hasPhotoreal && !engine.isOrbitalTexturesLoaded()) {
-      engine.loadOrbitalTextures('/earth-blue-marble-4k.webp', '/earth-night-lights-4k.webp').catch(() => {});
-    }
-  }, [dataLayers, prognosticModel, prognosticVariable, showClouds, isLoading, isEngineReady]);
+  }, [dataLayers, prognosticModel, prognosticVariable, showClouds, contourActive, geomorphicHydrology, timelineMinutes, isLoading, isEngineReady]);
 
   // WebGPU Device Loss Recovery
   useEffect(() => {
@@ -936,7 +832,7 @@ export const WebGPUCanvas: React.FC<WebGPUCanvasProps> = React.memo(({
     let dispScale = 0.08;
     if (engineRef.current) {
       const elev = engineRef.current.sampleCPUElevation(lonDeg, latDeg);
-      elevM = elev?.elevationMeters ?? 0;
+      elevM = elev?.maxElevationMeters ?? elev?.elevationMeters ?? 0;
       const liveProps = typeof window !== 'undefined'
         ? ((window as any).__INDICATRIX_LIVE_UNIFORMS__ || (window as any).__INDICATRIX_LIVE_PROPS__ || (window as any).__INDICATRIX_LIVE_OVERRIDES__)
         : null;
@@ -944,28 +840,6 @@ export const WebGPUCanvas: React.FC<WebGPUCanvasProps> = React.memo(({
     }
     const r = camRadius ?? sphericalRef.current.radius;
     return computeGroundClearanceFloor(elevM, dispScale, r);
-  }, []);
-
-  // Orbital Kinematics updates
-  const updateCameraTransform = useCallback(() => {
-    const camera = cameraRef.current;
-    const spherical = sphericalRef.current;
-    const target = targetRef.current;
-
-    const scrubAlpha = typeof window !== 'undefined' ? (window as any).__INDICATRIX_SCRUB_ALPHA__ : undefined;
-    const animAlpha = typeof window !== 'undefined' ? (window as any).__INDICATRIX_ANIM_ALPHA__ : undefined;
-    const curUnfurl = scrubAlpha !== undefined ? scrubAlpha : (animAlpha !== undefined ? animAlpha : (stateRef.current?.unfurlProgress ?? 0));
-    const clampedUnfurl = Math.max(0.0, Math.min(1.0, curUnfurl));
-    const unrollEase = clampedUnfurl * clampedUnfurl * (3.0 - 2.0 * clampedUnfurl);
-
-    const zoomWeight = Math.max(0.0, Math.min(1.0, (14.0 - spherical.radius) / 5.0));
-    const effRadius = Math.max(0.08, spherical.radius - 5.0 * unrollEase * zoomWeight);
-
-    camera.position.x = target.x + effRadius * Math.sin(spherical.phi) * Math.sin(spherical.theta);
-    camera.position.y = target.y + effRadius * Math.cos(spherical.phi);
-    camera.position.z = target.z + effRadius * Math.sin(spherical.phi) * Math.cos(spherical.theta);
-    camera.lookAt(target);
-    camera.updateMatrixWorld();
   }, []);
 
   // Unified Oblique and Planar Camera Kinematics (Dual-mode Globe & Unfurled Sheet)
@@ -1027,10 +901,16 @@ export const WebGPUCanvas: React.FC<WebGPUCanvasProps> = React.memo(({
     const curMode = stateRef.current?.mode ?? 0;
 
     if (curUnfurl < 0.001) {
+      const isNadir = Math.abs(pitchDeg) <= 0.01;
+      const isNorthUp = isNadir && Math.abs(headingDeg) <= 0.01;
       return {
         camX: sphereCamX, camY: sphereCamY, camZ: sphereCamZ,
-        targetX: sphereTargetX, targetY: sphereTargetY, targetZ: sphereTargetZ,
-        vUpX: sphereUpX, vUpY: sphereUpY, vUpZ: sphereUpZ,
+        targetX: isNadir ? 0 : sphereTargetX,
+        targetY: isNadir ? 0 : sphereTargetY,
+        targetZ: isNadir ? 0 : sphereTargetZ,
+        vUpX: isNorthUp ? 0 : sphereUpX,
+        vUpY: isNorthUp ? 1 : sphereUpY,
+        vUpZ: isNorthUp ? 0 : sphereUpZ,
         safeRadius, theta, phi
       };
     }
@@ -1038,55 +918,134 @@ export const WebGPUCanvas: React.FC<WebGPUCanvasProps> = React.memo(({
     const deformed = evaluatePointMorph(lonDeg, latDeg, curUnfurl, curMode, 0, 0.0);
     const altitudeAboveGround = Math.max(0.015, safeRadius - 5.0 * Math.sin(pRad));
 
-    const planarCamX = deformed[0];
-    const planarCamY = deformed[1];
-    const planarCamZ = deformed[2] + altitudeAboveGround;
+    const t = Math.max(0.0, Math.min(1.0, curUnfurl));
+    const tEased = t * t * (3.0 - 2.0 * t);
 
-    const planarFwdX = Math.sin(hRad);
-    const planarFwdY = Math.cos(hRad);
+    // Intrinsic SO(3) Darboux frame on the unrolling developable manifold:
+    // Smoothly unrolls azimuthal longitude roll and latitudinal pitch from sphere (t=0) to flat sheet (t=1)
+    // without chording through the cylinder interior or flipping normals at high longitudes (|lon| > 90°).
+    const thetaRoll = (1.0 - tEased) * theta;
+    const psiLat = (1.0 - tEased) * ((latDeg * Math.PI) / 180);
+    const cosPsi = Math.cos(psiLat);
+    const sinPsi = Math.sin(psiLat);
+    const sinRoll = Math.sin(thetaRoll);
+    const cosRoll = Math.cos(thetaRoll);
 
-    const planarVDirX = Math.sin(pRad) * planarFwdX;
-    const planarVDirY = Math.sin(pRad) * planarFwdY;
-    const planarVDirZ = -Math.cos(pRad);
+    const uX = cosPsi * sinRoll;
+    const uY = sinPsi;
+    const uZ = cosPsi * cosRoll;
+
+    const eX = cosRoll;
+    const eY = 0.0;
+    const eZ = -sinRoll;
+
+    const nNorthX = -sinPsi * sinRoll;
+    const nNorthY = cosPsi;
+    const nNorthZ = -sinPsi * cosRoll;
+
+    const standoff = (1.0 - t) * (safeRadius - 5.0) + t * altitudeAboveGround;
+    const camX = deformed[0] + uX * standoff;
+    const camY = deformed[1] + uY * standoff;
+    const camZ = deformed[2] + uZ * standoff;
+
+    const fwdX = nNorthX * Math.cos(hRad) + eX * Math.sin(hRad);
+    const fwdY = nNorthY * Math.cos(hRad) + eY * Math.sin(hRad);
+    const fwdZ = nNorthZ * Math.cos(hRad) + eZ * Math.sin(hRad);
+
+    const morphVDirX = -Math.cos(pRad) * uX + Math.sin(pRad) * fwdX;
+    const morphVDirY = -Math.cos(pRad) * uY + Math.sin(pRad) * fwdY;
+    const morphVDirZ = -Math.cos(pRad) * uZ + Math.sin(pRad) * fwdZ;
 
     const planarTargetDist = 3.5;
-    const planarTargetX = planarCamX + planarVDirX * planarTargetDist;
-    const planarTargetY = planarCamY + planarVDirY * planarTargetDist;
-    const planarTargetZ = planarCamZ + planarVDirZ * planarTargetDist;
+    const morphTargetDist = (1.0 - t) * targetDist + t * planarTargetDist;
 
-    const planarUpX = Math.cos(pRad) * planarFwdX;
-    const planarUpY = Math.cos(pRad) * planarFwdY;
-    const planarUpZ = Math.sin(pRad);
+    const vUpX = Math.sin(pRad) * uX + Math.cos(pRad) * fwdX;
+    const vUpY = Math.sin(pRad) * uY + Math.cos(pRad) * fwdY;
+    const vUpZ = Math.sin(pRad) * uZ + Math.cos(pRad) * fwdZ;
 
-    const t = Math.max(0.0, Math.min(1.0, curUnfurl));
     return {
-      camX: (1 - t) * sphereCamX + t * planarCamX,
-      camY: (1 - t) * sphereCamY + t * planarCamY,
-      camZ: (1 - t) * sphereCamZ + t * planarCamZ,
-      targetX: (1 - t) * sphereTargetX + t * planarTargetX,
-      targetY: (1 - t) * sphereTargetY + t * planarTargetY,
-      targetZ: (1 - t) * sphereTargetZ + t * planarTargetZ,
-      vUpX: (1 - t) * sphereUpX + t * planarUpX,
-      vUpY: (1 - t) * sphereUpY + t * planarUpY,
-      vUpZ: (1 - t) * sphereUpZ + t * planarUpZ,
+      camX,
+      camY,
+      camZ,
+      targetX: camX + morphVDirX * morphTargetDist,
+      targetY: camY + morphVDirY * morphTargetDist,
+      targetZ: camZ + morphVDirZ * morphTargetDist,
+      vUpX,
+      vUpY,
+      vUpZ,
       safeRadius, theta, phi
     };
   }, [getGroundClearanceFloor]);
 
-  // Update camera target or position when props change
-  useEffect(() => {
-    if (cameraTarget) {
-      if (Array.isArray(cameraTarget)) {
-        targetRef.current.set(cameraTarget[0], cameraTarget[1], cameraTarget[2]);
-      } else {
-        targetRef.current.copy(cameraTarget);
-      }
-      updateCameraTransform();
-    }
-  }, [cameraTarget, updateCameraTransform]);
+  // Orbital Kinematics updates
+  const updateCameraTransform = useCallback(() => {
+    const camera = cameraRef.current;
+    const spherical = sphericalRef.current;
+    const target = targetRef.current;
 
+    const scrubAlpha = typeof window !== 'undefined' ? (window as any).__INDICATRIX_SCRUB_ALPHA__ : undefined;
+    const animAlpha = typeof window !== 'undefined' ? (window as any).__INDICATRIX_ANIM_ALPHA__ : undefined;
+    const curUnfurl = scrubAlpha !== undefined ? scrubAlpha : (animAlpha !== undefined ? animAlpha : (stateRef.current?.unfurlProgress ?? 0));
+    const clampedUnfurl = Math.max(0.0, Math.min(1.0, curUnfurl));
+    const unrollEase = clampedUnfurl * clampedUnfurl * (3.0 - 2.0 * clampedUnfurl);
+
+    const obliquePitch = Number((loadingRegionsRef.current as any).__obliquePitchDeg || (stateRef.current as any)?.cameraPitchDeg || 0);
+    if (obliquePitch > 0.01) {
+      const obliqueHeading = Number((loadingRegionsRef.current as any).__obliqueHeadingDeg || (stateRef.current as any)?.cameraHeadingDeg || 0);
+      const sphLat = 90 - (spherical.phi * 180) / Math.PI;
+      const sphLon = (spherical.theta * 180) / Math.PI;
+      const latDeg = curUnfurl >= 0.01 ? (activeCoordsRef.current?.lat ?? sphLat) : sphLat;
+      const lonDeg = curUnfurl >= 0.01 ? (activeCoordsRef.current?.lon ?? sphLon) : sphLon;
+      const v = computeObliqueVectors(lonDeg, latDeg, spherical.radius, obliquePitch, obliqueHeading);
+      spherical.radius = v.safeRadius;
+      camera.position.set(v.camX, v.camY, v.camZ);
+      target.set(v.targetX, v.targetY, v.targetZ);
+      camera.up.set(v.vUpX, v.vUpY, v.vUpZ);
+      camera.lookAt(target);
+      camera.updateMatrixWorld();
+      return;
+    }
+
+    const zoomWeight = Math.max(0.0, Math.min(1.0, (14.0 - spherical.radius) / 5.0));
+    const effRadius = Math.max(0.08, spherical.radius - 5.0 * unrollEase * zoomWeight);
+
+    camera.position.x = target.x + effRadius * Math.sin(spherical.phi) * Math.sin(spherical.theta);
+    camera.position.y = target.y + effRadius * Math.cos(spherical.phi);
+    camera.position.z = target.z + effRadius * Math.sin(spherical.phi) * Math.cos(spherical.theta);
+    camera.up.set(0, 1, 0);
+    camera.lookAt(target);
+    camera.updateMatrixWorld();
+  }, [computeObliqueVectors]);
+
+  // Update camera position or target when props change
   useEffect(() => {
     if (cameraPosition) {
+      cameraTransitionRef.current = null;
+      (loadingRegionsRef.current as any).__obliquePitchDeg = 0;
+      (loadingRegionsRef.current as any).__obliqueHeadingDeg = 0;
+      if (stateRef.current) {
+        (stateRef.current as any).cameraPitchDeg = 0;
+        (stateRef.current as any).cameraHeadingDeg = 0;
+      }
+      if (typeof window !== 'undefined' && (window as any).__INDICATRIX_LIVE_UNIFORMS__) {
+        (window as any).__INDICATRIX_LIVE_UNIFORMS__.cameraPitchDeg = 0;
+      }
+      velocityRef.current.velTheta = 0;
+      velocityRef.current.velPhi = 0;
+      velocityRef.current.velRadius = 0;
+      velocityRef.current.velPanX = 0;
+      velocityRef.current.velPanY = 0;
+      const scrubAlpha = typeof window !== 'undefined' ? (window as any).__INDICATRIX_SCRUB_ALPHA__ : undefined;
+      const animAlpha = typeof window !== 'undefined' ? (window as any).__INDICATRIX_ANIM_ALPHA__ : undefined;
+      const curUnfurl = scrubAlpha !== undefined ? scrubAlpha : (animAlpha !== undefined ? animAlpha : (stateRef.current?.unfurlProgress ?? 0));
+      if (curUnfurl < 0.01) {
+        targetRef.current.copy(ORIGIN_VEC);
+      }
+      const curOffset = _scratchVecA.subVectors(cameraRef.current.position, targetRef.current);
+      const curR = Math.max(curOffset.length(), 0.001);
+      sphericalRef.current.radius = curR;
+      sphericalRef.current.theta = Math.atan2(curOffset.x, curOffset.z);
+      sphericalRef.current.phi = Math.acos(Math.min(Math.max(curOffset.y / curR, -1), 1));
       if (Array.isArray(cameraPosition)) {
         targetCameraPosRef.current = new Vector3(cameraPosition[0], cameraPosition[1], cameraPosition[2]);
       } else {
@@ -1094,6 +1053,23 @@ export const WebGPUCanvas: React.FC<WebGPUCanvasProps> = React.memo(({
       }
     }
   }, [cameraPosition]);
+
+  useEffect(() => {
+    if (cameraTarget) {
+      if (Array.isArray(cameraTarget)) {
+        targetRef.current.set(cameraTarget[0], cameraTarget[1], cameraTarget[2]);
+      } else {
+        targetRef.current.copy(cameraTarget);
+      }
+      if (targetCameraPosRef.current) {
+        cameraRef.current.up.set(0, 1, 0);
+        cameraRef.current.lookAt(targetRef.current);
+        cameraRef.current.updateMatrixWorld();
+      } else {
+        updateCameraTransform();
+      }
+    }
+  }, [cameraTarget, updateCameraTransform]);
 
   // Initialize Camera position
   useEffect(() => {
@@ -1108,6 +1084,11 @@ export const WebGPUCanvas: React.FC<WebGPUCanvasProps> = React.memo(({
       getActiveCoords: () => activeCoordsRef.current,
       get cursorCoords() { return cursorCoordsRef.current; },
       getCursorCoords: () => cursorCoordsRef.current,
+      getPosition: (): [number, number, number] => [
+        cameraRef.current.position.x,
+        cameraRef.current.position.y,
+        cameraRef.current.position.z,
+      ],
       getCamDist: () => {
         const scrubAlpha = typeof window !== 'undefined' ? (window as any).__INDICATRIX_SCRUB_ALPHA__ : undefined;
         const animAlpha = typeof window !== 'undefined' ? (window as any).__INDICATRIX_ANIM_ALPHA__ : undefined;
@@ -1124,10 +1105,11 @@ export const WebGPUCanvas: React.FC<WebGPUCanvasProps> = React.memo(({
         const inv = invertMacroChart([cPos.x, cPos.y, cPos.z], curUnfurl, 5.0);
         return Number.isFinite(inv.h) ? inv.h : cPos.length() - 5.0;
       },
-      get pitch() { return (stateRef.current as any)?.cameraPitchDeg ?? 0; },
-      getPitch: () => (stateRef.current as any)?.cameraPitchDeg ?? 0,
+      get pitch() { return (stateRef.current as any)?.cameraPitchDeg ?? (loadingRegionsRef.current as any)?.__obliquePitchDeg ?? 0; },
+      getPitch: () => (stateRef.current as any)?.cameraPitchDeg ?? (loadingRegionsRef.current as any)?.__obliquePitchDeg ?? 0,
       setPitch: (deg: number) => {
         const p = Math.max(0, Math.min(85, deg));
+        (loadingRegionsRef.current as any).__obliquePitchDeg = p;
         if (stateRef.current) {
           (stateRef.current as any).cameraPitchDeg = p;
         }
@@ -1143,6 +1125,15 @@ export const WebGPUCanvas: React.FC<WebGPUCanvasProps> = React.memo(({
       },
       setSpherical: (r: number, theta?: number, phi?: number, target?: [number, number, number]) => {
         cameraRef.current.up.set(0, 1, 0);
+        (loadingRegionsRef.current as any).__obliquePitchDeg = 0;
+        (loadingRegionsRef.current as any).__obliqueHeadingDeg = 0;
+        if (stateRef.current) {
+          (stateRef.current as any).cameraPitchDeg = 0;
+          (stateRef.current as any).cameraHeadingDeg = 0;
+        }
+        if (typeof window !== 'undefined' && (window as any).__INDICATRIX_LIVE_UNIFORMS__) {
+          (window as any).__INDICATRIX_LIVE_UNIFORMS__.cameraPitchDeg = 0;
+        }
         const curTheta = theta !== undefined ? theta : sphericalRef.current.theta;
         const curPhi = phi !== undefined ? phi : sphericalRef.current.phi;
         const lat = 90 - (curPhi * 180) / Math.PI;
@@ -1153,6 +1144,16 @@ export const WebGPUCanvas: React.FC<WebGPUCanvasProps> = React.memo(({
         const curUnfurl = scrubAlpha !== undefined ? scrubAlpha : (animAlpha !== undefined ? animAlpha : (stateRef.current?.unfurlProgress ?? 0));
         if (target) {
           targetRef.current.set(target[0], target[1], target[2]);
+          if (curUnfurl >= 0.01) {
+            let tLon = (target[0] / 5.0) * (180 / Math.PI);
+            tLon = ((((tLon + 180) % 360) + 360) % 360) - 180;
+            const clampedTY = Math.max(-5.0 * 2.5, Math.min(5.0 * 2.5, target[1]));
+            const curModeT = stateRef.current?.mode ?? 0;
+            const tLat = curModeT === 0
+              ? Math.max(-85, Math.min(85, (clampedTY / 5.0) * (180 / Math.PI)))
+              : (2.0 * Math.atan(Math.exp(clampedTY / 5.0)) - Math.PI / 2.0) * (180 / Math.PI);
+            activeCoordsRef.current = { lat: tLat, lon: tLon };
+          }
         } else if (curUnfurl < 0.01 || r >= 12.0) {
           targetRef.current.set(0, 0, 0);
         } else {
@@ -1189,6 +1190,15 @@ export const WebGPUCanvas: React.FC<WebGPUCanvasProps> = React.memo(({
       },
       lookAtCoordinates: (lonDeg: number, latDeg: number, zoomRadius = 15, target?: [number, number, number]) => {
         cameraRef.current.up.set(0, 1, 0);
+        (loadingRegionsRef.current as any).__obliquePitchDeg = 0;
+        (loadingRegionsRef.current as any).__obliqueHeadingDeg = 0;
+        if (stateRef.current) {
+          (stateRef.current as any).cameraPitchDeg = 0;
+          (stateRef.current as any).cameraHeadingDeg = 0;
+        }
+        if (typeof window !== 'undefined' && (window as any).__INDICATRIX_LIVE_UNIFORMS__) {
+          (window as any).__INDICATRIX_LIVE_UNIFORMS__.cameraPitchDeg = 0;
+        }
         activeCoordsRef.current = { lat: latDeg, lon: lonDeg };
         const phi = ((90 - latDeg) * Math.PI) / 180;
         const theta = (lonDeg * Math.PI) / 180;
@@ -1235,6 +1245,15 @@ export const WebGPUCanvas: React.FC<WebGPUCanvasProps> = React.memo(({
         updateCameraTransform();
       },
       easeToCoordinates: (lonDeg: number, latDeg: number, zoomRadius = 14.0, durationSec = 1.4) => {
+        (loadingRegionsRef.current as any).__obliquePitchDeg = 0;
+        (loadingRegionsRef.current as any).__obliqueHeadingDeg = 0;
+        if (stateRef.current) {
+          (stateRef.current as any).cameraPitchDeg = 0;
+          (stateRef.current as any).cameraHeadingDeg = 0;
+        }
+        if (typeof window !== 'undefined' && (window as any).__INDICATRIX_LIVE_UNIFORMS__) {
+          (window as any).__INDICATRIX_LIVE_UNIFORMS__.cameraPitchDeg = 0;
+        }
         activeCoordsRef.current = { lat: latDeg, lon: lonDeg };
         const phi = ((90 - latDeg) * Math.PI) / 180;
         const theta = (lonDeg * Math.PI) / 180;
@@ -1314,16 +1333,37 @@ export const WebGPUCanvas: React.FC<WebGPUCanvasProps> = React.memo(({
         targetRef.current.set(x, y, z);
         updateCameraTransform();
       },
-      setObliqueView: (lonDeg: number, latDeg: number, altitudeRadius = 6.05, pitchDeg = 52, headingDeg = 0) => {
-        const v = computeObliqueVectors(lonDeg, latDeg, altitudeRadius, pitchDeg, headingDeg);
+      setObliqueView: (lonDeg: number, latDeg: number, altitudeRadius = 6.05, pitchDeg = 52, headingDeg = 0, centerTarget = false) => {
+        let camLonDeg = lonDeg;
+        let camLatDeg = latDeg;
+        if (centerTarget && pitchDeg > 0.1) {
+          const safeR = Math.max(5.02, altitudeRadius);
+          const pRad = (Math.min(78, Math.max(0, pitchDeg)) * Math.PI) / 180;
+          const sinArg = Math.min(0.998, (safeR / 5.0) * Math.sin(pRad));
+          const offsetDeg = ((Math.asin(sinArg) - pRad) * 180) / Math.PI;
+          const hRad = (headingDeg * Math.PI) / 180;
+          camLatDeg = Math.max(-89.5, Math.min(89.5, latDeg - offsetDeg * Math.cos(hRad)));
+          const cosLat = Math.max(0.15, Math.cos((latDeg * Math.PI) / 180));
+          camLonDeg = lonDeg - (offsetDeg * Math.sin(hRad)) / cosLat;
+        }
+        const v = computeObliqueVectors(camLonDeg, camLatDeg, altitudeRadius, pitchDeg, headingDeg);
 
         cameraRef.current.position.set(v.camX, v.camY, v.camZ);
         targetRef.current.set(v.targetX, v.targetY, v.targetZ);
         cameraRef.current.up.set(v.vUpX, v.vUpY, v.vUpZ);
         cameraRef.current.lookAt(targetRef.current);
         cameraRef.current.updateMatrixWorld();
+        (loadingRegionsRef.current as any).__obliquePitchDeg = pitchDeg;
+        (loadingRegionsRef.current as any).__obliqueHeadingDeg = headingDeg;
         if (stateRef.current) {
           (stateRef.current as any).cameraPitchDeg = pitchDeg;
+          (stateRef.current as any).cameraHeadingDeg = headingDeg;
+        }
+        if (typeof window !== 'undefined') {
+          (window as any).__INDICATRIX_LIVE_UNIFORMS__ = {
+            ...((window as any).__INDICATRIX_LIVE_UNIFORMS__ || {}),
+            cameraPitchDeg: pitchDeg,
+          };
         }
 
         sphericalRef.current.radius = v.safeRadius;
@@ -1337,6 +1377,10 @@ export const WebGPUCanvas: React.FC<WebGPUCanvasProps> = React.memo(({
         velocityRef.current.velPanX = 0;
         velocityRef.current.velPanY = 0;
         targetCameraPosRef.current = null;
+        (loadingRegionsRef.current as any).__lastProgMoveMs = performance.now();
+      },
+      lookAtOblique: (targetLonDeg: number, targetLatDeg: number, altitudeRadius = 5.42, pitchDeg = 30, headingDeg = 0) => {
+        (window as any).__INDICATRIX_CAMERA__?.setObliqueView(targetLonDeg, targetLatDeg, altitudeRadius, pitchDeg, headingDeg, true);
       },
       snapPugetSound: (_duration = 1.6) => {
         const lonDeg = -122.38;
@@ -1635,8 +1679,21 @@ export const WebGPUCanvas: React.FC<WebGPUCanvasProps> = React.memo(({
         velocityRef.current.velPanY = 0;
         targetCameraPosRef.current = null;
 
+        activeCoordsRef.current = { lat: latDeg, lon: lonDeg };
+        sphericalRef.current.radius = v.safeRadius;
+        sphericalRef.current.theta = v.theta;
+        sphericalRef.current.phi = v.phi;
+        (loadingRegionsRef.current as any).__obliquePitchDeg = pitchDeg;
+        (loadingRegionsRef.current as any).__obliqueHeadingDeg = headingDeg;
         if (stateRef.current) {
           (stateRef.current as any).cameraPitchDeg = pitchDeg;
+          (stateRef.current as any).cameraHeadingDeg = headingDeg;
+        }
+        if (typeof window !== 'undefined') {
+          (window as any).__INDICATRIX_LIVE_UNIFORMS__ = {
+            ...((window as any).__INDICATRIX_LIVE_UNIFORMS__ || {}),
+            cameraPitchDeg: pitchDeg,
+          };
         }
 
         if (durationSec <= 0) {
@@ -1660,19 +1717,12 @@ export const WebGPUCanvas: React.FC<WebGPUCanvasProps> = React.memo(({
         }
       },
       snapHorizonCrossSection: (duration = 1.6) => {
-        if (typeof window !== 'undefined') {
-          if ((window as any).__INDICATRIX_SET_CLOUD_OPTIONS__) {
-            (window as any).__INDICATRIX_SET_CLOUD_OPTIONS__({ showClouds: true });
-          }
-          if ((window as any).__INDICATRIX_SET_ATMOSPHERIC_SCALE__) {
-            (window as any).__INDICATRIX_SET_ATMOSPHERIC_SCALE__((s: number) => (s <= 1.05 ? 6.0 : Math.max(s, 6.0)));
-          }
-        }
-        callbacksRef.current.onShowCloudsChange?.(true);
-        callbacksRef.current.onAtmosphericScaleChange?.(6.0);
-        callbacksRef.current.onTogglePlanetaryLayer?.('noaa-gfs-jetstream', true);
-
-        const v = computeObliqueVectors(8.5, 44.5, 5.22, 78.0, 0.0);
+        const lonDeg = 8.5;
+        const latDeg = 44.5;
+        const altitudeRadius = 5.22;
+        const pitchDeg = 78.0;
+        const headingDeg = 0.0;
+        const v = computeObliqueVectors(lonDeg, latDeg, altitudeRadius, pitchDeg, headingDeg);
 
         velocityRef.current.velTheta = 0;
         velocityRef.current.velPhi = 0;
@@ -1681,8 +1731,21 @@ export const WebGPUCanvas: React.FC<WebGPUCanvasProps> = React.memo(({
         velocityRef.current.velPanY = 0;
         targetCameraPosRef.current = null;
 
+        activeCoordsRef.current = { lat: latDeg, lon: lonDeg };
+        sphericalRef.current.radius = v.safeRadius;
+        sphericalRef.current.theta = v.theta;
+        sphericalRef.current.phi = v.phi;
+        (loadingRegionsRef.current as any).__obliquePitchDeg = pitchDeg;
+        (loadingRegionsRef.current as any).__obliqueHeadingDeg = headingDeg;
         if (stateRef.current) {
-          (stateRef.current as any).cameraPitchDeg = 78.0;
+          (stateRef.current as any).cameraPitchDeg = pitchDeg;
+          (stateRef.current as any).cameraHeadingDeg = headingDeg;
+        }
+        if (typeof window !== 'undefined') {
+          (window as any).__INDICATRIX_LIVE_UNIFORMS__ = {
+            ...((window as any).__INDICATRIX_LIVE_UNIFORMS__ || {}),
+            cameraPitchDeg: pitchDeg,
+          };
         }
 
         if (duration <= 0) {
@@ -1717,6 +1780,7 @@ export const WebGPUCanvas: React.FC<WebGPUCanvasProps> = React.memo(({
         velocityRef.current.velPanX = 0;
         velocityRef.current.velPanY = 0;
         targetCameraPosRef.current = null;
+        (loadingRegionsRef.current as any).__lastProgMoveMs = performance.now();
       },
       getSpherical: () => ({
         radius: sphericalRef.current.radius,
@@ -2128,17 +2192,8 @@ export const WebGPUCanvas: React.FC<WebGPUCanvasProps> = React.memo(({
         sphericalRef.current.phi = Math.acos(Math.min(Math.max(offset.y / Math.max(sphericalRef.current.radius, 0.001), -1), 1));
       }
 
-      const isPinchMode = e.shiftKey || cursorPhysicsEnabledRef.current;
-      if (isPinchMode && e.button === 0) {
-        isPinchingRef.current = true;
-        isDraggingRef.current = false;
-        const hit = currentHitPosRef.current;
-        pinchControllerRef.current.onPointerDown(hit.x, hit.y, hit.z, 0.75);
-        return;
-      }
-
       isDraggingRef.current = true;
-      dragButtonRef.current = e.button;
+      dragButtonRef.current = (e.button === 0 && e.metaKey) ? 2 : e.button;
       lastMousePosRef.current = { x: e.clientX, y: e.clientY };
 
       // Reset velocity on new direct manipulation
@@ -2151,7 +2206,6 @@ export const WebGPUCanvas: React.FC<WebGPUCanvasProps> = React.memo(({
 
     const onPointerMove = (e: PointerEvent) => {
       const hit = currentHitPosRef.current;
-      pinchControllerRef.current.onHoverMove(hit.x, hit.y, hit.z);
 
       const scrubAlpha = typeof window !== 'undefined' ? (window as any).__INDICATRIX_SCRUB_ALPHA__ : undefined;
       const animAlpha = typeof window !== 'undefined' ? (window as any).__INDICATRIX_ANIM_ALPHA__ : undefined;
@@ -2163,10 +2217,7 @@ export const WebGPUCanvas: React.FC<WebGPUCanvasProps> = React.memo(({
         lon = ((((lon + 180) % 360) + 360) % 360) - 180;
         const lat = Math.max(-85, Math.min(85, invHover.phi * (180 / Math.PI)));
         cursorCoordsRef.current = { lat, lon };
-      }
-
-      if (isPinchingRef.current) {
-        return; // Pinch is active; maintain strict separation from camera orbit
+        telemetryStore.setCursorCoords(cursorCoordsRef.current);
       }
 
       if (!isDraggingRef.current) return;
@@ -2178,8 +2229,9 @@ export const WebGPUCanvas: React.FC<WebGPUCanvasProps> = React.memo(({
         if (e.altKey || e.ctrlKey) {
           // Horizon Pitch / Tilt control (0 deg nadir to 85 deg grazing horizon)
           const pitchSpeed = 0.25;
-          const currentPitch = (stateRef.current as any)?.cameraPitchDeg ?? 0;
+          const currentPitch = (stateRef.current as any)?.cameraPitchDeg ?? (loadingRegionsRef.current as any)?.__obliquePitchDeg ?? 0;
           const nextPitch = Math.max(0, Math.min(85, currentPitch - dy * pitchSpeed));
+          (loadingRegionsRef.current as any).__obliquePitchDeg = nextPitch;
           if (stateRef.current) {
             (stateRef.current as any).cameraPitchDeg = nextPitch;
           }
@@ -2204,6 +2256,16 @@ export const WebGPUCanvas: React.FC<WebGPUCanvasProps> = React.memo(({
 
         // Orbit rotation: adaptively damped with camera altitude above the geoid
         cameraRef.current.up.set(0, 1, 0);
+        const wasObliquePitch = ((loadingRegionsRef.current as any).__obliquePitchDeg || (stateRef.current as any)?.cameraPitchDeg || 0) > 0.01;
+        (loadingRegionsRef.current as any).__obliquePitchDeg = 0;
+        (loadingRegionsRef.current as any).__obliqueHeadingDeg = 0;
+        if (stateRef.current) {
+          (stateRef.current as any).cameraPitchDeg = 0;
+          (stateRef.current as any).cameraHeadingDeg = 0;
+        }
+        if (typeof window !== 'undefined' && (window as any).__INDICATRIX_LIVE_UNIFORMS__) {
+          (window as any).__INDICATRIX_LIVE_UNIFORMS__.cameraPitchDeg = 0;
+        }
         const altRatio = Math.max(0.04, Math.min(1.0, (sphericalRef.current.radius - 5.0) / 7.0));
         const rotateSpeed = 0.005 * (curUnfurl < 0.01 ? (0.04 + 0.96 * altRatio) : 1.0);
         const dTheta = -dx * rotateSpeed;
@@ -2230,26 +2292,62 @@ export const WebGPUCanvas: React.FC<WebGPUCanvasProps> = React.memo(({
           camLon = ((((camLon + 180) % 360) + 360) % 360) - 180;
           const camLat = Math.max(-85, Math.min(85, 90 - (sphericalRef.current.phi * 180) / Math.PI));
           activeCoordsRef.current = { lat: camLat, lon: camLon };
+          if (wasObliquePitch) {
+            targetRef.current.set(0, 0, 0);
+          }
+        } else if (wasObliquePitch) {
+          targetRef.current.set(cameraRef.current.position.x, cameraRef.current.position.y, 0.0);
         }
         if (curUnfurl < 0.01 && sphericalRef.current.radius >= 16.0) {
           targetRef.current.set(0, 0, 0);
+        } else if (curUnfurl >= 0.01 && sphericalRef.current.radius >= 11.0 && targetRef.current.lengthSq() > 1e-6) {
+          const macroRecenter = Math.min(0.18, ((sphericalRef.current.radius - 11.0) / 5.0) * 0.14 + 0.03);
+          targetRef.current.set(
+            targetRef.current.x * (1.0 - macroRecenter),
+            targetRef.current.y * (1.0 - macroRecenter),
+            0.0
+          );
+          let panLon = (targetRef.current.x / 5.0) * (180 / Math.PI);
+          panLon = ((((panLon + 180) % 360) + 360) % 360) - 180;
+          const clampedY = Math.max(-5.0 * 2.5, Math.min(5.0 * 2.5, targetRef.current.y));
+          const curModeRot = stateRef.current?.mode ?? 0;
+          const panLat = curModeRot === 0
+            ? Math.max(-85, Math.min(85, (clampedY / 5.0) * (180 / Math.PI)))
+            : (2.0 * Math.atan(Math.exp(clampedY / 5.0)) - Math.PI / 2.0) * (180 / Math.PI);
+          activeCoordsRef.current = { lat: panLat, lon: panLon };
         }
       } else if (dragButtonRef.current === 2 || dragButtonRef.current === 1) {
         // Pan translation aligned with camera local screen-right and screen-up axes projected onto the sheet/target plane
-        const panSpeed = sphericalRef.current.radius * 0.001;
+        const effAlt = curUnfurl >= 0.5 ? Math.max(0.35, sphericalRef.current.radius - 5.0) : sphericalRef.current.radius;
+        const panSpeed = (curUnfurl >= 0.5 ? Math.max(2.5, effAlt * 1.6) : sphericalRef.current.radius) * 0.001;
         const m = (cameraRef.current as any).matrixWorld?.elements;
         const rightLen = m ? Math.hypot(m[0], m[1], m[2]) : 0;
         const upLen = m ? Math.hypot(m[4], m[5], m[6]) : 0;
-        const rightX = rightLen > 1e-4 ? m[0] / rightLen : Math.cos(sphericalRef.current.theta);
-        const rightY = rightLen > 1e-4 ? m[1] / rightLen : 0;
-        const upX = upLen > 1e-4 ? m[4] / upLen : 0;
-        const upY = upLen > 1e-4 ? m[5] / upLen : 1;
+        let rightX = rightLen > 1e-4 ? m[0] / rightLen : Math.cos(sphericalRef.current.theta);
+        let rightY = rightLen > 1e-4 ? m[1] / rightLen : Math.sin(sphericalRef.current.theta);
+        let upX = upLen > 1e-4 ? m[4] / upLen : -Math.sin(sphericalRef.current.theta);
+        let upY = upLen > 1e-4 ? m[5] / upLen : Math.cos(sphericalRef.current.theta);
+        if (curUnfurl >= 0.5) {
+          const rightXY = Math.hypot(rightX, rightY);
+          if (rightXY > 1e-4) {
+            rightX /= rightXY;
+            rightY /= rightXY;
+          }
+          const upXY = Math.hypot(upX, upY);
+          if (upXY > 1e-4) {
+            upX /= upXY;
+            upY /= upXY;
+          } else {
+            upX = -Math.sin(sphericalRef.current.theta);
+            upY = Math.cos(sphericalRef.current.theta);
+          }
+        }
         const dScreenX = -dx * panSpeed;
         const dScreenY = dy * panSpeed;
         const dPanX = dScreenX * rightX + dScreenY * upX;
         const dPanY = dScreenX * rightY + dScreenY * upY;
-        targetRef.current.x += dPanX;
-        targetRef.current.y += dPanY;
+        targetRef.current.x = Math.max(-Math.PI * 5.0, Math.min(Math.PI * 5.0, targetRef.current.x + dPanX));
+        targetRef.current.y = Math.max(-Math.PI * 2.5, Math.min(Math.PI * 2.5, targetRef.current.y + dPanY));
         // Track pan velocity for smooth inertial glide release
         velocityRef.current.velPanX = dPanX;
         velocityRef.current.velPanY = dPanY;
@@ -2276,23 +2374,10 @@ export const WebGPUCanvas: React.FC<WebGPUCanvasProps> = React.memo(({
     };
 
     const onPointerUp = () => {
-      if (isPinchingRef.current) {
-        isPinchingRef.current = false;
-        pinchControllerRef.current.onPointerUp();
-      }
       isDraggingRef.current = false;
     };
 
-    const onPointerEnter = () => {
-      pinchControllerRef.current.onPointerEnter();
-    };
-
     const onPointerLeave = () => {
-      if (isPinchingRef.current) {
-        isPinchingRef.current = false;
-        pinchControllerRef.current.onPointerUp();
-      }
-      pinchControllerRef.current.onPointerLeave();
       isDraggingRef.current = false;
     };
 
@@ -2308,20 +2393,73 @@ export const WebGPUCanvas: React.FC<WebGPUCanvasProps> = React.memo(({
       const animAlpha = typeof window !== 'undefined' ? (window as any).__INDICATRIX_ANIM_ALPHA__ : undefined;
       const curUnfurl = scrubAlpha !== undefined ? scrubAlpha : (animAlpha !== undefined ? animAlpha : (stateRef.current?.unfurlProgress ?? 0));
 
-      // Smooth inertial zoom impulse (decay factor 0.05)
-      const zoomImpulse = e.deltaY * 0.015;
-      velocityRef.current.velRadius += zoomImpulse;
+      // Horizontal two-finger trackpad scroll or Shift+Wheel pans across the planar map
+      if (curUnfurl >= 0.5 && !e.ctrlKey && (e.shiftKey || Math.abs(e.deltaX) > Math.abs(e.deltaY) * 1.15)) {
+        const effAlt = Math.max(0.4, sphericalRef.current.radius - 5.0);
+        const panScale = Math.max(2.0, effAlt * 1.5) * 0.0012;
+        const rightX = Math.cos(sphericalRef.current.theta);
+        const rightY = Math.sin(sphericalRef.current.theta);
+        const fwdX = -Math.sin(sphericalRef.current.theta);
+        const fwdY = Math.cos(sphericalRef.current.theta);
+        const rawDx = e.shiftKey && Math.abs(e.deltaX) < 1e-3 ? e.deltaY : e.deltaX;
+        const rawDy = e.shiftKey && Math.abs(e.deltaX) < 1e-3 ? 0 : e.deltaY;
+        const dPanX = (rawDx * rightX - rawDy * fwdX) * panScale;
+        const dPanY = (rawDx * rightY - rawDy * fwdY) * panScale;
+        targetRef.current.x = Math.max(-Math.PI * 5.0, Math.min(Math.PI * 5.0, targetRef.current.x + dPanX));
+        targetRef.current.y = Math.max(-Math.PI * 2.5, Math.min(Math.PI * 2.5, targetRef.current.y + dPanY));
+        velocityRef.current.velPanX = dPanX * 0.5;
+        velocityRef.current.velPanY = dPanY * 0.5;
+        updateCameraTransform();
+        return;
+      }
+
+      // Smooth inertial zoom impulse scaled proportionally to camera altitude above the surface
+      const minEffectiveAlt = e.deltaY > 0 ? 2.8 : 0.08;
+      const altAboveSurface = Math.max(minEffectiveAlt, sphericalRef.current.radius - (curUnfurl < 0.01 ? 5.0 : 4.6));
+      const zoomScale = Math.min(0.0025, altAboveSurface * 0.00025);
+      const zoomImpulse = Math.max(-0.35, Math.min(0.35, e.deltaY * zoomScale));
+      velocityRef.current.velRadius = Math.max(-0.6, Math.min(0.6, velocityRef.current.velRadius + zoomImpulse));
 
       const hitPos = currentHitPosRef.current;
 
       if (e.deltaY < 0) {
-        // Zoom In: Lerp target toward cursor hit point if on-globe
+        // Zoom In: Lerp target toward cursor hit point if on-globe or planar sheet
         if (hitPos) {
-          const lerpFactor = Math.min(0.08, Math.abs(e.deltaY) * 0.0008);
+          const lerpFactor = curUnfurl < 0.01 ? 0.0 : Math.min(0.16, Math.abs(e.deltaY) * 0.0020);
           targetRef.current.lerp(hitPos, lerpFactor);
+          if (curUnfurl >= 0.01) {
+            targetRef.current.x = Math.max(-Math.PI * 5.0, Math.min(Math.PI * 5.0, targetRef.current.x));
+            targetRef.current.y = Math.max(-Math.PI * 2.5, Math.min(Math.PI * 2.5, targetRef.current.y));
+            targetRef.current.z = 0.0;
+            const clampedHitX = Math.max(-Math.PI * 5.0, Math.min(Math.PI * 5.0, hitPos.x));
+            const clampedHitY = Math.max(-Math.PI * 2.5, Math.min(Math.PI * 2.5, hitPos.y));
+            const panFollow = Math.min(0.045, Math.abs(e.deltaY) * 0.00045);
+            velocityRef.current.velPanX = (clampedHitX - targetRef.current.x) * panFollow;
+            velocityRef.current.velPanY = (clampedHitY - targetRef.current.y) * panFollow;
+            let panLon = (targetRef.current.x / 5.0) * (180 / Math.PI);
+            panLon = ((((panLon + 180) % 360) + 360) % 360) - 180;
+            const clampedY = Math.max(-5.0 * 2.5, Math.min(5.0 * 2.5, targetRef.current.y));
+            const curModeZoom = stateRef.current?.mode ?? 0;
+            const panLat = curModeZoom === 0
+              ? Math.max(-85, Math.min(85, (clampedY / 5.0) * (180 / Math.PI)))
+              : (2.0 * Math.atan(Math.exp(clampedY / 5.0)) - Math.PI / 2.0) * (180 / Math.PI);
+            activeCoordsRef.current = { lat: panLat, lon: panLon };
+          }
           const len = targetRef.current.length();
           if (curUnfurl < 0.01 && len > 5.0) {
             targetRef.current.multiplyScalar(5.0 / len);
+          }
+          const isObliqueZoom = ((loadingRegionsRef.current as any).__obliquePitchDeg || (stateRef.current as any)?.cameraPitchDeg || 0) > 0.01;
+          if (curUnfurl < 0.01 && hitPos.lengthSq() > 1.0 && !isObliqueZoom) {
+            const hitLen = hitPos.length();
+            const hitTheta = Math.atan2(hitPos.x, hitPos.z);
+            const hitPhi = Math.acos(Math.max(-1.0, Math.min(1.0, hitPos.y / hitLen)));
+            let dTheta = ((hitTheta - sphericalRef.current.theta + Math.PI) % (2.0 * Math.PI));
+            if (dTheta < 0.0) dTheta += 2.0 * Math.PI;
+            dTheta -= Math.PI;
+            const angleFollow = Math.min(0.055, Math.abs(e.deltaY) * 0.00042);
+            sphericalRef.current.theta += dTheta * angleFollow;
+            sphericalRef.current.phi = Math.max(0.001, Math.min(Math.PI - 0.001, sphericalRef.current.phi + (hitPhi - sphericalRef.current.phi) * angleFollow));
           }
         } else {
           // Fallback: if off-globe, standard radial distance adjustment while decaying target toward origin
@@ -2342,58 +2480,146 @@ export const WebGPUCanvas: React.FC<WebGPUCanvasProps> = React.memo(({
       updateCameraTransform();
     };
 
+    const onDoubleClick = () => {
+      const scrubAlpha = typeof window !== 'undefined' ? (window as any).__INDICATRIX_SCRUB_ALPHA__ : undefined;
+      const animAlpha = typeof window !== 'undefined' ? (window as any).__INDICATRIX_ANIM_ALPHA__ : undefined;
+      const curUnfurl = scrubAlpha !== undefined ? scrubAlpha : (animAlpha !== undefined ? animAlpha : (stateRef.current?.unfurlProgress ?? 0));
+      const hitPos = currentHitPosRef.current;
+      if (!hitPos) return;
+      if (curUnfurl >= 0.01) {
+        const clampedHitX = Math.max(-Math.PI * 5.0, Math.min(Math.PI * 5.0, hitPos.x));
+        const clampedHitY = Math.max(-Math.PI * 2.5, Math.min(Math.PI * 2.5, hitPos.y));
+        velocityRef.current.velPanX = (clampedHitX - targetRef.current.x) * 0.055;
+        velocityRef.current.velPanY = (clampedHitY - targetRef.current.y) * 0.055;
+        velocityRef.current.velRadius = Math.max(-0.25, -Math.max(0.0, sphericalRef.current.radius - 5.6) * 0.03);
+      } else if (hitPos.lengthSq() > 1.0) {
+        const hitLen = hitPos.length();
+        const hitTheta = Math.atan2(hitPos.x, hitPos.z);
+        const hitPhi = Math.acos(Math.max(-1.0, Math.min(1.0, hitPos.y / hitLen)));
+        let dTheta = ((hitTheta - sphericalRef.current.theta + Math.PI) % (2.0 * Math.PI));
+        if (dTheta < 0.0) dTheta += 2.0 * Math.PI;
+        dTheta -= Math.PI;
+        velocityRef.current.velTheta = dTheta * 0.05;
+        velocityRef.current.velPhi = (hitPhi - sphericalRef.current.phi) * 0.05;
+      }
+    };
+
     const onContextMenu = (e: MouseEvent) => e.preventDefault();
 
     const container = containerRef.current || canvas;
 
     container.addEventListener('pointerdown', onPointerDown as EventListener);
-    container.addEventListener('pointerenter', onPointerEnter as EventListener);
     container.addEventListener('pointerleave', onPointerLeave as EventListener);
     window.addEventListener('pointermove', onPointerMove as EventListener);
     window.addEventListener('pointerup', onPointerUp as EventListener);
     container.addEventListener('wheel', onWheel as EventListener, { passive: false });
+    container.addEventListener('dblclick', onDoubleClick as EventListener);
     container.addEventListener('contextmenu', onContextMenu as EventListener);
 
     return () => {
       container.removeEventListener('pointerdown', onPointerDown as EventListener);
-      container.removeEventListener('pointerenter', onPointerEnter as EventListener);
       container.removeEventListener('pointerleave', onPointerLeave as EventListener);
       window.removeEventListener('pointermove', onPointerMove as EventListener);
       window.removeEventListener('pointerup', onPointerUp as EventListener);
       container.removeEventListener('wheel', onWheel as EventListener);
+      container.removeEventListener('dblclick', onDoubleClick as EventListener);
       container.removeEventListener('contextmenu', onContextMenu as EventListener);
     };
   }, [updateCameraTransform]);
 
-  // Load Geometry and Initialize WebGPU Engine
+  // Load Geometry and Initialize WebGPU Engine (or swap point buffers in-place on 100k <-> 1M)
   useEffect(() => {
     let isMounted = true;
     const canvas = canvasRef.current;
     if (!canvas) return;
 
-    const tier = TIER_CONFIG[resolution] || TIER_CONFIG['1M'];
+    const tier = TIER_CONFIG[resolution] || TIER_CONFIG['100k'];
     const binFile = tier.bin;
-    const jsonFile = resolution === '100k' ? '/geo-mesh-100k.json' : null;
     activeLodTierRef.current = resolution;
 
-    // Fast-path: When switching between high-resolution tiers (1M, 3M, 4M, 8M, 16M),
-    // the underlying point dataset (/geo-mesh-1m.bin) is already loaded in GPU memory.
-    // Retessellate the dual-surface lithosphere and hydrosphere sphere grid dynamically on GPU.
+    // Fast-path 1: Underlying point dataset is already loaded in GPU memory.
     if (engineRef.current.initialized && loadedBinRef.current === binFile) {
       activeLodTierRef.current = resolution;
-      const tStart = performance.now();
-      const sphereInfo = engineRef.current.rebuildSphereMesh(tier.lat, tier.lon);
-      const tessellationMs = Math.max(1, Math.round(performance.now() - tStart));
       const baseBytes = loadedDataInfoRef.current?.baseVramBytes || 0;
-      const totalVramMb = parseFloat(((baseBytes + sphereInfo.memoryBytes) / (1024 * 1024)).toFixed(2));
       callbacksRef.current.onDataLoaded?.({
-        pointCount: loadedDataInfoRef.current?.pointCount || sphereInfo.vertexCount,
-        lineCount: loadedDataInfoRef.current?.lineCount || sphereInfo.triangleCount,
-        format: 'WebGPU (Dynamic Grid)',
-        loadTimeMs: tessellationMs,
-        vramMb: totalVramMb,
+        pointCount: loadedDataInfoRef.current?.pointCount || 0,
+        lineCount: loadedDataInfoRef.current?.lineCount || 0,
+        format: 'WebGPU (CDLOD Dynamic)',
+        loadTimeMs: 1,
+        vramMb: parseFloat((baseBytes / (1024 * 1024)).toFixed(2)),
       });
       return;
+    }
+
+    // Fast-path 2: Engine is already initialized — reallocate staticBuffer, particleBuffers[0..1],
+    // lineIndexBuffer, and computeBindGroups IN-PLACE without calling engine.dispose()!
+    if (engineRef.current.initialized) {
+      loadedBinRef.current = binFile;
+      const tSwap0 = performance.now();
+      fetch(binFile)
+        .then(async (res) => {
+          let buffer: ArrayBuffer | null = null;
+          if (res.ok) {
+            const candidate = await res.arrayBuffer();
+            if (candidate.byteLength >= 32 && new DataView(candidate).getUint32(0, true) === 0x47454F4D) {
+              buffer = candidate;
+            }
+          }
+          if (!buffer && binFile !== '/geo-mesh-100k.bin') {
+            const fallbackRes = await fetch('/geo-mesh-100k.bin');
+            if (fallbackRes.ok) {
+              const fallbackCandidate = await fallbackRes.arrayBuffer();
+              if (fallbackCandidate.byteLength >= 32 && new DataView(fallbackCandidate).getUint32(0, true) === 0x47454F4D) {
+                buffer = fallbackCandidate;
+              }
+            }
+          }
+          if (!buffer || !isMounted || !engineRef.current.initialized) return;
+
+          const view = new DataView(buffer);
+          if (view.getUint32(0, true) !== 0x47454F4D) return;
+          const pointCount = view.getUint32(8, true);
+          const indexCount = view.getUint32(12, true);
+          const pOffset = view.getUint32(16, true);
+          const tOffset = view.getUint32(20, true);
+          const typOffset = view.getUint32(24, true);
+          const iOffset = view.getUint32(28, true);
+
+          const pointsData = new Float32Array(buffer, pOffset, pointCount * 3);
+          const target2DData = new Float32Array(buffer, tOffset, pointCount * 2);
+          const typeData = new Float32Array(buffer, typOffset, pointCount);
+          const lineIndices = new Uint32Array(buffer, iOffset, indexCount);
+
+          engineRef.current.reallocateParticleBuffers({
+            pointCount,
+            pointsData,
+            target2DData,
+            typeData,
+            lineIndices,
+          });
+          activeLodTierRef.current = resolution;
+          const vramBytes =
+            pointsData.byteLength + target2DData.byteLength + typeData.byteLength + lineIndices.byteLength;
+          loadedDataInfoRef.current = {
+            pointCount,
+            lineCount: indexCount / 2,
+            baseVramBytes: vramBytes,
+          };
+          callbacksRef.current.onDataLoaded?.({
+            pointCount,
+            lineCount: indexCount / 2,
+            format: 'WebGPU (Binary Mesh)',
+            loadTimeMs: Math.max(1, Math.round(performance.now() - tSwap0)),
+            vramMb: parseFloat((vramBytes / (1024 * 1024)).toFixed(2)),
+          });
+        })
+        .catch((swapErr) => {
+          console.error('[WebGPUCanvas] In-place buffer reallocation failed:', swapErr);
+        });
+
+      return () => {
+        isMounted = false;
+      };
     }
 
     setIsLoading(true);
@@ -2401,10 +2627,6 @@ export const WebGPUCanvas: React.FC<WebGPUCanvasProps> = React.memo(({
 
     const t0 = performance.now();
 
-    // If switching datasets (e.g. from 100k to 1M+ or vice versa), dispose previous engine state
-    if (engineRef.current.initialized) {
-      engineRef.current.dispose();
-    }
     loadedBinRef.current = binFile;
     const engine = engineRef.current;
     (window as any).__WEBGPU_ENGINE__ = engine;
@@ -2414,6 +2636,11 @@ export const WebGPUCanvas: React.FC<WebGPUCanvasProps> = React.memo(({
       (window as any).__INDICATRIX_CAMERA__ = cameraRef.current;
     }
     engine.camera = cameraRef.current;
+
+    // Kick off WebGPU adapter/device acquisition, prebaked SDF font atlas fetch, and OPFS warm DEM read in parallel with initial binary mesh fetch
+    void getWebGPUDevice();
+    void preloadSDFAtlas();
+    void opfsAssetStore.prefetchGlobalDEMPyramid('/earth-gebco2024-dem-u16.bin');
 
     fetch(binFile)
       .then(async (res) => {
@@ -2462,26 +2689,43 @@ export const WebGPUCanvas: React.FC<WebGPUCanvasProps> = React.memo(({
         });
         activeLodTierRef.current = resolution;
         (window as any).__INDICATRIX_WEBGPU_ENGINE__ = engine;
+        if (typeof engine.setVolumetricCloudsEnabled === 'function') {
+          engine.setVolumetricCloudsEnabled(volumetricClouds ?? true);
+        }
 
-        // Configure dual-surface crust resolution dynamically across 100k .. 16M tiers
-        const sphereInfo = engine.rebuildSphereMesh(tier.lat, tier.lon);
-
-        // Asynchronously ingest GEBCO 2024 16-bit DEM texture with ETOPO 2022 fallback (Phase 2)
-        engine.loadDEMTexture('/earth-gebco2024-dem-u16.bin').catch(() => {
-          engine.loadDEMTexture('/earth-etopo2022-dem-u16.bin').catch(() => {
-            engine.loadDEMTexture('/earth-etopo2022.cog.tif').catch(() => {});
+        // Apply already-prefetched warm OPFS 14-mip DEM pyramid immediately (< 100 ms) before vector/cloud builds;
+        // on cold boot (record === null in ~2 ms), fall through to non-blocking network loadDEMTexture.
+        const appliedWarmDem =
+          typeof engine.tryApplyWarmPrefetchedDEM === 'function'
+            ? await engine.tryApplyWarmPrefetchedDEM('/earth-gebco2024-dem-u16.bin')
+            : false;
+        if (!appliedWarmDem) {
+          engine.loadDEMTexture('/earth-gebco2024-dem-u16.bin').catch(() => {
+            engine.loadDEMTexture('/earth-etopo2022-dem-u16.bin').catch(() => {
+              engine.loadDEMTexture('/earth-gebco2024-dem.webp').catch(() => {
+                engine.loadDEMTexture('/earth-etopo2022.cog.tif').catch(() => {});
+              });
+            });
           });
-        });
+        }
         engine.loadHydroTexture('/earth-hydrology-bc5.dds').catch(() => {});
         engine.loadNormalTexture('/earth-normals-bc5.dds').catch(() => {});
         engine.loadVectorData('/geo-vectors.bin').catch(() => {});
         if (cachedLayersRef.current.showContours) {
           engine.loadContourMesh('/geo-contour-mesh.bin').catch(() => {});
         }
-        engine.loadSatelliteTrajectories('/data/tle-starlink.json').catch(() => {});
+        if (cachedLayersRef.current.showSatellites) {
+          engine.loadSatelliteTrajectories('/data/tle-starlink.json').catch(() => {});
+        }
         const isWnModel = isWeatherNextModel(prognosticModel);
+        const isSatModel = isSatelliteModel(prognosticModel);
 
-        if (isWnModel) {
+        if (isSatModel) {
+          engine.loadWindTexture('/data/weathernext/wind_10m_vector-0.bin').catch(() => {
+            engine.loadWindTexture('/data/gfs-wind-latest.bin').catch(() => {});
+          });
+          engine.loadAllCloudLayers(false, 0, 'satellite').catch(() => {});
+        } else if (isWnModel) {
           engine.loadWindTexture('/data/weathernext/wind_10m_vector-0.bin').catch(() => {
             engine.loadWindTexture('/data/gfs-wind-latest.bin').catch(() => {});
           });
@@ -2490,7 +2734,6 @@ export const WebGPUCanvas: React.FC<WebGPUCanvasProps> = React.memo(({
           engine.loadWindTexture('/data/gfs-wind-latest.bin').catch(() => {});
           engine.loadAllCloudLayers(false).catch(() => {});
         }
-        engine.loadOrbitalTextures('/earth-blue-marble-4k.webp', '/earth-night-lights-4k.webp').catch(() => {});
 
         if (!isMounted) {
           return;
@@ -2506,7 +2749,7 @@ export const WebGPUCanvas: React.FC<WebGPUCanvasProps> = React.memo(({
           baseVramBytes: vramBytes,
         };
 
-        const totalVramMb = parseFloat(((vramBytes + sphereInfo.memoryBytes) / (1024 * 1024)).toFixed(2));
+        const totalVramMb = parseFloat((vramBytes / (1024 * 1024)).toFixed(2));
 
         callbacksRef.current.onDataLoaded?.({
           pointCount,
@@ -2516,98 +2759,12 @@ export const WebGPUCanvas: React.FC<WebGPUCanvasProps> = React.memo(({
           vramMb: totalVramMb,
         });
       })
-      .catch(async (binErr) => {
+      .catch((binErr) => {
         console.error('[WebGPUCanvas] bin load error:', binErr);
-        if (!jsonFile) {
-          console.error('WebGPU binary load failed:', binErr);
-          if (isMounted) {
-            setLoadError(binErr.message);
-            onError?.(binErr);
-          }
-          return;
-        }
-
-        try {
-          const res = await fetch(jsonFile);
-          const data = await res.json();
-          if (!isMounted) return;
-
-          const pointsData = new Float32Array(data.pointsBuffer);
-          const target2DData = new Float32Array(data.target2DBuffer);
-          const typeData = new Float32Array(data.typeBuffer);
-          const lineIndices = new Uint32Array(data.lineIndices);
-
-          const engine = engineRef.current;
-          (window as any).__WEBGPU_ENGINE__ = engine;
-          if ((window as any).__INDICATRIX_CAMERA__) {
-            (window as any).__INDICATRIX_CAMERA__.camera = cameraRef.current;
-          } else {
-            (window as any).__INDICATRIX_CAMERA__ = cameraRef.current;
-          }
-          engine.camera = cameraRef.current;
-          await engine.initialize({
-            canvas,
-            pointCount: pointsData.length / 3,
-            pointsData,
-            target2DData,
-            typeData,
-            lineIndices,
-          });
-
-          const sphereInfo = engine.rebuildSphereMesh(tier.lat, tier.lon);
-
-          // Asynchronously ingest GEBCO 2024 16-bit DEM texture with ETOPO 2022 fallback (Phase 2)
-          engine.loadDEMTexture('/earth-gebco2024-dem-u16.bin').catch(() => {
-            engine.loadDEMTexture('/earth-etopo2022-dem-u16.bin').catch(() => {
-              engine.loadDEMTexture('/earth-etopo2022.cog.tif').catch(() => {});
-            });
-          });
-          engine.loadHydroTexture('/earth-hydrology-bc5.dds').catch(() => {});
-          engine.loadNormalTexture('/earth-normals-bc5.dds').catch(() => {});
-          engine.loadVectorData('/geo-vectors.bin').catch(() => {});
-          if (cachedLayersRef.current.showContours) {
-            engine.loadContourMesh('/geo-contour-mesh.bin').catch(() => {});
-          }
-          engine.loadSatelliteTrajectories('/data/tle-starlink.json').catch(() => {});
-          const isWnModel = isWeatherNextModel(prognosticModel);
-
-          if (isWnModel) {
-            engine.loadWindTexture('/data/weathernext/wind_10m_vector-0.bin').catch(() => {
-              engine.loadWindTexture('/data/gfs-wind-latest.bin').catch(() => {});
-            });
-            engine.loadAllCloudLayers(true).catch(() => {});
-          } else {
-            engine.loadWindTexture('/data/gfs-wind-latest.bin').catch(() => {});
-            engine.loadAllCloudLayers(false).catch(() => {});
-          }
-          engine.loadOrbitalTextures('/earth-blue-marble-4k.webp', '/earth-night-lights-4k.webp').catch(() => {});
-
-          if (!isMounted) return;
-          setIsLoading(false);
-          setIsEngineReady(true);
-
-          const t1 = performance.now();
-          const vramBytes = pointsData.byteLength + target2DData.byteLength + typeData.byteLength + lineIndices.byteLength;
-          loadedDataInfoRef.current = {
-            pointCount: pointsData.length / 3,
-            lineCount: lineIndices.length / 2,
-            baseVramBytes: vramBytes,
-          };
-
-          const totalVramMb = parseFloat(((vramBytes + sphereInfo.memoryBytes) / (1024 * 1024)).toFixed(2));
-
-          callbacksRef.current.onDataLoaded?.({
-            pointCount: pointsData.length / 3,
-            lineCount: lineIndices.length / 2,
-            format: 'WebGPU (JSON Mesh)',
-            loadTimeMs: Math.round(t1 - t0),
-            vramMb: totalVramMb,
-          });
-        } catch (err: any) {
-          if (isMounted) {
-            setLoadError(err.message);
-            callbacksRef.current.onError?.(err);
-          }
+        if (isMounted) {
+          setLoadError(binErr.message);
+          callbacksRef.current.onError?.(binErr);
+          onError?.(binErr);
         }
       });
 
@@ -2619,6 +2776,22 @@ export const WebGPUCanvas: React.FC<WebGPUCanvasProps> = React.memo(({
   // Dedicated unmount teardown
   useEffect(() => {
     return () => {
+      if (ownedWnDataSourceRef.current) {
+        const dsToDispose = ownedWnDataSourceRef.current;
+        ownedWnDataSourceRef.current = null;
+        if ((window as any).__INDICATRIX_WEATHERNEXT_DATA_SOURCE__ === dsToDispose) {
+          delete (window as any).__INDICATRIX_WEATHERNEXT_DATA_SOURCE__;
+        }
+        try { dsToDispose.dispose?.(); } catch {}
+      }
+      if (ownedWnRingRef.current) {
+        const ringToDispose = ownedWnRingRef.current;
+        ownedWnRingRef.current = null;
+        if ((window as any).__INDICATRIX_WEATHERNEXT_RING_BUFFER__ === ringToDispose) {
+          delete (window as any).__INDICATRIX_WEATHERNEXT_RING_BUFFER__;
+        }
+        try { ringToDispose.dispose?.(); } catch {}
+      }
       engineRef.current.dispose();
       loadedBinRef.current = null;
     };
@@ -2637,19 +2810,18 @@ export const WebGPUCanvas: React.FC<WebGPUCanvasProps> = React.memo(({
 
       viewportSizeRef.current = { width, height, dpr };
 
-      canvas.width = Math.round(width * dpr);
-      canvas.height = Math.round(height * dpr);
-
-      const overlay = overlayCanvasRef.current;
-      if (overlay) {
-        overlay.width = Math.round(width * dpr);
-        overlay.height = Math.round(height * dpr);
-      }
+      const nextW = Math.round(width * dpr);
+      const nextH = Math.round(height * dpr);
+      if (nextW <= 0 || nextH <= 0) return;
 
       cameraRef.current.aspect = width / Math.max(height, 1);
       cameraRef.current.updateProjectionMatrix();
 
-      engineRef.current.resize(canvas.width, canvas.height);
+      if (canvas.width !== nextW || canvas.height !== nextH) {
+        canvas.width = nextW;
+        canvas.height = nextH;
+        engineRef.current.resize(canvas.width, canvas.height);
+      }
     };
 
     const resizeObserver = new ResizeObserver(handleResize);
@@ -2680,15 +2852,7 @@ export const WebGPUCanvas: React.FC<WebGPUCanvasProps> = React.memo(({
         mode: curModeProp,
         layerMode: curLayer,
         theme: curTheme,
-        showSoundings: curShowSoundings,
-        showTriangulation: curShowTriangulation,
         showVectors: curShowVectors,
-        activeOverlay: curActiveOverlay,
-        showLandmarks: curShowLandmarks,
-        showTissot: curShowTissot,
-        dataLayers: curDataLayers,
-        vortexStrength: curVortexStrength,
-        fractureIntensity: curFractureIntensity,
       } = stateRef.current;
 
       const directMode = typeof window !== 'undefined' ? (window as any).__INDICATRIX_MODE__ : undefined;
@@ -2696,6 +2860,7 @@ export const WebGPUCanvas: React.FC<WebGPUCanvasProps> = React.memo(({
 
       const scrubAlpha = typeof window !== 'undefined' ? (window as any).__INDICATRIX_SCRUB_ALPHA__ : undefined;
       const animAlpha = typeof window !== 'undefined' ? (window as any).__INDICATRIX_ANIM_ALPHA__ : undefined;
+      const storeLiveAlpha = telemetryStore.getLiveUnfurl();
 
       if (scrubAlpha !== undefined) {
         lastScrubAlphaRef.current = scrubAlpha;
@@ -2709,7 +2874,14 @@ export const WebGPUCanvas: React.FC<WebGPUCanvasProps> = React.memo(({
       }
 
       const activeScrub = scrubAlpha !== undefined ? scrubAlpha : lastScrubAlphaRef.current;
-      const curUnfurl = activeScrub !== undefined ? activeScrub : (animAlpha !== undefined ? animAlpha : curUnfurlProp);
+      const curUnfurl =
+        activeScrub !== undefined
+          ? activeScrub
+          : animAlpha !== undefined
+            ? animAlpha
+            : storeLiveAlpha !== null
+              ? storeLiveAlpha
+              : curUnfurlProp;
 
       if (engine.initialized) {
         const appStartTime = startTime !== undefined ? startTime : startTimeRef.current;
@@ -2740,10 +2912,16 @@ export const WebGPUCanvas: React.FC<WebGPUCanvasProps> = React.memo(({
 
           if (trajectory.isFinished()) {
             callbacksRef.current.onDemoModeChange?.(false);
-            const offset = _scratchVecA.subVectors(camera.position, targetRef.current);
-            sphericalRef.current.radius = offset.length();
-            sphericalRef.current.theta = Math.atan2(offset.x, offset.z);
-            sphericalRef.current.phi = Math.acos(Math.min(Math.max(offset.y / Math.max(sphericalRef.current.radius, 0.001), -1), 1));
+            if (curUnfurl < 0.01) {
+              sphericalRef.current.radius = camera.position.length();
+              sphericalRef.current.theta = Math.atan2(camera.position.x, camera.position.z);
+              sphericalRef.current.phi = Math.acos(Math.min(Math.max(camera.position.y / Math.max(sphericalRef.current.radius, 0.001), -1), 1));
+            } else {
+              const offset = _scratchVecA.subVectors(camera.position, targetRef.current);
+              sphericalRef.current.radius = offset.length();
+              sphericalRef.current.theta = Math.atan2(offset.x, offset.z);
+              sphericalRef.current.phi = Math.acos(Math.min(Math.max(offset.y / Math.max(sphericalRef.current.radius, 0.001), -1), 1));
+            }
           }
         } else if (cameraTransitionRef.current && !isDraggingRef.current) {
           const tr = cameraTransitionRef.current;
@@ -2770,10 +2948,21 @@ export const WebGPUCanvas: React.FC<WebGPUCanvasProps> = React.memo(({
           camera.lookAt(targetRef.current);
           camera.updateMatrixWorld();
 
-          const offset = _scratchVecA.subVectors(camera.position, targetRef.current);
-          sphericalRef.current.radius = offset.length();
-          sphericalRef.current.theta = Math.atan2(offset.x, offset.z);
-          sphericalRef.current.phi = Math.acos(Math.min(Math.max(offset.y / Math.max(sphericalRef.current.radius, 0.001), -1), 1));
+          if (curUnfurl < 0.01) {
+            const rLen = Math.max(camera.position.length(), 0.001);
+            sphericalRef.current.radius = rLen;
+            sphericalRef.current.theta = Math.atan2(camera.position.x, camera.position.z);
+            sphericalRef.current.phi = Math.acos(Math.min(Math.max(camera.position.y / rLen, -1), 1));
+            let lon = (sphericalRef.current.theta * 180) / Math.PI;
+            lon = ((((lon + 180) % 360) + 360) % 360) - 180;
+            const lat = Math.max(-85, Math.min(85, 90 - (sphericalRef.current.phi * 180) / Math.PI));
+            activeCoordsRef.current = { lat, lon };
+          } else {
+            const offset = _scratchVecA.subVectors(camera.position, targetRef.current);
+            sphericalRef.current.radius = offset.length();
+            sphericalRef.current.theta = Math.atan2(offset.x, offset.z);
+            sphericalRef.current.phi = Math.acos(Math.min(Math.max(offset.y / Math.max(sphericalRef.current.radius, 0.001), -1), 1));
+          }
 
           if (alpha >= 1.0) {
             cameraTransitionRef.current = null;
@@ -2790,10 +2979,25 @@ export const WebGPUCanvas: React.FC<WebGPUCanvasProps> = React.memo(({
           lon = ((((lon + 180) % 360) + 360) % 360) - 180;
           const lat = Math.max(-85, Math.min(85, 90 - (sphericalRef.current.phi * 180) / Math.PI));
           activeCoordsRef.current = { lat, lon };
-          updateCameraTransform();
+          if (curUnfurl < 0.01) {
+            updateCameraTransform();
+          } else {
+            camera.up.set(0, 1, 0);
+            camera.lookAt(targetRef.current);
+            camera.updateMatrixWorld();
+          }
 
           if (camera.position.distanceTo(targetPos) < 0.05) {
             camera.position.copy(targetPos);
+            targetRef.current.copy(ORIGIN_VEC);
+            const finalOffset = _scratchVecA.subVectors(camera.position, targetRef.current);
+            sphericalRef.current.radius = finalOffset.length();
+            sphericalRef.current.theta = Math.atan2(finalOffset.x, finalOffset.z);
+            sphericalRef.current.phi = Math.acos(Math.min(Math.max(finalOffset.y / Math.max(sphericalRef.current.radius, 0.001), -1), 1));
+            let finalLon = (sphericalRef.current.theta * 180) / Math.PI;
+            finalLon = ((((finalLon + 180) % 360) + 360) % 360) - 180;
+            const finalLat = Math.max(-85, Math.min(85, 90 - (sphericalRef.current.phi * 180) / Math.PI));
+            activeCoordsRef.current = { lat: finalLat, lon: finalLon };
             targetCameraPosRef.current = null;
             updateCameraTransform();
           }
@@ -2816,8 +3020,8 @@ export const WebGPUCanvas: React.FC<WebGPUCanvasProps> = React.memo(({
                 Math.max(sphericalRef.current.phi + vel.velPhi, 0.001),
                 Math.PI - 0.001
               );
-              targetRef.current.x += vel.velPanX;
-              targetRef.current.y += vel.velPanY;
+              targetRef.current.x = Math.max(-Math.PI * 5.0, Math.min(Math.PI * 5.0, targetRef.current.x + vel.velPanX));
+              targetRef.current.y = Math.max(-Math.PI * 2.5, Math.min(Math.PI * 2.5, targetRef.current.y + vel.velPanY));
 
               vel.velTheta *= decay;
               vel.velPhi *= decay;
@@ -2849,14 +3053,29 @@ export const WebGPUCanvas: React.FC<WebGPUCanvasProps> = React.memo(({
             if (Math.abs(vel.velRadius) > 1e-6) {
               const currentPhi = sphericalRef.current.phi;
               const currentTheta = sphericalRef.current.theta;
-              const currentLat = 90 - (currentPhi * 180) / Math.PI;
-              let currentLon = (currentTheta * 180) / Math.PI;
-              currentLon = (((currentLon + 180) % 360) + 360) % 360 - 180;
+              const sphLat = 90 - (currentPhi * 180) / Math.PI;
+              let sphLon = (currentTheta * 180) / Math.PI;
+              sphLon = (((sphLon + 180) % 360) + 360) % 360 - 180;
+              const currentLat = curUnfurl >= 0.5 ? (activeCoordsRef.current?.lat ?? sphLat) : sphLat;
+              const currentLon = curUnfurl >= 0.5 ? (activeCoordsRef.current?.lon ?? sphLon) : sphLon;
               const h_floor = getGroundClearanceFloor(currentLon, currentLat, sphericalRef.current.radius + vel.velRadius);
               sphericalRef.current.radius = Math.min(
                 Math.max(sphericalRef.current.radius + vel.velRadius, h_floor),
                 50.0
               );
+              if (curUnfurl >= 0.5 && vel.velRadius > 0 && sphericalRef.current.radius >= 11.0 && targetRef.current.lengthSq() > 1e-6) {
+                const zoomOutRecenter = Math.min(0.14, ((sphericalRef.current.radius - 11.0) / 6.0) * 0.12 + 0.02);
+                targetRef.current.x *= (1.0 - zoomOutRecenter);
+                targetRef.current.y *= (1.0 - zoomOutRecenter);
+                let lon = (targetRef.current.x / 5.0) * (180 / Math.PI);
+                lon = ((((lon + 180) % 360) + 360) % 360) - 180;
+                const clampedY = Math.max(-5.0 * 2.5, Math.min(5.0 * 2.5, targetRef.current.y));
+                const curModeZoomOut = stateRef.current?.mode ?? 0;
+                const lat = curModeZoomOut === 0
+                  ? Math.max(-85, Math.min(85, (clampedY / 5.0) * (180 / Math.PI)))
+                  : (2.0 * Math.atan(Math.exp(clampedY / 5.0)) - Math.PI / 2.0) * (180 / Math.PI);
+                activeCoordsRef.current = { lat, lon };
+              }
               vel.velRadius *= decay;
               if (Math.abs(vel.velRadius) < 1e-6) vel.velRadius = 0;
             }
@@ -2881,7 +3100,7 @@ export const WebGPUCanvas: React.FC<WebGPUCanvasProps> = React.memo(({
             const prevUnfurl = Math.max(0.0, Math.min(1.0, lastUnfurlRef.current));
             const prevEase = prevUnfurl * prevUnfurl * (3.0 - 2.0 * prevUnfurl);
             const dEase = unrollEase - prevEase;
-            const isGlobalView = sphericalRef.current.radius >= 12.0;
+            const isGlobalView = sphericalRef.current.radius >= 16.0;
 
             if (!isDraggingRef.current) {
               cameraRef.current.up.set(0, 1, 0);
@@ -2891,7 +3110,6 @@ export const WebGPUCanvas: React.FC<WebGPUCanvasProps> = React.memo(({
                 if (wrappedTheta < 0.0) wrappedTheta += 2.0 * Math.PI;
                 wrappedTheta -= Math.PI;
                 sphericalRef.current.theta = wrappedTheta * (1.0 - rightingStep);
-                sphericalRef.current.phi += (Math.PI * 0.5 - sphericalRef.current.phi) * rightingStep;
               } else if (dEase < -1e-6) {
                 const foldStep = Math.min(1.0, (-dEase) / Math.max(1e-4, prevEase));
                 const goalTheta = (activeCoordsRef.current.lon * Math.PI) / 180.0;
@@ -2972,8 +3190,13 @@ export const WebGPUCanvas: React.FC<WebGPUCanvasProps> = React.memo(({
           const sphLat = 90 - (currentPhi * 180) / Math.PI;
           let sphLon = (currentTheta * 180) / Math.PI;
           sphLon = ((sphLon + 180) % 360 + 360) % 360 - 180;
-          const currentLat = curUnfurl >= 0.5 ? (activeCoordsRef.current?.lat ?? sphLat) : sphLat;
-          const currentLon = curUnfurl >= 0.5 ? (activeCoordsRef.current?.lon ?? sphLon) : sphLon;
+          const planarLon = (targetRef.current.x / 5.0) * (180.0 / Math.PI);
+          const planarLat = (targetRef.current.y / 5.0) * (180.0 / Math.PI);
+          const hasPlanarOffset = Math.abs(planarLon) > 1e-4 || Math.abs(planarLat) > 1e-4;
+          const currentLat = curUnfurl >= 0.5 ? (hasPlanarOffset ? planarLat : (activeCoordsRef.current?.lat ?? sphLat)) : sphLat;
+          const currentLon = curUnfurl >= 0.5 ? (hasPlanarOffset ? planarLon : (activeCoordsRef.current?.lon ?? sphLon)) : sphLon;
+          const effectiveSlippyRadius =
+            curUnfurl >= 0.5 ? Math.min(currentRadius, 5.0 + Math.max(0.06, currentRadius - 5.0) * 0.25) : currentRadius;
 
           // Camera zoom threshold: radius <= 12.0 indicates regional focus
           const isZoomedIn = currentRadius <= 12.0;
@@ -2982,12 +3205,12 @@ export const WebGPUCanvas: React.FC<WebGPUCanvasProps> = React.memo(({
           if (isZoomedIn) {
             for (const reg of regions) {
               const b = reg.bounds;
-              // Allow 0.75° boundary buffer for pre-fetching
+              // Allow 3.2° boundary buffer for pre-fetching and oblique camera step-backs
               if (
-                currentLon >= b.minLon - 0.75 &&
-                currentLon <= b.maxLon + 0.75 &&
-                currentLat >= b.minLat - 0.75 &&
-                currentLat <= b.maxLat + 0.75
+                currentLon >= b.minLon - 3.2 &&
+                currentLon <= b.maxLon + 3.2 &&
+                currentLat >= b.minLat - 3.2 &&
+                currentLat <= b.maxLat + 3.2
               ) {
                 matchedRegion = reg;
                 break;
@@ -3004,7 +3227,10 @@ export const WebGPUCanvas: React.FC<WebGPUCanvasProps> = React.memo(({
 
               if (activeRegionIdRef.current !== regId) {
                 activeRegionIdRef.current = regId;
-                activeTileKeyRef.current = null;
+                activeTileKeyRef.current = engine.getRegionalDEMTexture(regId) ? targetTileKey : null;
+                if (engine.getRegionalDEMTexture(regId)) {
+                  engine.setActiveRegionalDEM(regId);
+                }
               }
 
               if (activeTileKeyRef.current !== targetTileKey && !loadingRegionsRef.current.has(regId)) {
@@ -3013,6 +3239,7 @@ export const WebGPUCanvas: React.FC<WebGPUCanvasProps> = React.memo(({
                   .streamRegionalCOG(regId, matchedRegion.bounds, matchedRegion.cogUrl)
                   .then((success) => {
                     loadingRegionsRef.current.delete(regId);
+                    (loadingRegionsRef.current as any).__lastSlippyKey = null;
                     if (success) {
                       activeTileKeyRef.current = targetTileKey;
                       if (activeRegionIdRef.current === regId) {
@@ -3029,10 +3256,16 @@ export const WebGPUCanvas: React.FC<WebGPUCanvasProps> = React.memo(({
                           regId
                         )
                         .then(() => {
+                          activeTileKeyRef.current = targetTileKey;
                           if (activeRegionIdRef.current === regId) {
                             engine.setActiveRegionalDEM(regId);
                           }
                         });
+                    } else {
+                      activeTileKeyRef.current = targetTileKey;
+                      if (activeRegionIdRef.current === regId) {
+                        engine.setActiveRegionalDEM(regId);
+                      }
                     }
                   })
                   .catch(() => {
@@ -3072,27 +3305,33 @@ export const WebGPUCanvas: React.FC<WebGPUCanvasProps> = React.memo(({
           } else {
             const engine = engineRef.current;
             if (activeRegionIdRef.current !== null) {
-              const prevId = activeRegionIdRef.current;
               activeRegionIdRef.current = null;
               activeTileKeyRef.current = null;
               engine.setActiveRegionalDEM(null);
-              if (currentRadius > 14.0) {
-                engine.releaseRegionalDEMTexture(prevId);
-              }
             }
           }
 
-          if (currentRadius <= 5.65) {
+          if (effectiveSlippyRadius <= 5.65) {
             const engine = engineRef.current;
             if (typeof engine.streamSlippyMapTerrainTiles === 'function') {
-              const slippyZoom = currentRadius <= 5.05 ? 11 : currentRadius <= 5.10 ? 10 : currentRadius <= 5.18 ? 9 : 8;
+              const slippyZoom =
+                effectiveSlippyRadius <= 5.03 ? 12 : effectiveSlippyRadius <= 5.06 ? 11 : effectiveSlippyRadius <= 5.16 ? 10 : effectiveSlippyRadius <= 5.28 ? 9 : 8;
               const n = 1 << slippyZoom;
-              const camPitchDeg = (stateRef.current as any)?.cameraPitchDeg ?? 0;
+              const camPitchDeg = (stateRef.current as any)?.cameraPitchDeg || (loadingRegionsRef.current as any).__obliquePitchDeg || 0;
+              const camHeadingDeg = (stateRef.current as any)?.cameraHeadingDeg || (loadingRegionsRef.current as any).__obliqueHeadingDeg || 0;
               const camPitchRad = (Math.max(0, Math.min(75, camPitchDeg)) * Math.PI) / 180.0;
-              const lookAheadDeg = Math.min(0.35, Math.max(0.0, currentRadius - 5.0) * Math.tan(camPitchRad) * 11.459);
-              const focusLat = Math.max(-85.0, Math.min(85.0, currentLat + lookAheadDeg));
+              const camHeadingRad = (camHeadingDeg * Math.PI) / 180.0;
+              const lookAheadDeg =
+                curUnfurl >= 0.5
+                  ? 0.0
+                  : Math.min(3.5, Math.max(0.0, effectiveSlippyRadius - 5.0) * Math.tan(camPitchRad) * 11.459);
+              const cosCurLat = Math.max(0.2, Math.cos((currentLat * Math.PI) / 180.0));
+              const focusLat = Math.max(-85.0, Math.min(85.0, currentLat + lookAheadDeg * Math.cos(camHeadingRad)));
+              const focusLon =
+                ((((currentLon + (lookAheadDeg * Math.sin(camHeadingRad)) / cosCurLat) + 180.0) % 360.0) + 360.0) % 360.0 -
+                180.0;
               const latRad = (focusLat * Math.PI) / 180.0;
-              const tx = Math.max(0, Math.min(n - 1, Math.floor(((currentLon + 180.0) / 360.0) * n)));
+              const tx = Math.max(0, Math.min(n - 1, Math.floor(((focusLon + 180.0) / 360.0) * n)));
               const ty = Math.max(
                 0,
                 Math.min(
@@ -3100,16 +3339,47 @@ export const WebGPUCanvas: React.FC<WebGPUCanvasProps> = React.memo(({
                   Math.floor(((1.0 - Math.log(Math.tan(latRad) + 1.0 / Math.cos(latRad)) / Math.PI) * 0.5) * n)
                 )
               );
-              const slippyKey = `terrarium:${slippyZoom}:${tx}:${ty}`;
+              const isRegionalOverviewInFlight = Boolean(
+                matchedRegion?.cogUrl && loadingRegionsRef.current.has(matchedRegion.id)
+              );
+              const useRegionalLevel0COG =
+                Boolean(matchedRegion?.cogUrl) &&
+                effectiveSlippyRadius <= 5.50 &&
+                typeof engine.streamRegionalCOGLevel0Neighborhood === 'function' &&
+                (typeof engine.shouldStreamRegionalLevel0COG === 'function'
+                  ? engine.shouldStreamRegionalLevel0COG(matchedRegion!.id, slippyZoom)
+                  : false);
+              const slippyKey = useRegionalLevel0COG
+                ? `${matchedRegion!.id}:l0:${Math.round(focusLon * 12)}:${Math.round(focusLat * 12)}`
+                : `terrarium:${slippyZoom}:${tx}:${ty}`;
               const lastSlippyKey = (loadingRegionsRef.current as any).__lastSlippyKey;
-              if (lastSlippyKey !== slippyKey && !loadingRegionsRef.current.has(slippyKey)) {
+              const slippyInFlight = Boolean((loadingRegionsRef.current as any).__slippyInFlight);
+              const lastProgMoveMs = Number((loadingRegionsRef.current as any).__lastProgMoveMs || 0);
+              const isCameraSettled =
+                !isDraggingRef.current &&
+                performance.now() - lastProgMoveMs > 160 &&
+                Math.abs(velocityRef.current.velTheta) < 0.002 &&
+                Math.abs(velocityRef.current.velPhi) < 0.002 &&
+                Math.abs(velocityRef.current.velRadius) < 0.05;
+              if (
+                isCameraSettled &&
+                !isRegionalOverviewInFlight &&
+                !slippyInFlight &&
+                lastSlippyKey !== slippyKey &&
+                !loadingRegionsRef.current.has(slippyKey)
+              ) {
                 (loadingRegionsRef.current as any).__lastSlippyKey = slippyKey;
+                (loadingRegionsRef.current as any).__slippyInFlight = true;
                 if (!matchedRegion) {
                   activeTileKeyRef.current = slippyKey;
                 }
                 loadingRegionsRef.current.add(slippyKey);
-                engine.streamSlippyMapTerrainTiles(currentLon, focusLat, slippyZoom).finally(() => {
+                const streamPromise = useRegionalLevel0COG
+                  ? engine.streamRegionalCOGLevel0Neighborhood(matchedRegion!.id, focusLon, focusLat, matchedRegion!.cogUrl, 2)
+                  : engine.streamSlippyMapTerrainTiles(focusLon, focusLat, slippyZoom);
+                streamPromise.finally(() => {
                   loadingRegionsRef.current.delete(slippyKey);
+                  (loadingRegionsRef.current as any).__slippyInFlight = false;
                 });
               }
             }
@@ -3130,34 +3400,8 @@ export const WebGPUCanvas: React.FC<WebGPUCanvasProps> = React.memo(({
           cursorCoordsRef.current = { lat, lon };
         }
 
-        // 1. Whimsical Effects Manager update (Fibonacci polar alignment Moiré scaling)
-        const whimsicalState = whimsicalManagerRef.current.update(
-          [camera.position.x, camera.position.y, camera.position.z],
-          curMode,
-          curUnfurl,
-          time,
-          dt * 1000
-        );
-        (window as any).__INDICATRIX_WHIMSICAL__ = whimsicalState;
-        (window as any).__WHIMSICAL_MANAGER__ = whimsicalManagerRef.current;
-
-        // 2. Manifold Pinch Spring-Damper Dynamics (k=45, gamma=6.5, omega_d=28)
-        const pinchState = pinchControllerRef.current.update(dt);
-        const isPinchActive = pinchState.fsmState === 'PINCH_ENGAGED' || pinchState.fsmState === 'RELEASE_REBOUND';
-        (window as any).__INDICATRIX_PINCH__ = pinchState;
-        (window as any).__MANIFOLD_PINCH_CONTROLLER__ = pinchControllerRef.current;
-
-        const cursorActive = (cursorPhysicsEnabledRef.current || isPinchActive)
-          ? (isPinchActive ? true : cursorUniforms.u_cursorActive > 0.001)
-          : false;
-
-        if (isPinchActive) {
-          const hitArr = pinchControllerRef.current.getDisplacedHitPosition();
-          reusableHitPosRef.current.set(hitArr[0], hitArr[1], hitArr[2]);
-        }
-        const displacedHitPos = isPinchActive
-          ? reusableHitPosRef.current
-          : cursorUniforms.u_cursorHitPos;
+        const cursorActive = cursorPhysicsEnabledRef.current ? cursorUniforms.u_cursorActive > 0.001 : false;
+        const displacedHitPos = cursorUniforms.u_cursorHitPos;
 
         const layerCache = cachedLayersRef.current;
         const activeDataLayer = layerCache.activeDataLayer;
@@ -3171,10 +3415,12 @@ export const WebGPUCanvas: React.FC<WebGPUCanvasProps> = React.memo(({
         // Orbital scale (r >= 5.50): 2.8x displacement multiplier for dramatic global topography.
         // Close-up survey (r <= 5.05): Attenuates smoothly to 1.0x (true physical crust relief),
         // preventing 144km spire displacement and allowing close-range inspection down to 1km AGL.
-        const currentCamRadius = (1.0 - curUnfurl) * sphericalRef.current.radius + curUnfurl * (5.0 + Math.abs(camera.position.z));
+        const planarCamDist = Math.max(Math.abs(camera.position.z), camera.position.distanceTo(targetRef.current));
+        const currentCamRadius = Math.max(5.25, (1.0 - curUnfurl) * sphericalRef.current.radius + curUnfurl * Math.max(sphericalRef.current.radius, 5.0 + planarCamDist));
         const alphaRelief = Math.min(1.0, Math.max(0.0, (currentCamRadius - 5.05) / (5.50 - 5.05)));
         const reliefMultiplier = 0.16 + 2.64 * alphaRelief;
         const displacementScale = baseDisplacementScale * (reliefMultiplier / 2.8);
+        const reliefAttenRatio = reliefMultiplier / 2.8;
         const hillshadeIntensity = liveOverrides?.hillshadeIntensity ?? activeDataLayer?.hillshadeIntensity ?? layerCache.primaryReliefLayer?.hillshadeIntensity ?? 1.0;
         const reliefActive = activeDataLayer ? layerCache.reliefActive : false;
         const seaLevel = liveOverrides?.seaLevelOffset ?? activeDataLayer?.seaLevelOffset ?? layerCache.primaryReliefLayer?.seaLevelOffset ?? 0.0;
@@ -3185,7 +3431,7 @@ export const WebGPUCanvas: React.FC<WebGPUCanvasProps> = React.memo(({
         const peakExponent = liveOverrides?.peakExponent ?? activeDataLayer?.peakExponent ?? layerCache.primaryReliefLayer?.peakExponent ?? 1.4;
         const paperTooth = liveOverrides?.roughness !== undefined
           ? liveOverrides.roughness
-          : (liveOverrides?.paperTooth ?? activeDataLayer?.paperTooth ?? layerCache.primaryReliefLayer?.paperTooth ?? 0.40);
+          : (liveOverrides?.paperTooth ?? activeDataLayer?.paperTooth ?? layerCache.primaryReliefLayer?.paperTooth ?? (curTheme === 1 ? 0.40 : curTheme === 0 ? 0.25 : 0.15));
         const opacity = activeDataLayer?.opacity ?? 1.0;
         const renderStyle = activeDataLayer?.renderStyle ?? (activeDataLayer?.id === 'hybrid-crust-hydrosphere' ? 'hybrid' : 'architectural');
 
@@ -3195,7 +3441,9 @@ export const WebGPUCanvas: React.FC<WebGPUCanvasProps> = React.memo(({
         const showWind = liveOverrides?.showWind !== undefined ? liveOverrides.showWind : (hasSurfaceWind || hasJetStream);
 
         // Dynamic near-plane modulation: 0.1 at orbit (alt >= 1.0) -> 0.00005 in troposphere (alt <= 0.004)
-        const camDist = camera.position.length();
+        const rawCamDist = camera.position.length();
+        const unfurlNear = Math.min(1.0, Math.max(0.0, curUnfurl));
+        const camDist = rawCamDist * (1.0 - unfurlNear) + (5.0 + Math.abs(camera.position.z)) * unfurlNear;
         const activeLat = activeCoordsRef.current?.lat ?? 0;
         const activeLon = activeCoordsRef.current?.lon ?? 0;
         const floorRadius = getGroundClearanceFloor(activeLon, activeLat, camDist);
@@ -3226,16 +3474,12 @@ export const WebGPUCanvas: React.FC<WebGPUCanvasProps> = React.memo(({
             ? (masterShowClouds && cloudLayer.visible)
             : masterShowClouds);
 
-        const atmLayer = layerCache.atmLayer;
-        const effectiveShowAtmosphere = liveOverrides?.showAtmosphere !== undefined
-          ? liveOverrides.showAtmosphere
-          : (atmLayer !== null
-            ? atmLayer.visible
-            : (stateRef.current.showAtmosphere ?? false));
-
+        const engineVolumetric = typeof engine.isVolumetricCloudsEnabled === 'function'
+          ? engine.isVolumetricCloudsEnabled()
+          : true;
         const effectiveVolumetricClouds = liveOverrides?.volumetricClouds !== undefined
           ? liveOverrides.volumetricClouds
-          : (stateRef.current.volumetricClouds ?? true);
+          : (engineVolumetric && (stateRef.current.volumetricClouds ?? true));
 
         const effectiveShowCloudLow = liveOverrides?.showCloudLow !== undefined
           ? liveOverrides.showCloudLow
@@ -3252,6 +3496,21 @@ export const WebGPUCanvas: React.FC<WebGPUCanvasProps> = React.memo(({
               : (stateRef.current.shadowIntensity ?? 0.45))
           : 0.0;
 
+        const liveTimeline = telemetryStore.getLiveTimeline();
+        const effTimelineMinutes =
+          liveOverrides?.timelineMinutes !== undefined
+            ? liveOverrides.timelineMinutes
+            : liveTimeline
+              ? liveTimeline.timelineMinutes
+              : stateRef.current.timelineMinutes;
+        const effScrubTau =
+          liveOverrides?.scrubTau !== undefined
+            ? liveOverrides.scrubTau
+            : liveTimeline
+              ? liveTimeline.tau
+              : (stateRef.current.scrubTau || (((effTimelineMinutes ?? 0) % 60 + 60) % 60) / 60);
+        const effWeatherTau = liveTimeline ? liveTimeline.tau : stateRef.current.weatherTau;
+
         engine.render({
           unfurl: curUnfurl,
           mode: curMode,
@@ -3264,7 +3523,6 @@ export const WebGPUCanvas: React.FC<WebGPUCanvasProps> = React.memo(({
           cursorHitPos: displacedHitPos,
           cursorVel: cursorUniforms.u_cursorVel,
           cursorActive,
-          pointScaleMultiplier: whimsicalState.pointScaleMultiplier,
           camera,
           displacementScale,
           hillshadeIntensity,
@@ -3284,7 +3542,6 @@ export const WebGPUCanvas: React.FC<WebGPUCanvasProps> = React.memo(({
           showCloudMid: liveOverrides?.showCloudMid !== undefined ? liveOverrides.showCloudMid : stateRef.current.showCloudMid,
           showCloudHigh: liveOverrides?.showCloudHigh !== undefined ? liveOverrides.showCloudHigh : stateRef.current.showCloudHigh,
           cloudFalseColor: liveOverrides?.cloudFalseColor !== undefined ? liveOverrides.cloudFalseColor : stateRef.current.cloudFalseColor,
-          showAtmosphere: effectiveShowAtmosphere,
           cloudDriftSpeed:
             liveOverrides?.cloudDriftSpeed !== undefined
               ? liveOverrides.cloudDriftSpeed
@@ -3300,7 +3557,9 @@ export const WebGPUCanvas: React.FC<WebGPUCanvasProps> = React.memo(({
           cloudThickness: liveOverrides?.cloudThickness !== undefined ? liveOverrides.cloudThickness : stateRef.current.cloudThickness,
           cloudLowTop: liveOverrides?.cloudLowTop !== undefined ? liveOverrides.cloudLowTop : stateRef.current.cloudLowTop,
           resolution: stateRef.current.resolution || '1M',
-          cloudMaxSteps: liveOverrides?.cloudMaxSteps,
+          cloudMaxSteps:
+            liveOverrides?.cloudMaxSteps ??
+            (!stateRef.current.purityMode && stateRef.current.resolution === '100k' ? 32 : undefined),
           atmosphericScale: stateRef.current.atmosphericScale,
           shadowIntensity: effectiveShadowIntensity,
           prognosticModel: stateRef.current.prognosticModel,
@@ -3308,17 +3567,17 @@ export const WebGPUCanvas: React.FC<WebGPUCanvasProps> = React.memo(({
           verticalScaleMode: stateRef.current.verticalScaleMode,
           rainShadowFeedback: stateRef.current.rainShadowFeedback,
           pluvialGamma: stateRef.current.pluvialGamma,
-          weatherOpticalMode: stateRef.current.weatherOpticalMode,
-          timelineMinutes: stateRef.current.timelineMinutes,
-          scrubTau: stateRef.current.scrubTau,
-          weatherTau: stateRef.current.weatherTau,
-          tau: stateRef.current.scrubTau,
+          timelineMinutes: effTimelineMinutes,
+          scrubTau: effScrubTau,
+          reliefAttenRatio: liveOverrides?.reliefAttenRatio !== undefined ? liveOverrides.reliefAttenRatio : reliefAttenRatio,
+          effectiveCamRadius: camDist,
+          atmoFeatureMask: liveOverrides?.atmoFeatureMask !== undefined ? liveOverrides.atmoFeatureMask : 255,
+          weatherTau: effWeatherTau,
+          tau: effScrubTau,
           windSpeedMultiplier: liveOverrides?.windSpeedMultiplier ?? stateRef.current.windSpeedMultiplier,
           windParticleLifetime: liveOverrides?.windParticleLifetime ?? stateRef.current.windParticleLifetime,
           thermodynamicGating: stateRef.current.thermodynamicGating,
           lclGating: stateRef.current.thermodynamicGating,
-          vortexStrength: curVortexStrength,
-          fractureIntensity: curFractureIntensity,
           seaLevel,
           sunAzimuth: liveOverrides?.sunAzimuth !== undefined ? liveOverrides.sunAzimuth : sunAzimuth,
           sunAltitude: liveOverrides?.sunAltitude !== undefined ? liveOverrides.sunAltitude : sunAltitude,
@@ -3330,11 +3589,6 @@ export const WebGPUCanvas: React.FC<WebGPUCanvasProps> = React.memo(({
           cdlodDiagnosticMode: stateRef.current.cdlodDiagnosticMode ?? 0,
           opacity,
           renderStyle,
-          isolatedStratum:
-            stateRef.current.isolatedStratum !== undefined &&
-            stateRef.current.isolatedStratum !== null
-              ? stateRef.current.isolatedStratum
-              : -1,
           purityMode:
             liveOverrides?.purityMode !== undefined
               ? Boolean(liveOverrides.purityMode)
@@ -3402,390 +3656,26 @@ export const WebGPUCanvas: React.FC<WebGPUCanvasProps> = React.memo(({
         if (now - lastProfilerTimeRef.current >= 250) {
           lastProfilerTimeRef.current = now;
           const profilerReport = engine.getProfiler()?.getLatestReport();
+          if (profilerReport) {
+            telemetryStore.setGpuReport(profilerReport);
+          }
           if (profilerReport && callbacksRef.current.onGpuProfilerReport) {
             callbacksRef.current.onGpuProfilerReport(profilerReport);
           }
+          telemetryStore.setLodStats({
+            activeNodes: (engine as any).cdlodActiveNodeCount ?? 0,
+            culledNodes: 0,
+            indirectDrawCalls: (engine as any).lastIndirectDrawCallsCount ?? 0,
+            maxLodLevel: (engine as any).lastMaxLodSeen ?? 0,
+            activeSlippyTiles: engine.gpuTileCache?.getActiveClusterSlotCount?.() ?? 0,
+          });
         }
-
-        // 2D Overlay Rendering (Landmarks, Tissot Indicatrices, Geodesic Arcs)
-        const overlayCanvas = overlayCanvasRef.current;
-        const { width: vWidth, height: vHeight, dpr: vDpr } = viewportSizeRef.current;
-        if (overlayCanvas && vWidth > 0 && vHeight > 0) {
-          const ctx = overlayCanvas.getContext('2d');
-          if (ctx) {
-            ctx.clearRect(0, 0, overlayCanvas.width, overlayCanvas.height);
-            ctx.save();
-            ctx.scale(vDpr, vDpr);
-            const w = vWidth;
-            const h = vHeight;
-
-              const projectPoint = (x3: number, y3: number, z3: number): [number, number, boolean] => {
-                _scratchProjVec.set(x3, y3, z3);
-                let isFront = true;
-                // Progressive horizon backface culling transitioning smoothly into planar regime
-                const sphereWeight = 1.0 - Math.min(1.0, curUnfurl / 0.50);
-                if (sphereWeight > 0.0) {
-                  _scratchNorm.copy(_scratchProjVec).normalize();
-                  _scratchVDir.subVectors(camera.position, _scratchProjVec).normalize();
-                  const facing = _scratchNorm.dot(_scratchVDir);
-                  const facingThreshold = 0.05 * sphereWeight - 0.40 * (1.0 - sphereWeight);
-                  if (facing < facingThreshold) {
-                    isFront = false;
-                  }
-                }
-                _scratchProjVec.project(camera);
-                if (_scratchProjVec.z >= 1.0 || _scratchProjVec.z <= -1.0) {
-                  isFront = false;
-                }
-                _scratchProjResult[0] = (_scratchProjVec.x * 0.5 + 0.5) * w;
-                _scratchProjResult[1] = (-_scratchProjVec.y * 0.5 + 0.5) * h;
-                _scratchProjResult[2] = isFront;
-                return _scratchProjResult;
-              };
-
-              // 1. Geodesic Arcs & Animated Current Flow Beads
-              if (curActiveOverlay && curActiveOverlay !== 'off') {
-                const arcs = sampledArcSegmentsRef.current;
-                for (let aIdx = 0; aIdx < arcs.length; aIdx++) {
-                  const arc = arcs[aIdx];
-                  if (arc.category !== curActiveOverlay) continue;
-                  ctx.beginPath();
-                  let hasStarted = false;
-                  for (let i = 0; i < arc.segments.length; i++) {
-                    const pt = arc.segments[i];
-                    const pos3D = evaluatePointMorph(pt.lon, pt.lat, curUnfurl, curMode, time, 0.08);
-                    const [sx, sy, isFront] = projectPoint(pos3D[0], pos3D[1], pos3D[2]);
-                    if (!isFront) {
-                      hasStarted = false;
-                      continue;
-                    }
-                    if (!hasStarted) {
-                      ctx.moveTo(sx, sy);
-                      hasStarted = true;
-                    } else {
-                      ctx.lineTo(sx, sy);
-                    }
-                  }
-                  if (curActiveOverlay === 'antipodes') {
-                    ctx.setLineDash([4, 4]);
-                    ctx.strokeStyle = arc.color || (curTheme === 1 ? 'rgba(225, 29, 72, 0.65)' : 'rgba(251, 113, 133, 0.65)');
-                    ctx.lineWidth = 1.5;
-                  } else {
-                    ctx.setLineDash([]);
-                    ctx.strokeStyle = arc.color || (curTheme === 1 ? '#0284C7' : '#38BDF8');
-                    ctx.lineWidth = 1.5;
-                  }
-                  ctx.stroke();
-                  ctx.setLineDash([]);
-
-                  // Pulse beads along arc
-                  const segLen = arc.segments.length;
-                  for (let b = 0; b < 3; b++) {
-                    const speed = curActiveOverlay === 'conveyor' ? 0.08 : 0.16;
-                    const tBead = (time * speed + b * 0.33) % 1.0;
-                    const idxFloat = tBead * (segLen - 1);
-                    const i0 = Math.floor(idxFloat);
-                    const i1 = Math.min(segLen - 1, i0 + 1);
-                    const f = idxFloat - i0;
-                    const lon = (1 - f) * arc.segments[i0].lon + f * arc.segments[i1].lon;
-                    const lat = (1 - f) * arc.segments[i0].lat + f * arc.segments[i1].lat;
-                    const beadPos = evaluatePointMorph(lon, lat, curUnfurl, curMode, time, 0.12);
-                    const [bx, by, bFront] = projectPoint(beadPos[0], beadPos[1], beadPos[2]);
-                    if (bFront) {
-                      ctx.fillStyle = '#FFFFFF';
-                      ctx.beginPath();
-                      ctx.arc(bx, by, 2.5, 0, Math.PI * 2);
-                      ctx.fill();
-                    }
-                  }
-                }
-              }
-
-              // 2. Tissot Indicatrices (Authentic Mathematical Conjugate Axes & Drafting Ink)
-              if (curShowTissot) {
-                const inkColor =
-                  curTheme === 1
-                    ? 'rgba(140, 72, 32, 0.85)' // Cream Rag: Warm Sepia / Umber
-                    : curTheme === 2
-                    ? 'rgba(165, 213, 255, 0.85)' // Prussian Cyanotype: Washed Cerulean
-                    : 'rgba(56, 189, 248, 0.85)'; // Tharp: Marine Cyan Technical Ink
-                const crosshairColor =
-                  curTheme === 1
-                    ? 'rgba(140, 72, 32, 0.55)'
-                    : curTheme === 2
-                    ? 'rgba(232, 237, 242, 0.55)'
-                    : 'rgba(56, 189, 248, 0.55)';
-
-                const circles = tissotCirclesRef.current;
-                for (let cIdx = 0; cIdx < circles.length; cIdx++) {
-                  const c = circles[cIdx];
-                  // Outer Indicatrix Perimeter
-                  ctx.strokeStyle = inkColor;
-                  ctx.lineWidth = 1.0;
-                  ctx.beginPath();
-                  let started = false;
-                  for (let i = 0; i < c.perimeter.length; i++) {
-                    const pt = c.perimeter[i];
-                    const pos3D = evaluatePointMorph(pt.lon, pt.lat, curUnfurl, curMode, time, 0.04);
-                    const [sx, sy, isFront] = projectPoint(pos3D[0], pos3D[1], pos3D[2]);
-                    if (!isFront) {
-                      started = false;
-                      continue;
-                    }
-                    if (!started) {
-                      ctx.moveTo(sx, sy);
-                      started = true;
-                    } else {
-                      ctx.lineTo(sx, sy);
-                    }
-                  }
-                  ctx.stroke();
-
-                  // Internal Principal Conjugate Crosshairs (N-S Meridian & E-W Parallel axes)
-                  ctx.strokeStyle = crosshairColor;
-                  ctx.lineWidth = 0.75;
-                  ctx.setLineDash([2, 2]);
-
-                  for (let axIdx = 0; axIdx < 2; axIdx++) {
-                    const axis = axIdx === 0 ? c.axisMajor : c.axisMinor;
-                    if (!axis || axis.length < 2) continue;
-                    ctx.beginPath();
-                    let axisStarted = false;
-                    const STEPS = 8;
-                    for (let s = 0; s <= STEPS; s++) {
-                      const f = s / STEPS;
-                      const aLon = axis[0].lon + f * (axis[1].lon - axis[0].lon);
-                      const aLat = axis[0].lat + f * (axis[1].lat - axis[0].lat);
-                      const aPos = evaluatePointMorph(aLon, aLat, curUnfurl, curMode, time, 0.04);
-                      const [ax, ay, aFront] = projectPoint(aPos[0], aPos[1], aPos[2]);
-                      if (!aFront) {
-                        axisStarted = false;
-                        continue;
-                      }
-                      if (!axisStarted) {
-                        ctx.moveTo(ax, ay);
-                        axisStarted = true;
-                      } else {
-                        ctx.lineTo(ax, ay);
-                      }
-                    }
-                    ctx.stroke();
-                  }
-                  ctx.setLineDash([]);
-                }
-              }
-
-              // 3. Cached / Throttled 2D Overlay Text Projections (Landmarks, Soundings, Benchmarks)
-              const effectiveShowLandmarks = liveOverrides?.showLandmarks !== undefined ? liveOverrides.showLandmarks : curShowLandmarks;
-              const cCache = overlayCacheRef.current;
-              cCache.frame++;
-              const camP = camera.position;
-              const isStatic =
-                Math.abs(camP.x - cCache.camX) < 1e-4 &&
-                Math.abs(camP.y - cCache.camY) < 1e-4 &&
-                Math.abs(camP.z - cCache.camZ) < 1e-4 &&
-                Math.abs(curUnfurl - cCache.unfurl) < 1e-4 &&
-                curMode === cCache.mode &&
-                w === cCache.w &&
-                h === cCache.h &&
-                curTheme === cCache.theme;
-
-              // Only re-project expensive 3D coordinates when camera/morph changes, throttled to every 2nd frame during movement
-              const shouldRecalculate = !isStatic && (cCache.frame % 2 === 0 || cCache.unfurl < 0);
-              if (shouldRecalculate) {
-                cCache.camX = camP.x;
-                cCache.camY = camP.y;
-                cCache.camZ = camP.z;
-                cCache.unfurl = curUnfurl;
-                cCache.mode = curMode;
-                cCache.w = w;
-                cCache.h = h;
-                cCache.theme = curTheme;
-
-                // Project Landmark Anchors
-                cCache.landmarks = [];
-                if (effectiveShowLandmarks) {
-                  for (let lmIdx = 0; lmIdx < LANDMARK_ANCHORS.length; lmIdx++) {
-                    const lm = LANDMARK_ANCHORS[lmIdx];
-                    const pos3D = evaluatePointMorph(lm.lon, lm.lat, curUnfurl, curMode, time, 0.12);
-                    const [lx, ly, isFront] = projectPoint(pos3D[0], pos3D[1], pos3D[2]);
-                    if (isFront && lx >= -50 && lx <= w + 50 && ly >= -50 && ly <= h + 50) {
-                      const label = lm.label || '';
-                      const tw = getCachedTextWidth(ctx, label, '10px monospace');
-                      cCache.landmarks.push({
-                        lx,
-                        ly,
-                        px: lx + 8,
-                        py: ly - 8,
-                        pw: tw + 10,
-                        ph: 16,
-                        label,
-                      });
-                    }
-                  }
-                }
-
-                // Project Spot Soundings
-                cCache.soundings = [];
-                if (curShowSoundings) {
-                  for (let sIdx = 0; sIdx < ARCHIVAL_SOUNDINGS.length; sIdx++) {
-                    const s = ARCHIVAL_SOUNDINGS[sIdx];
-                    const pos3D = evaluatePointMorph(s.lon, s.lat, curUnfurl, curMode, time, -0.015);
-                    const [sx, sy, isFront] = projectPoint(pos3D[0], pos3D[1], pos3D[2]);
-                    if (isFront && sx >= -20 && sx <= w + 20 && sy >= -20 && sy <= h + 20) {
-                      cCache.soundings.push({
-                        sx,
-                        sy,
-                        text: `${s.depthFm} fm`,
-                      });
-                    }
-                  }
-                }
-
-                // Project Benchmarks
-                cCache.benchmarks = [];
-                if (curShowTriangulation) {
-                  for (let bmIdx = 0; bmIdx < GEODETIC_BENCHMARKS.length; bmIdx++) {
-                    const bm = GEODETIC_BENCHMARKS[bmIdx];
-                    const pos3D = evaluatePointMorph(bm.lon, bm.lat, curUnfurl, curMode, time, 0.06);
-                    const [bx, by, isFront] = projectPoint(pos3D[0], pos3D[1], pos3D[2]);
-                    if (isFront && bx >= -30 && bx <= w + 30 && by >= -30 && by <= h + 30) {
-                      cCache.benchmarks.push({
-                        bx,
-                        by,
-                        id: bm.id,
-                      });
-                    }
-                  }
-                }
-              }
-
-              // 3. Render Landmark Anchors from Cache
-              if (effectiveShowLandmarks && cCache.landmarks.length > 0) {
-                const dotColor = curTheme === 1 ? '#0F172A' : '#38BDF8';
-                const boxBg = curTheme === 1 ? 'rgba(255, 255, 255, 0.85)' : 'rgba(15, 23, 42, 0.85)';
-                const boxBorder = curTheme === 1 ? 'rgba(15, 23, 42, 0.3)' : 'rgba(56, 189, 248, 0.5)';
-                const textColor = curTheme === 1 ? '#0F172A' : '#E2E8F0';
-
-                ctx.font = '10px monospace';
-                ctx.lineWidth = 1;
-                for (let i = 0; i < cCache.landmarks.length; i++) {
-                  const lm = cCache.landmarks[i];
-                  ctx.fillStyle = dotColor;
-                  ctx.beginPath();
-                  ctx.arc(lm.lx, lm.ly, 3, 0, Math.PI * 2);
-                  ctx.fill();
-
-                  ctx.fillStyle = boxBg;
-                  ctx.strokeStyle = boxBorder;
-                  ctx.beginPath();
-                  ctx.roundRect(lm.px, lm.py, lm.pw, lm.ph, 4);
-                  ctx.fill();
-                  ctx.stroke();
-
-                  ctx.fillStyle = textColor;
-                  ctx.fillText(lm.label, lm.px + 5, lm.py + 12);
-                }
-              }
-
-              // 4. Render Bathymetric Spot Soundings from Cache
-              if (curShowSoundings && cCache.soundings.length > 0) {
-                const dotColor = curTheme === 1 ? '#8c3e24' : curTheme === 2 ? '#38bdf8' : '#00e5ff';
-                const textColor =
-                  curTheme === 1
-                    ? 'rgba(74, 59, 50, 0.85)'
-                    : curTheme === 2
-                    ? 'rgba(165, 213, 255, 0.85)'
-                    : 'rgba(142, 230, 255, 0.85)';
-
-                ctx.font = curTheme === 1 ? 'italic 9px Newsreader, serif' : '9px "IBM Plex Mono", monospace';
-                for (let i = 0; i < cCache.soundings.length; i++) {
-                  const s = cCache.soundings[i];
-                  ctx.fillStyle = dotColor;
-                  ctx.beginPath();
-                  ctx.arc(s.sx, s.sy, 1.8, 0, Math.PI * 2);
-                  ctx.fill();
-
-                  ctx.fillStyle = textColor;
-                  ctx.fillText(s.text, s.sx + 4, s.sy + 3);
-                }
-              }
-
-              // 5. Geodetic Triangulation Sightlines & Benchmarks
-              if (curShowTriangulation) {
-                // Draw connecting dashed great-circle sightlines
-                ctx.setLineDash([3, 3]);
-                ctx.lineWidth = 1.0;
-                ctx.strokeStyle =
-                  curTheme === 1
-                    ? 'rgba(168, 80, 50, 0.45)'
-                    : curTheme === 2
-                    ? 'rgba(120, 190, 255, 0.45)'
-                    : 'rgba(0, 229, 255, 0.45)';
-
-                for (let eIdx = 0; eIdx < GEODETIC_EDGES.length; eIdx++) {
-                  const edge = GEODETIC_EDGES[eIdx];
-                  const a = BENCHMARKS_MAP.get(edge[0]);
-                  const b = BENCHMARKS_MAP.get(edge[1]);
-                  if (!a || !b) continue;
-
-                  ctx.beginPath();
-                  let started = false;
-                  const numSteps = 12;
-                  for (let i = 0; i <= numSteps; i++) {
-                    const t = i / numSteps;
-                    const lon = a.lon + (b.lon - a.lon) * t;
-                    const lat = a.lat + (b.lat - a.lat) * t;
-                    const pos3D = evaluatePointMorph(lon, lat, curUnfurl, curMode, time, 0.05);
-                    const [px, py, isFront] = projectPoint(pos3D[0], pos3D[1], pos3D[2]);
-                    if (!isFront) {
-                      started = false;
-                      continue;
-                    }
-                    if (!started) {
-                      ctx.moveTo(px, py);
-                      started = true;
-                    } else {
-                      ctx.lineTo(px, py);
-                    }
-                  }
-                  ctx.stroke();
-                }
-                ctx.setLineDash([]);
-
-                // Draw benchmark stations from cache
-                if (cCache.benchmarks.length > 0) {
-                  const bmColor = curTheme === 1 ? '#a85032' : curTheme === 2 ? '#78beff' : '#00e5ff';
-                  ctx.font = '8px "IBM Plex Mono", monospace';
-                  for (let i = 0; i < cCache.benchmarks.length; i++) {
-                    const bm = cCache.benchmarks[i];
-                    ctx.strokeStyle = bmColor;
-                    ctx.fillStyle = curTheme === 1 ? '#f6f1e8' : '#0c1a29';
-                    ctx.lineWidth = 1.2;
-
-                    ctx.beginPath();
-                    ctx.moveTo(bm.bx, bm.by - 3.5);
-                    ctx.lineTo(bm.bx + 3.5, bm.by);
-                    ctx.lineTo(bm.bx, bm.by + 3.5);
-                    ctx.lineTo(bm.bx - 3.5, bm.by);
-                    ctx.closePath();
-                    ctx.fill();
-                    ctx.stroke();
-
-                    ctx.fillStyle = bmColor;
-                    ctx.fillText(bm.id, bm.bx + 5, bm.by - 3);
-                  }
-                }
-              }
-
-              ctx.restore();
-            }
-          }
 
         // Frame Telemetry Calculation
         frameCountRef.current++;
         if (now - lastFpsTimeRef.current >= 500) {
           const fps = Math.round((frameCountRef.current * 1000) / (now - lastFpsTimeRef.current));
+          telemetryStore.setFps(fps);
           callbacksRef.current.onFpsUpdate?.(fps);
           frameCountRef.current = 0;
           lastFpsTimeRef.current = now;
@@ -3823,16 +3713,18 @@ export const WebGPUCanvas: React.FC<WebGPUCanvasProps> = React.memo(({
             lonDeg = Math.round(activeCoordsRef.current.lon);
           }
           lonDeg = ((((lonDeg + 180) % 360) + 360) % 360) - 180;
+          const rawCamDist = camera.position.length();
+          const camDist = (1.0 - curUnfurl) * rawCamDist + curUnfurl * (5.0 + Math.abs(camera.position.z));
+          const roundedCamDist = Math.round(camDist * 20) / 20;
+          telemetryStore.setGeodeticCoords(latDeg, lonDeg, roundedCamDist);
           if (callbacksRef.current.onCoordsChange) {
-            callbacksRef.current.onCoordsChange(latDeg, lonDeg);
+            callbacksRef.current.onCoordsChange(latDeg, lonDeg, roundedCamDist);
           }
 
           // Provenance Telemetry Update (Zero-recompilation, zero React thrash)
           const curCoords = cursorCoordsRef.current || activeCoordsRef.current || { lat: latDeg, lon: lonDeg };
           const targetLat = curCoords.lat ?? latDeg;
           const targetLon = curCoords.lon ?? lonDeg;
-          const rawCamDist = camera.position.length();
-          const camDist = (1.0 - curUnfurl) * rawCamDist + curUnfurl * (5.0 + Math.abs(camera.position.z));
           const altitudeMeters = Math.max(0, (camDist - 5.0) * 1274200);
 
           let elevM = 0;
@@ -3847,19 +3739,32 @@ export const WebGPUCanvas: React.FC<WebGPUCanvasProps> = React.memo(({
             inset = 'NOAA CUDEM (3m LiDAR)';
           } else if (regId === 'grand-canyon') {
             inset = 'USGS 3DEP (30m)';
+          } else if (regId === 'yellowstone' || regId === 'flatirons-chautauqua') {
+            inset = 'USGS 3DEP (10m)';
           } else if (regId === 'fuji') {
             inset = 'Copernicus GLO-30 (30m)';
           } else if (regId === 'matterhorn') {
             inset = 'Swisstopo (10m) / Copernicus GLO-30';
+          } else if (
+            regId === 'monterey-canyon' ||
+            regId === 'bahamas-tongue' ||
+            regId === 'mid-atlantic-ridge' ||
+            regId === 'mariana-trench'
+          ) {
+            inset = 'NOAA NCEI / GEBCO Bathymetry';
           } else if (targetLon >= -161.0 && targetLon <= -154.0 && targetLat >= 18.0 && targetLat <= 23.0) {
             inset = 'NOAA CUDEM (3m LiDAR)';
           } else if (targetLon >= -71.0 && targetLon <= -69.0 && targetLat >= 41.0 && targetLat <= 43.0) {
             inset = 'NOAA CUDEM (3m LiDAR)';
           } else if (targetLon >= -112.5 && targetLon <= -111.5 && targetLat >= 35.9 && targetLat <= 36.5) {
             inset = 'USGS 3DEP (30m)';
+          } else if (targetLon >= -111.15 && targetLon <= -109.8 && targetLat >= 44.1 && targetLat <= 45.1) {
+            inset = 'USGS 3DEP (10m)';
+          } else if (targetLon >= -105.75 && targetLon <= -105.15 && targetLat >= 39.85 && targetLat <= 40.35) {
+            inset = 'USGS 3DEP (10m)';
           } else if (targetLon >= 138.5 && targetLon <= 139.0 && targetLat >= 35.2 && targetLat <= 35.5) {
             inset = 'Copernicus GLO-30 (30m)';
-          } else if (targetLon >= 7.40 && targetLon <= 7.90 && targetLat >= 45.75 && targetLat <= 46.20) {
+          } else if (targetLon >= 7.20 && targetLon <= 8.20 && targetLat >= 45.60 && targetLat <= 46.40) {
             inset = 'Swisstopo (10m) / Copernicus GLO-30';
           }
 
@@ -3893,10 +3798,6 @@ export const WebGPUCanvas: React.FC<WebGPUCanvasProps> = React.memo(({
         ref={canvasRef}
         className="w-full h-full block cursor-grab active:cursor-grabbing"
       />
-      <canvas
-        ref={overlayCanvasRef}
-        className="absolute inset-0 pointer-events-none w-full h-full"
-      />
       {/* 
         Single WebGPU context: native vector ribbon pipeline and contour isolines render directly in engine.render().
         Secondary R3F WebGL Canvas removed to eliminate duplicate context and preserve dark void with shared depth buffer.
@@ -3927,5 +3828,6 @@ export const WebGPUCanvas: React.FC<WebGPUCanvasProps> = React.memo(({
     </div>
   );
 });
+WebGPUCanvas.displayName = 'WebGPUCanvas';
 
 export default WebGPUCanvas;
